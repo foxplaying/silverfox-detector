@@ -1,0 +1,85 @@
+{
+  "manifest_version": 3,
+  "name": "SilverFox Detector",
+  "version": "0.1.0",
+  "description": "Detect suspicious download landing pages via DOM heuristics and MAIN-world behavioral hooks.",
+  "permissions": [
+    "storage",
+    "tabs",
+    "activeTab",
+    "notifications",
+    "downloads",
+    "scripting",
+    "webNavigation",
+    "declarativeNetRequestWithHostAccess"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": [
+        "nav-boot/package-classifier.js",
+        "nav-boot/sso-detector.js",
+        "nav-boot/page-shell-detector.js",
+        "nav-boot/cloaking-kit-scanner.js",
+        "nav-boot/gesture-tracker.js",
+        "nav-boot/nav-blocker.js",
+        "nav-boot/location-guard.js",
+        "nav-boot/index.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": [
+        "page-hooks/package-heuristics.js",
+        "page-hooks/page-context.js",
+        "page-hooks/cloaking-kit.js",
+        "page-hooks/download-ui.js",
+        "page-hooks/nav-policy.js",
+        "page-hooks/dom-guard.js",
+        "page-hooks/index.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": [
+        "content/state.js",
+        "content/package-heuristics.js",
+        "content/brand-heuristics.js",
+        "content/brand-correlation.js",
+        "content/encrypted-spa.js",
+        "content/intel-gates.js",
+        "content/page-context.js",
+        "content/detectors.js",
+        "content/detectors-extended.js",
+        "content/brand-spoof-detector.js",
+        "content/intel-network.js",
+        "content/guard.js",
+        "content/scanner.js",
+        "content/lifecycle.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_title": "SilverFox Detector",
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
