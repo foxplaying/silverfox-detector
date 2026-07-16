@@ -20,12 +20,21 @@
   importScripts("./download-verdict-bg.js");
   importScripts("./message-handler-bg.js");
 
-  // --- 注册 nav-boot + 清理残留 DNR ---
+  // --- 注册 nav-boot + 清理残留 DNR / 启动清系统通知 ---
   try {
     NS.ensureRegisteredNavBoot();
     NS.clearAllHostileNavDnr();
-    chrome.runtime.onInstalled.addListener(() => { NS.ensureRegisteredNavBoot(); NS.clearAllHostileNavDnr(); });
-    chrome.runtime.onStartup.addListener(() => { NS.ensureRegisteredNavBoot(); NS.clearAllHostileNavDnr(); });
+    // 仅浏览器启动/安装时清托盘，避免 SW 热重启误清正在看的通知
+    chrome.runtime.onInstalled.addListener(() => {
+      NS.ensureRegisteredNavBoot();
+      NS.clearAllHostileNavDnr();
+      try { NS.onNotificationBootCleanup(); } catch { /* ignore */ }
+    });
+    chrome.runtime.onStartup.addListener(() => {
+      NS.ensureRegisteredNavBoot();
+      NS.clearAllHostileNavDnr();
+      try { NS.onNotificationBootCleanup(); } catch { /* ignore */ }
+    });
   } catch { /* ignore */ }
 
   // --- webNavigation ---
@@ -110,15 +119,26 @@
           try { chrome.downloads.erase({ id: item.id }); } catch { /* ignore */ }
           const tabId = item.tabId ?? null;
           if (tabId != null) NS.safeSetBadge(tabId, "!", "#d93025");
-          NS.showBlockedNotification("已拦截可疑下载文件", verdict.label || "可疑安装包", tabId).catch(() => { /* ignore */ });
+          const cancelLabel = verdict.label || "可疑安装包";
+          const dlUrl = item.finalUrl || item.url || "";
+          // 同 URL/文件名 40 分钟内不重复系统通知（浏览器重启恢复下载仍会 cancel，但不连环弹）
+          const maybeNotify = async () => {
+            try {
+              if (typeof NS.shouldNotifyDownloadBlock === "function") {
+                const allow = await NS.shouldNotifyDownloadBlock(cancelLabel || dlUrl);
+                if (!allow) return;
+              }
+              await NS.showBlockedNotification("已拦截可疑下载文件", cancelLabel, tabId);
+            } catch { /* ignore */ }
+          };
+          maybeNotify();
           const pageUrlForNotice = (() => {
             try {
-              if (tabId == null) return item.finalUrl || item.url || "";
+              if (tabId == null) return dlUrl;
               const st = NS.tabNavState && NS.tabNavState.get ? NS.tabNavState.get(tabId) : null;
-              return (st && st.lastGoodUrl) || item.finalUrl || item.url || "";
-            } catch { return item.finalUrl || item.url || ""; }
+              return (st && st.lastGoodUrl) || dlUrl;
+            } catch { return dlUrl; }
           })();
-          const cancelLabel = verdict.label || "可疑安装包";
           const { PackageHeuristicsBg } = NS;
           if (!(PackageHeuristicsBg.looksLikeProductPackageName(cancelLabel) || PackageHeuristicsBg.looksLikeProductSetupWithBuildId(String(cancelLabel).replace(/\.[^.]+$/, "")))) {
             chrome.storage.local.set({ latestNotice: { title: "已拦截可疑下载文件", message: cancelLabel, tabId, url: pageUrlForNotice, timestamp: Date.now() } });

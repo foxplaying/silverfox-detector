@@ -62,6 +62,8 @@
         }
         // Android 反向域名 APK
         if (/^(?:[a-z][a-z0-9_]*\.){2,}[a-z][a-z0-9_]*(?:[._-]\d{2,16})?$/i.test(base)) return true;
+        // 应用商店内容寻址哈希 APK（MD5/SHA）
+        if (/\.(?:apk|xapk|apks|aab)$/i.test(name) && /^[a-f0-9]{16,64}$/i.test(base)) return true;
         return false;
       } catch {
         return false;
@@ -84,6 +86,8 @@
         const base = name.replace(/\.(apk|xapk|apks|aab|exe|zip|msi|dmg|pkg|rar|7z|appx)$/i, "");
         if (/^(?:[a-z][a-z0-9_]*\.){2,}[a-z][a-z0-9_]*(?:[._-]\d{2,16})?$/i.test(base)) return true;
         if (/^(?:[a-z][a-z0-9_]*\.){2,}[a-z0-9_]+$/i.test(base) && (base.match(/\./g) || []).length >= 2) return true;
+        // 内容寻址哈希 APK（应用商店 CDN）
+        if (/\.(?:apk|xapk|apks|aab)$/i.test(name) && /^[a-f0-9]{16,64}$/i.test(base)) return true;
         if (/^(?:inst|setup|install|installer|update|upgrade|patch|down|download|soft|client|package|pkg|release|stable|official|online|full|mini|lite|web|get|run|start|main|core|base|app)$/i.test(base)) return true;
         if (/^[A-Za-z][A-Za-z0-9._-]{2,60}?[._-](?:setup|install|installer)[._-]\d{4,16}$/i.test(base)
           && /[a-zA-Z]{4,}/.test(base)

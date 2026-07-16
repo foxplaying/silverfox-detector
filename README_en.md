@@ -27,7 +27,7 @@ Silverfox Detector watches every HTTP/HTTPS page for download-phishing patterns 
 - **Desktop force-download kits** - strips `.dlp-overlay`/`电脑版推荐` DOM and blocks hidden `a`/`iframe` package auto-downloads.
 - **Remote garble package dispatch** - flags `fetchDownloadLink` -> random-host garble installer flows.
 - **Object-storage package drops** - anonymous bucket / OSS / TOS / R2 packages on off-site hosts.
-- **ICP / WHOIS intel** - 24h-cached multi-source ICP lookup (aizhan / uapis) and RDAP WHOIS age; valid ICP clears soft brand-spoof false positives.
+- **ICP / WHOIS intel** - 24h-cached multi-source ICP lookup (aizhan / beiancx / uapis) and RDAP WHOIS age; valid ICP clears soft brand-spoof false positives.
 - **Download cancellation** - SW cancels suspicious `chrome.downloads` items; DNR short-burst blocks SERP bounce hops.
 
 ## Architecture

@@ -8,13 +8,52 @@
   const { PackageHeuristics } = NS;
 
   class PageContext {
-    /** 大型第一方平台（Microsoft Store 等）注入沙箱 iframe，跳过重型原型 wrap。 */
-    static hostIsMajorPlatformOrigin() {
+    /**
+     * 大型内容应用壳（行为/结构启发，无域名名单）。
+     * 用于跳过 setAttribute 等重型原型 wrap：节点/链接密集且无仿冒下载话术。
+     * 另：viewport 含 target-densitydpi 时 wrap 会污染 DevTools 堆栈，亦走 light。
+     */
+    static pageLooksLikeHeavyContentAppShell() {
       try {
-        const h = String(location.hostname || "").toLowerCase().replace(/^www\./, "");
-        if (!h) return false;
-        if (h === "apps.microsoft.com" || h === "www.microsoft.com") return true;
-        return /(?:^|\.)(?:microsoft|windows|office|live|xbox|msn|bing|github|google|gstatic|apple|amazon|cloudflare|akamai|azure|office365)\.(?:com|net|org|cn|com\.cn)$/i.test(h);
+        const title = String(document.title || "");
+        if (/官网|官方下载|官方正版|官方网站|官方客户端|电脑版官网|立即免费下载|全平台官方/i.test(title)) return false;
+        try {
+          if (typeof PageContext.pageLooksLikeDownloadPhishShell === "function"
+            && PageContext.pageLooksLikeDownloadPhishShell()) return false;
+        } catch { /* ignore */ }
+        // densitydpi：行为信号（常见于部分门户），非域名名单
+        try {
+          const vp = document.querySelector('meta[name="viewport"]');
+          if (vp && /target-densitydpi/i.test(String(vp.getAttribute("content") || ""))) return true;
+        } catch { /* ignore */ }
+        let nodes = 0; let links = 0; let scripts = 0;
+        try { nodes = document.getElementsByTagName("*").length; } catch { nodes = 0; }
+        try { links = document.links ? document.links.length : 0; } catch { links = 0; }
+        try { scripts = document.scripts ? document.scripts.length : 0; } catch { scripts = 0; }
+        if (nodes >= 1200 && links >= 30) return true;
+        if (nodes >= 800 && links >= 40 && scripts >= 6) return true;
+        if (nodes >= 2000) return true;
+        return false;
+      } catch {
+        return false;
+      }
+    }
+
+    /**
+     * document_start 即可判定：应跳过重型 DOM 原型 wrap。
+     * 仅 URL 形态 / 已有 head 信号，不读域名白名单。
+     */
+    static shouldUseLightHooksEarly() {
+      try {
+        if (PageContext.isSearchUrlShapeEarly()) return true;
+        if (PageContext.isSearchUrlShapeOnly()) return true;
+        // 标题已是仿冒下载壳 → 必须全量 hook
+        if (/官网|官方下载|官方正版|官方客户端|立即免费下载/i.test(document.title || "")) return false;
+        try {
+          const vp = document.querySelector('meta[name="viewport"]');
+          if (vp && /target-densitydpi/i.test(String(vp.getAttribute("content") || ""))) return true;
+        } catch { /* ignore */ }
+        return false;
       } catch {
         return false;
       }
