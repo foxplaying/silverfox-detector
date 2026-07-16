@@ -22,7 +22,7 @@
 Silverfox Detector 监控每个 HTTP/HTTPS 页面的下载钓鱼模式，并在恶意安装包落地前启用分层防御：
 
 - **SEO 伪装跳转套件**（zhizhu 类）—— 在 `document_start` 于 MAIN world 拦截 `location.replace`/`assign`/`href` 与 `window.open`，先于页面 JS 执行。
-- **品牌仿冒下载门户** —— 标题/正文品牌 ↔ 主机相关性，识别拼写、夹带、连字符镜像抢注域名（如 `todeskai.com` 宣称 ToDesk）。
+- **品牌仿冒下载门户** —— 标题/正文品牌 ↔ 主机相关性，识别拼写、夹带、连字符镜像抢注域名（如 `aa-todesk.com` 宣称 ToDesk）。
 - **加密 Nuxt SPA 壳** —— 检测 `windowsDownload`/`macDownload` 键 + 不透明 base64 载荷且无透明安装包链接。
 - **桌面端强制下载套件** —— 清除 `.dlp-overlay`/`电脑版推荐` DOM，拦截隐藏 `a`/`iframe` 安装包自动下载。
 - **远程乱码安装包下发** —— 标记 `fetchDownloadLink` -> 随机主机乱码安装包流程。
