@@ -21,10 +21,12 @@
       this.cloakingKitFlag = false;
       this.blockedHops = new Set();
       this.lastTrustedGestureAt = 0;
-      if (PageContext.hostIsMajorPlatformOrigin()) {
-        this.lightPage = true;
-        this.officialSafe = true;
-      }
+      // document_start：仅行为信号 light（搜索 / densitydpi），非域名名单
+      try {
+        if (typeof PageContext.shouldUseLightHooksEarly === "function" && PageContext.shouldUseLightHooksEarly()) {
+          this.lightPage = true;
+        }
+      } catch { /* ignore */ }
       this._installGestureListeners();
     }
 
@@ -99,6 +101,7 @@
     isLightPage() {
       if (this.officialSafe || this.lightPage) return true;
       try {
+        // 仅廉价 URL 形态；大型 SPA 由定时 promote 写 lightPage，避免每次 wrap 扫全 DOM
         if (PageContext.isSearchUrlShapeOnly() || PageContext.pageLooksLikeSerpUrl()) { this.lightPage = true; return true; }
       } catch { /* ignore */ }
       return false;
@@ -256,7 +259,8 @@
           try {
             const fn = PackageHeuristics.getFilenameFromUrl(href);
             const base = (fn || "").replace(/\.[^.]+$/, "");
-            if (/^[a-f0-9]{16,64}$/i.test(base) && !PackageHeuristics.isSuspiciousPackageFilename(fn)) return false;
+            // 内容寻址哈希 APK/包：应用商店 CDN，放行
+            if (/^[a-f0-9]{16,64}$/i.test(base) || (typeof PackageHeuristics.isContentAddressedPackageName === "function" && PackageHeuristics.isContentAddressedPackageName(fn))) return false;
           } catch { /* ignore */ }
           if (this.officialSafe && !kit && !this.guardEnabled) return false;
           this._emitAutoNavBlock(href, `auto-nav-no-gesture -> ${reason || href}`, "非用户手势自动下载");

@@ -150,10 +150,15 @@
     return /^(?:inst|setup|install|installer|update|upgrade|patch|down|download|soft|client|package|pkg|release|stable|official|online|full|mini|lite|web|get|run|start|main|core|base|app|bundle|deploy|launch)$/i.test(base);
   };
 
+  /**
+   * 内容寻址/哈希文件名（应用商店 CDN 常见）：MD5(32)/SHA1(40)/SHA256(64) 等纯十六进制 stem。
+   * 例：F4138527CA4023F251FD9EE076449A96.apk —— 非银狐乱码包。
+   */
   NS.isContentAddressedPackageName = function (fileName) {
     const name = NS.normalizeFileName(fileName);
     if (!name || !PACKAGE_NAME.test(name)) return false;
     const base = name.replace(/\.[^.]+$/, "");
+    // 16–64 位 hex；常见 32(MD5)/40(SHA1)/64(SHA256)
     return /^[a-f0-9]{16,64}$/i.test(base);
   };
 
@@ -204,6 +209,8 @@
     const lower = name.toLowerCase();
     const extension = lower.split(".").pop() || "";
     if (!/^(zip|exe|apk|dmg|msi|rar|7z|pkg|appx)$/.test(extension)) return false;
+    // 内容寻址哈希包名（应用商店 CDN）不当可疑乱码
+    if (NS.isContentAddressedPackageName(name)) return false;
     if (NS.looksLikeProductPackageName(name)) return false;
     if (NS.isBenignShortInstallerName(name)) return false;
     const baseName = name.replace(/\.[^.]+$/, "");
@@ -215,7 +222,8 @@
     if (/^[a-z]{2,4}-\d+[a-z0-9]/i.test(baseName)) return true;
     if (/\.[0-9]{3,10}$/.test(baseName) && !/\d+\.\d+\.\d+/.test(baseName) && !/^(?:[a-z][a-z0-9_]*\.){2,}/i.test(baseName)) return true;
     if (/^(?:app)?(?:install|setup|installer|down|update|client)[a-z0-9]*\.\d{4,}$/i.test(baseName)) return true;
-    if (/^[a-f0-9]{12,}$/i.test(baseName)) return true;
+    // 短于 16 的 hex 仍可疑；16–64 已由 isContentAddressedPackageName 放过
+    if (/^[a-f0-9]{12,15}$/i.test(baseName)) return true;
     if (/(?:^|[_\-.])(app|soft|client|proxy|intsoft)(?![a-z])[_\-.]?\d{5,}$/i.test(baseName)) return true;
     if (/^(?:app[_-]?setup|setup)[._-]\d{5,}/i.test(baseName)) return true;
     if (/(?:^|[._-])setup[._-]\d{5,}/i.test(baseName) && !/[a-zA-Z一-鿿]{4,}[._-]setup[._-]\d{5,}/i.test(baseName)) return true;
@@ -289,6 +297,8 @@
     const name = NS.normalizeFileName(/https?:\/\//i.test(String(fileNameOrUrl)) ? NS.getFilenameFromUrl(fileNameOrUrl) : fileNameOrUrl);
     if (!name) return false;
     const base = name.replace(/\.[^.]+$/, "");
+    // 哈希 APK：应用商店内容寻址（F413…96.apk）
+    if (/\.(?:apk|xapk|apks|aab)$/i.test(name) && NS.isContentAddressedPackageName(name)) return true;
     if (NS.looksLikeAndroidPackageIdName(base) || NS.looksLikeAndroidPackageIdName(name)) return true;
     if (NS.isBenignShortInstallerName(name)) return true;
     if (NS.looksLikeProductPackageName(name)) return true;
@@ -684,7 +694,9 @@
 
   NS.collectAllPagePackageHrefs = function () {
     const set = new Set();
+    const MAX = 80;
     const add = (h) => {
+      if (set.size >= MAX) return;
       if (!h || typeof h !== "string") return;
       const t = h.trim();
       if (!t || /^(javascript:|#)$/i.test(t)) return;
@@ -695,21 +707,32 @@
         if (NS.isPackageFileUrl(t)) set.add(t);
       }
     };
+    const archiveHeavy = typeof NS.pageLooksLikeHighVolumePackageArchive === "function" && NS.pageLooksLikeHighVolumePackageArchive();
+    const nodeCap = archiveHeavy ? 60 : 400;
     try {
-      document.querySelectorAll("a[href], a[data-href], a[data-url], [data-download], [data-down]").forEach((el) => {
-        add(NS.getElementDownloadHref(el) || el.getAttribute("href") || "");
-      });
+      const nodes = document.querySelectorAll("a[href], a[data-href], a[data-url], [data-download], [data-down]");
+      const n = Math.min(nodes.length, nodeCap);
+      for (let i = 0; i < n && set.size < MAX; i++) {
+        add(NS.getElementDownloadHref(nodes[i]) || nodes[i].getAttribute("href") || "");
+      }
     } catch { /* ignore */ }
-    try {
-      document.querySelectorAll("[onclick], [onmousedown], [ondblclick], button, .platform-btn, [class*='download'], [class*='platform']").forEach((el) => {
-        const attrs = ["onclick", "onmousedown", "ondblclick", "data-href", "data-url", "data-link", "href"];
-        for (const a of attrs) {
-          const v = el.getAttribute && el.getAttribute(a);
-          if (v) NS.extractPackageUrlFromHandlerText(v).forEach(add);
+    if (!archiveHeavy || set.size < 12) {
+      try {
+        const nodes2 = document.querySelectorAll("[onclick], [onmousedown], [ondblclick], button, .platform-btn, [class*='download'], [class*='platform']");
+        const n2 = Math.min(nodes2.length, archiveHeavy ? 40 : 200);
+        for (let i = 0; i < n2 && set.size < MAX; i++) {
+          const el = nodes2[i];
+          const attrs = ["onclick", "onmousedown", "ondblclick", "data-href", "data-url", "data-link", "href"];
+          for (const a of attrs) {
+            const v = el.getAttribute && el.getAttribute(a);
+            if (v) NS.extractPackageUrlFromHandlerText(v).forEach(add);
+          }
         }
-      });
-    } catch { /* ignore */ }
-    try { NS.extractPackageUrlFromHandlerText(NS.getThreatScanHtml(120000)).forEach(add); } catch { /* ignore */ }
+      } catch { /* ignore */ }
+    }
+    if (!archiveHeavy) {
+      try { NS.extractPackageUrlFromHandlerText(NS.getThreatScanHtml(80000)).forEach(add); } catch { /* ignore */ }
+    }
     return Array.from(set);
   };
 
@@ -798,10 +821,27 @@
 
   NS.disableAllDownloadIntentControls = function () {
     const state = NS.state;
-    NS.getAllDownloadIntentElements().forEach((el) => {
+    const seen = new Set();
+    const disableEl = (el) => {
+      if (!el || seen.has(el)) return;
+      seen.add(el);
       const href = (el.getAttribute("href") || el.getAttribute("data-href") || el.getAttribute("data-threat-original-href") || state.protectedTargets[0] || "").trim();
       NS.disableOneSuspiciousElement(el, href || "js-download");
-    });
+    };
+    NS.getAllDownloadIntentElements().forEach(disableEl);
+    try {
+      document.querySelectorAll(
+        "a.download-uri, .download-uri, a.download-btn, .download-btn, .download-btn-nav, a.btn-download, .btn-download, #mainDownloadBtn, .platform-btn, button.platform-btn, [class*='btn-download'], [class*='download-btn'], [class*='Download'], a[class*='down'], button[class*='down']"
+      ).forEach(disableEl);
+    } catch { /* ignore */ }
+    // 文案兜底：短 CTA
+    try {
+      document.querySelectorAll("a, button, [role='button']").forEach((el) => {
+        const t = (el.textContent || "").replace(/\s+/g, " ").trim();
+        if (t.length > 0 && t.length < 36 && /立即下载|免费下载|官方下载|客户端下载|电脑版|Windows\s*版|Mac\s*版|下载客户端|一键下载/i.test(t)) disableEl(el);
+      });
+    } catch { /* ignore */ }
+    try { if (state.downloadGuardInstalled && typeof NS.applyDownloadGuardDomLock === "function") NS.applyDownloadGuardDomLock(true); } catch { /* ignore */ }
   };
 
   NS.tryDecodeBase64Payload = function (str, maxLayers = 5) {

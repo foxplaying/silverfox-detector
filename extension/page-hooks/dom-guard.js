@@ -353,8 +353,10 @@
     static _patchSetAttribute(policy, restoreList) {
       try {
         try {
-          if (PageContext.isSearchUrlShapeOnly() || PageContext.pageLooksLikeSerpUrl() || PageContext.hostIsMajorPlatformOrigin()) policy.lightPage = true;
+          if (PageContext.isSearchUrlShapeOnly() || PageContext.pageLooksLikeSerpUrl()
+            || (typeof policy.isLightPage === "function" && policy.isLightPage())) policy.lightPage = true;
         } catch { /* ignore */ }
+        // light：绝不包装 setAttribute（viewport target-densitydpi 会经包装器冒泡到扩展堆栈）
         if (policy.lightPage || policy.officialSafe) return;
         const origSetAttr = Element.prototype.setAttribute;
         if (origSetAttr && !Element.prototype.__silverfoxSetAttr) {
@@ -365,6 +367,10 @@
             try {
               const n = String(name || "").toLowerCase();
               if (n === "sandbox") return origSetAttr.call(this, name, value); // 永不碰沙箱
+              // content/viewport 等：原样透传且不进入威胁分支（减少无关键堆栈）
+              if (n === "content" || n === "name" || n === "http-equiv" || n === "charset" || n === "property") {
+                return origSetAttr.call(this, name, value);
+              }
               if (n !== "class" && n !== "classname" && n !== "href" && n !== "src") return origSetAttr.call(this, name, value);
               const v = String(value || "");
               if (n === "class" || n === "classname") {
@@ -393,7 +399,8 @@
     static _wrapInsertMethods(policy, restoreList) {
       try {
         try {
-          if (PageContext.isSearchUrlShapeOnly() || PageContext.pageLooksLikeSerpUrl() || PageContext.hostIsMajorPlatformOrigin()) policy.lightPage = true;
+          if (PageContext.isSearchUrlShapeOnly() || PageContext.pageLooksLikeSerpUrl()
+            || (typeof policy.isLightPage === "function" && policy.isLightPage())) policy.lightPage = true;
         } catch { /* ignore */ }
         if (policy.lightPage || policy.officialSafe) return;
         const wrapInsert = (proto, method) => {
@@ -514,7 +521,7 @@
       } catch { /* ignore */ }
     }
 
-    /** window.download_uri 拦截：多绑模板写入时 arm guard。 */
+    /** window.download_uri 拦截：写入时主动 arm（不依赖用户点击下载按钮）。 */
     static installDownloadUriTrap(policy) {
       try {
         let downloadUriValue = "";
@@ -527,17 +534,20 @@
             let multiBind = false;
             try {
               multiBind = document.getElementsByClassName("download-uri").length >= 1
-                || document.querySelectorAll(".download-uri, a.download-uri").length >= 1;
+                || document.querySelectorAll(".download-uri, a.download-uri, .download-btn, .download-btn-nav, #mainDownloadBtn, a[class*='download'], button[class*='download']").length >= 1;
             } catch { /* ignore */ }
-            if (!multiBind) return;
             const isPkg = PackageHeuristics.PACKAGE_EXT.test(downloadUriValue) || PackageHeuristics.PACKAGE_NAME.test(downloadUriValue.split("/").pop() || "");
             const isHop = PackageHeuristics.looksLikeOpaqueDownloadHopUrl(downloadUriValue);
-            policy.post({ type: "request-guard", reason: isPkg || isHop ? `全局 download_uri 下发: ${downloadUriValue}` : `全局 download_uri 动态绑定: ${downloadUriValue.slice(0, 120)}` });
-            if (isPkg || isHop || policy.guardEnabled) {
-              policy._rememberHop(downloadUriValue);
-              policy.guardEnabled = true;
-              DownloadUi.disableAllDownloadButtonsInPage();
-            }
+            // 有安装包/跳板 URL，或页上存在下载按钮壳，均应主动 request-guard（勿等点击）
+            if (!multiBind && !isPkg && !isHop) return;
+            const reason = isPkg || isHop
+              ? `全局 download_uri 下发: ${downloadUriValue}`
+              : `下载按钮已绑定可疑远程地址`;
+            policy.post({ type: "request-guard", reason });
+            policy.post({ type: "signal", name: "远程API动态绑定下载", weight: 18, reason: `download_uri -> ${downloadUriValue.slice(0, 160)}` });
+            policy._rememberHop(downloadUriValue);
+            policy.guardEnabled = true;
+            DownloadUi.disableAllDownloadButtonsInPage();
           }
         });
       } catch { /* ignore */ }

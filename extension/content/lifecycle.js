@@ -24,6 +24,8 @@
     const c = NS.caches;
     const prevHost = state._analyzedHost || "";
     const hostChanged = !prevHost || prevHost !== (location.hostname || "");
+    // 在清威胁标志之前判定是否同站 keep-light（依赖当前 state）
+    const keepLight = !hostChanged && typeof NS.shouldKeepLightOnSameHostSoftNav === "function" && NS.shouldKeepLightOnSameHostSoftNav();
     state.score = 0; state.details = [];
     if (state.signalSet && typeof state.signalSet.clear === "function") state.signalSet.clear(); else state.signalSet = new Set();
     state.mutationCount = 0; state.iframeCount = 0; state.hiddenCount = 0; state.overlayCount = 0;
@@ -35,11 +37,14 @@
     state.remoteDownloadDispatchDetected = false; state.downloadGuardInstalled = false;
     state.protectedTargets = []; state.protectionNoticeSent = false; state.spoofBrand = "";
     state.contextCache = null; state.contextCacheAt = 0;
-    state._perfBenign = false; state._perfBenignAt = 0; state._intelLightMode = false; state._serpLightNotified = false;
-    state._analysisDone = false; state._analysisDoneAt = 0;
+    // 同站 soft-nav 且此前已 light/结构大型内容 SPA：保留 light，避免每次 pushState 全量复扫卡死
+    state._perfBenign = keepLight; state._perfBenignAt = keepLight ? Date.now() : 0;
+    state._intelLightMode = keepLight; state._serpLightNotified = false;
+    state._analysisDone = keepLight; state._analysisDoneAt = keepLight ? Date.now() : 0;
     state._pendingSoftBrandSpoof = false; state._icpQuerySettled = false; state._icpQueryFailed = false;
     state._pageBootAt = Date.now(); state._pendingEncryptedSpa = false; state._encryptedSpaRescanArmed = false;
     state._scanBusy = false; state._lastFastScanAt = 0;
+    state._proactiveProbeAt = 0; state._proactiveProbeBusy = false;
     state._earlyShellArmed = false; state._guardRedisableArmed = false;
     state._seoCloakKitDetected = false; state._indexNowPhishTemplate = false; state._multiPlatformSerpTrap = false;
     state._brandSpoofPortalDetected = false; state._fakeSpaDetected = false; state._brandResourceMismatchDetected = false;
@@ -50,7 +55,11 @@
     NS.invalidateHtmlCache();
     if (hostChanged) { state.icpInfo = ""; state.whoisInfo = ""; state.icpMatchedHost = ""; }
     state._analyzedHost = location.hostname || "";
-    try { NS.postToHooks({ type: "set-guard", enabled: false }); NS.reEnableAllThreatDisabledElements(); } catch { /* ignore */ }
+    try {
+      NS.postToHooks({ type: "set-guard", enabled: false });
+      try { NS.applyDownloadGuardDomLock(false); } catch { /* ignore */ }
+      NS.reEnableAllThreatDisabledElements();
+    } catch { /* ignore */ }
     try {
       if (chrome?.runtime?.id) {
         chrome.runtime.sendMessage({ type: "page-analysis-reset", url: location.href, reason: reason || "page-url-changed" }, () => { void chrome.runtime.lastError; });
@@ -66,14 +75,39 @@
 
   NS.scheduleRescanAfterPageChange = function () {
     const c = NS.caches;
+    const state = NS.state;
+    // 已 light / 大型内容 SPA / WHOIS 超成熟：不排队多轮重扫（无域名名单）
+    try {
+      if (state._intelLightMode || state._perfBenign
+        || (typeof NS.shouldKeepLightOnSameHostSoftNav === "function" && NS.shouldKeepLightOnSameHostSoftNav())
+        || NS.looksLikeUltraMatureWhoisDomain()
+        || NS.looksLikeUltraMatureIcpDomain()) {
+        if (!state._intelLightMode) NS.enterIntelLightMode("page-change-light");
+        else { state._perfBenign = true; state._analysisDone = true; }
+        NS.markAnalysisComplete("page-change-light");
+        NS.emitRiskReport(true);
+        return;
+      }
+    } catch { /* ignore */ }
     if (c.pageNavRescanTimer) { try { clearTimeout(c.pageNavRescanTimer); } catch { /* ignore */ } c.pageNavRescanTimer = null; }
     c.pageNavRescanTimer = setTimeout(() => {
       c.pageNavRescanTimer = null;
+      try {
+        if (NS.state._intelLightMode || NS.state._perfBenign
+          || NS.looksLikeUltraMatureWhoisDomain()
+          || NS.looksLikeUltraMatureIcpDomain()
+          || (typeof NS.pageLooksLikeHeavyContentSpa === "function" && NS.pageLooksLikeHeavyContentSpa())) {
+          NS.enterIntelLightMode("page-change-light-deferred");
+          NS.markAnalysisComplete("page-change-light");
+          NS.emitRiskReport(true);
+          return;
+        }
+      } catch { /* ignore */ }
       NS.startIcpWhoisIntelEarly("page-url-changed");
       try { NS.tryEarlyShellProtect(); NS.armImmediatePackageBlock(); NS.scanSuspiciousPackagesFast(true); } catch (e) { console.warn("page-change early rescan failed", e); }
       NS.scheduleIdle(() => {
         try {
-          if (NS.looksLikeUltraMatureIcpDomain() || NS.state._intelLightMode || NS.state._perfBenign) { NS.emitRiskReport(true); return; }
+          if (NS.looksLikeUltraMatureIcpDomain() || NS.looksLikeUltraMatureWhoisDomain() || NS.state._intelLightMode || NS.state._perfBenign) { NS.emitRiskReport(true); return; }
           if (!NS.state._perfBenign) NS.detectLandingPageImpersonation();
           NS.scanSuspiciousPackagesFast(true);
           NS.emitRiskReport(true);
@@ -81,10 +115,21 @@
       }, 900);
       NS.scheduleIdle(() => {
         try {
-          if (NS.looksLikeUltraMatureIcpDomain() || NS.state._intelLightMode || NS.state._perfBenign || NS.isBenignContentPage() || NS.shouldNeverArmProtection()) { NS.maybeLiftDownloadGuard(); NS.emitRiskReport(true); return; }
+          const hasDlTargets = typeof NS.pageHasProactiveDownloadButtonTargets === "function"
+            && NS.pageHasProactiveDownloadButtonTargets();
+          // 有下载按钮目标：即使长文首页被标 benign 也必须主动 fetch 按钮地址
+          const lightSkip = NS.looksLikeUltraMatureIcpDomain() || NS.looksLikeUltraMatureWhoisDomain()
+            || NS.state._intelLightMode || NS.shouldNeverArmProtection()
+            || ((NS.state._perfBenign || NS.isBenignContentPage()) && !hasDlTargets);
+          if (lightSkip) { NS.maybeLiftDownloadGuard(); NS.emitRiskReport(true); return; }
           NS.scanSuspiciousPackagesFast(true);
-          if (NS.state._perfBenign || NS.isBenignContentPage()) { NS.maybeLiftDownloadGuard(); NS.emitRiskReport(true); return; }
-          NS.detectLinkedLandingPageSources().catch(() => {}).finally(() => { NS.maybeLiftDownloadGuard(); NS.finalize(); });
+          if ((NS.state._perfBenign || NS.isBenignContentPage()) && !hasDlTargets) {
+            NS.maybeLiftDownloadGuard(); NS.emitRiskReport(true); return;
+          }
+          const probe = typeof NS.proactivelyProbeDownloadButtons === "function"
+            ? NS.proactivelyProbeDownloadButtons()
+            : NS.detectLinkedLandingPageSources();
+          Promise.resolve(probe).catch(() => {}).finally(() => { NS.maybeLiftDownloadGuard(); NS.finalize(); });
         } catch { NS.finalize(); }
       }, 1400);
     }, 120);
@@ -92,11 +137,30 @@
 
   NS.handlePageUrlChanged = function (reason, incomingUrl) {
     const c = NS.caches;
+    const state = NS.state;
     const url = (incomingUrl && String(incomingUrl)) || location.href;
     const live = location.href;
     const key = live || url;
     if (!NS.isHttpOrHttpsPage(key) && !NS.isHttpOrHttpsPage(live)) { NS.silverfoxLog("nav-skip", "non-http-protocol", String(key).slice(0, 80)); return; }
     if (c.lastAnalyzedUrl && key === c.lastAnalyzedUrl) return;
+    // 同站 soft-nav + 状态/结构已可 light：禁止 reset+全量复扫（纯逻辑，非域名白名单）
+    try {
+      let prevHost = "";
+      try { prevHost = c.lastAnalyzedUrl ? new URL(c.lastAnalyzedUrl).hostname : (state._analyzedHost || ""); } catch { prevHost = state._analyzedHost || ""; }
+      const newHost = location.hostname || "";
+      const sameHost = !!(prevHost && newHost && prevHost.replace(/^www\./, "") === newHost.replace(/^www\./, ""));
+      if (sameHost && typeof NS.shouldKeepLightOnSameHostSoftNav === "function" && NS.shouldKeepLightOnSameHostSoftNav()) {
+        c.lastAnalyzedUrl = key;
+        state._perfBenign = true;
+        state._perfBenignAt = Date.now();
+        state._intelLightMode = true;
+        state._analysisDone = true;
+        state._scanBusy = false;
+        try { NS.emitRiskReport(true); } catch { /* ignore */ }
+        NS.silverfoxLog && NS.silverfoxLog("nav-skip", "soft-nav-keep-light", reason || "");
+        return;
+      }
+    } catch { /* ignore */ }
     if (c.pageNavResetBusy) { setTimeout(() => NS.handlePageUrlChanged(reason || "url-changed-retry", incomingUrl), 80); return; }
     c.pageNavResetBusy = true;
     try { c.lastAnalyzedUrl = key; NS.resetAnalysisStateForPageChange(reason || "url-changed"); NS.scheduleRescanAfterPageChange(); }
@@ -144,13 +208,18 @@
       if (data.type === "signal" && data.name) {
         if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) { NS.notifyHooksOfficialSafe(true); return; }
         if (NS.isBenignContentPage() && !/安装包|下载|远程|PHP|API|仿冒|手势|跳转/i.test(data.name || "")) return;
-        if (/非用户手势|自动下载|自动跳转/i.test(data.name || "") || /非用户手势|auto-nav-no-gesture|kit-or-relay-auto-external/i.test(data.reason || "")) {
+        if (/非用户手势|自动下载|自动跳转|跨域跳转/i.test(data.name || "") || /非用户手势|auto-nav-no-gesture|kit-or-relay-auto-external|auto-external/i.test(data.reason || "")) {
           const r = String(data.reason || "");
           const m = r.match(/([A-Za-z0-9][A-Za-z0-9._-]{2,120}\.(?:zip|exe|apk|msi|dmg|rar|7z))/i);
           const maybeName = m ? m[1] : "";
           const hrefFromReason = (r.match(/https?:\/\/[^\s"'<>\\]+/i) || [])[0] || "";
           if (hrefFromReason && NS.isAuthSsoOrLoginRedirectUrl(hrefFromReason)) return;
-          if (/非用户手势自动跳转/i.test(data.name || "") && hrefFromReason && !NS.isPackageFileUrl(hrefFromReason) && !NS.looksLikeOpaqueDownloadHopUrl(hrefFromReason) && !state._seoCloakKitDetected) return;
+          // 无安装包的自动/跨域跳转：仅提示、不 arm（pcsoft 等正版软件站广告/统计跨域）
+          const noPkg = !maybeName
+            && (!hrefFromReason || (!NS.isPackageFileUrl(hrefFromReason) && !NS.looksLikeOpaqueDownloadHopUrl(hrefFromReason)));
+          if (noPkg && !state._seoCloakKitDetected && !state._desktopForceDlKit && !state._fakeSpaDetected && !state._fakeBrandShellDetected) {
+            return;
+          }
           if (maybeName && (NS.looksLikeStrongProductInstallerName(maybeName) || NS.isClearProductOrAndroidPackage(maybeName) || NS.looksLikeProductPackageName(maybeName) || NS.isBenignShortInstallerName(maybeName) || NS.isContentAddressedPackageName(maybeName) || NS.isAllowlistedProductPackageUrl(maybeName))) return;
           if (hrefFromReason && (NS.isAllowlistedProductPackageUrl(hrefFromReason) || NS.looksLikeStrongProductInstallerName(NS.getFilenameFromUrl(hrefFromReason)))) return;
           if (NS.looksLikeSafeOfficialContext() || NS.isTrustedOfficialDownloadContext()) return;
@@ -174,7 +243,11 @@
           if (m && (NS.looksLikeStrongProductInstallerName(m[1]) || (NS.looksLikeProductPackageName(m[1]) && !NS.looksLikeOversimplifiedBrandInstallerName(m[1])) || NS.isClearProductOrAndroidPackage(m[1]))) return;
           const hrefM = (r.match(/https?:\/\/[^\s"'<>]+/i) || [])[0] || "";
           if (hrefM && (NS.isAllowlistedProductPackageUrl(hrefM) || NS.looksLikeStrongProductInstallerName(NS.getFilenameFromUrl(hrefM)))) return;
-          if ((data.weight || 0) <= 8 && !/手势|仿冒|跳转|下发|API动态/i.test(data.name || "")) return;
+          // 纯跨域跳转信号：无安装包不 arm
+          if (/跨域跳转|自动跳转|搜索引擎跳转/i.test(data.name || "")
+            && !m && (!hrefM || (!NS.isPackageFileUrl(hrefM) && !NS.looksLikeOpaqueDownloadHopUrl(hrefM)))
+            && !state._seoCloakKitDetected && !state._desktopForceDlKit) return;
+          if ((data.weight || 0) <= 8 && !/手势|仿冒|下发|API动态/i.test(data.name || "")) return;
           NS.installDownloadGuard(data.reason || data.name, { notify: true, href: hrefM || "", message: data.reason || data.name });
         }
         return;
@@ -187,14 +260,18 @@
         if (/非用户手势自动跳转/i.test(reason) && href && NS.isAuthSsoOrLoginRedirectUrl(href)) return;
         if (href && NS.isSiteHomeUrl(href) && !NS.isPackageFileUrl(href)) return;
         const fn = href ? NS.getFilenameFromUrl(href) : "";
-        if (href && (NS.isAllowlistedProductPackageUrl(href) || NS.looksLikeStrongProductInstallerName(fn) || NS.isClearProductOrAndroidPackage(href) || NS.isClearProductOrAndroidPackage(fn) || NS.looksLikeProductPackageName(fn) || NS.isBenignShortInstallerName(fn) || NS.isContentAddressedPackageName(fn)) && !NS.looksLikeBrandNearMissPackageName(fn) && !NS.isSuspiciousDownloadFilename(fn)) return;
+        // 内容寻址哈希 APK 等：不要求再过 isSuspicious（旧逻辑会自相矛盾）
+        if (href && (NS.isAllowlistedProductPackageUrl(href) || NS.looksLikeStrongProductInstallerName(fn) || NS.isClearProductOrAndroidPackage(href) || NS.isClearProductOrAndroidPackage(fn) || NS.looksLikeProductPackageName(fn) || NS.isBenignShortInstallerName(fn) || NS.isContentAddressedPackageName(fn)) && !NS.looksLikeBrandNearMissPackageName(fn)) return;
         const autoNoGesture = /auto-nav-no-gesture|auto-search-trap|auto-external|phish-shell-auto|非用户手势|programmatic-a\.click|programmatic/i.test(reason);
         if (!NS.isPackageFileUrl(href) && !NS.looksLikeOpaqueDownloadHopUrl(href) && !autoNoGesture) {
           if (/api\.php|download_link|远程API|远程下发|download_uri/i.test(reason)) NS.installDownloadGuard(reason || "可疑下载", { notify: true, href: "", message: reason || "远程动态下载" });
           return;
         }
         if (autoNoGesture && href && !NS.isPackageFileUrl(href) && NS.isAuthSsoOrLoginRedirectUrl(href)) return;
-        if (autoNoGesture && href && !NS.isPackageFileUrl(href) && !NS.looksLikeOpaqueDownloadHopUrl(href) && /非用户手势自动跳转|kit-or-relay-auto-external|auto-external/i.test(reason) && !state._seoCloakKitDetected && !state._brandSpoofPortalDetected) return;
+        // 无安装包的跨域/自动跳转：不 arm（与 signal 路径一致）
+        if (autoNoGesture && href && !NS.isPackageFileUrl(href) && !NS.looksLikeOpaqueDownloadHopUrl(href)
+          && /非用户手势|kit-or-relay-auto-external|auto-external|auto-nav-no-gesture/i.test(reason)
+          && !state._seoCloakKitDetected && !state._desktopForceDlKit && !state._fakeSpaDetected && !state._fakeBrandShellDetected && !state._brandSpoofPortalDetected) return;
         if (autoNoGesture && (NS.looksLikeSafeOfficialContext() || NS.isTrustedOfficialDownloadContext()) && !state._seoCloakKitDetected && !state._brandSpoofPortalDetected) return;
         if (autoNoGesture && href && (NS.isAllowlistedProductPackageUrl(href) || NS.looksLikeStrongProductInstallerName(fn))) return;
         if (href && !state.protectedTargets.includes(href)) state.protectedTargets.push(href);
@@ -210,7 +287,16 @@
         if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) { NS.notifyHooksOfficialSafe(true); return; }
         try {
           const rr = String(data.reason || "");
-          if (/非用户手势自动跳转|auto-nav-no-gesture|kit-or-relay-auto-external/i.test(rr)) { const hrefM = rr.match(/https?:\/\/[^\s"'<>\\]+/i); if (hrefM && NS.isAuthSsoOrLoginRedirectUrl(hrefM[0])) return; }
+          if (/非用户手势自动跳转|auto-nav-no-gesture|kit-or-relay-auto-external|auto-external/i.test(rr)) {
+            const hrefM = rr.match(/https?:\/\/[^\s"'<>\\]+/i);
+            if (hrefM && NS.isAuthSsoOrLoginRedirectUrl(hrefM[0])) return;
+            // 无安装包的「自动跳转/跨域」request-guard：不 arm（正版软件站广告/外链）
+            if (hrefM && !NS.isPackageFileUrl(hrefM[0]) && !NS.looksLikeOpaqueDownloadHopUrl(hrefM[0])
+              && !state._seoCloakKitDetected && !state._desktopForceDlKit && !state._fakeSpaDetected && !state._fakeBrandShellDetected) {
+              return;
+            }
+            if (!hrefM && !state._seoCloakKitDetected && !state._desktopForceDlKit) return;
+          }
           const hrefAny = rr.match(/https?:\/\/[^\s"'<>]+/i);
           if (hrefAny && NS.isAuthSsoOrLoginRedirectUrl(hrefAny[0]) && !NS.isPackageFileUrl(hrefAny[0])) return;
         } catch { /* ignore */ }
@@ -224,8 +310,12 @@
         } catch { /* ignore */ }
         NS.armBackgroundProtect("full");
         try { chrome.runtime.sendMessage({ type: "request-guard-bg", mode: "full", url: location.href, reason: data.reason || "" }, () => { void chrome.runtime.lastError; }); } catch { /* ignore */ }
-        NS.installDownloadGuard(data.reason || "页面行为触发下载保护", { notify: true, message: data.reason || "可疑下载保护" });
+        const rr = String(data.reason || "");
+        const hard = /下载壳|远程|API|download_uri|强制弹窗|SEO|乱码|绑定可疑|仿冒/i.test(rr);
+        if (hard) state.remoteDownloadDispatchDetected = true;
+        NS.installDownloadGuard(data.reason || "页面行为触发下载保护", { notify: true, message: data.reason || "可疑下载保护", forceNotify: true, lockHard: hard });
         NS.disableSuspiciousDownloadButtons();
+        NS.disableAllDownloadIntentControls();
         NS.scanSuspiciousPackagesFast();
         return;
       }
@@ -243,28 +333,57 @@
     const c = NS.caches;
     const gen = genOpt != null ? genOpt : c.intelGeneration;
     const urlKey = urlKeyOpt || location.href;
-    const pageHost = NS.normalizeDomain(location.hostname);
+    // 情报主机保留 www（www.gov.cn 不得被 normalizeDomain 打成 gov.cn）
+    const pageHost = typeof NS.normalizeHostForIntel === "function"
+      ? NS.normalizeHostForIntel(location.hostname)
+      : String(location.hostname || "").trim().toLowerCase();
     if (!pageHost || !/^https?:/i.test(String(location.protocol || ""))) { if (gen === c.intelGeneration) c.intelDoneForUrl = urlKey; return; }
     let whois = null;
-    try { whois = await NS.detectWhoisRegistrationAge(pageHost || location.hostname); } catch { whois = { success: false }; }
+    try { whois = await NS.detectWhoisRegistrationAge(pageHost); } catch { whois = { success: false }; }
     if (gen !== c.intelGeneration || location.href !== urlKey) return;
     NS.maybeLiftDownloadGuard(); NS.emitRiskReport(true);
+    // WHOIS ↔ ICP 绑定：无有效 WHOIS 则不查 ICP、不展示 ICP
     if (!NS.whoisHasResult(whois)) {
       state.icpInfo = ""; state.icpMatchedHost = "";
-      state._icpQuerySettled = true; state._icpQueryFailed = false;
+      state._icpQuerySettled = true; state._icpQueryFailed = true;
       if (gen === c.intelGeneration) c.intelDoneForUrl = urlKey;
-      if (state._pendingSoftBrandSpoof && !state._seoCloakKitDetected && !state._fakeSpaDetected) {
-        state._pendingSoftBrandSpoof = false;
-        try { if (NS.detectBrandSpoofDownloadPortal()) state._brandSpoofPortalDetected = true; } catch { /* ignore */ }
+      if (!state._seoCloakKitDetected && !state._fakeSpaDetected) {
+        try {
+          state._analysisDone = false;
+          if (state._pendingSoftBrandSpoof || !state._brandSpoofPortalDetected) {
+            state._pendingSoftBrandSpoof = false;
+            if (NS.detectBrandSpoofDownloadPortal()) state._brandSpoofPortalDetected = true;
+          }
+          NS.scanSuspiciousPackagesFast(true);
+        } catch { /* ignore */ }
       }
       NS.maybeLiftDownloadGuard(); NS.emitRiskReport(true);
       return;
     }
     try {
       if (!pageHost) { state.icpInfo = ""; state.icpMatchedHost = ""; state._icpQuerySettled = true; state._icpQueryFailed = false; if (gen === c.intelGeneration) c.intelDoneForUrl = urlKey; NS.maybeLiftDownloadGuard(); NS.emitRiskReport(true); return; }
+      // ICP 与 WHOIS 同一 pageHost（含 www）
       const icpCheck = await NS.detectIcpDomain(pageHost);
       if (gen !== c.intelGeneration || location.href !== urlKey) return;
-      if (!icpCheck.success) { NS.silverfoxLog("intel-icp", "api-fail"); state._icpQueryFailed = true; state._icpQuerySettled = false; if (gen === c.intelGeneration) c.intelDoneForUrl = urlKey; NS.maybeLiftDownloadGuard(); NS.emitRiskReport(true); return; }
+      if (!icpCheck.success) {
+        // API 失败视为门控已定论（查不到），否则软品牌仿冒会永久 pending
+        NS.silverfoxLog("intel-icp", "api-fail-settle-missing");
+        state.icpInfo = ""; state.icpMatchedHost = "";
+        state._icpQueryFailed = true; state._icpQuerySettled = true;
+        if (gen === c.intelGeneration) c.intelDoneForUrl = urlKey;
+        if (!state._seoCloakKitDetected && !state._fakeSpaDetected) {
+          try {
+            state._analysisDone = false;
+            if (state._pendingSoftBrandSpoof || !state._brandSpoofPortalDetected) {
+              state._pendingSoftBrandSpoof = false;
+              if (NS.detectBrandSpoofDownloadPortal()) state._brandSpoofPortalDetected = true;
+            }
+            NS.scanSuspiciousPackagesFast(true);
+          } catch { /* ignore */ }
+        }
+        NS.maybeLiftDownloadGuard(); NS.emitRiskReport(true);
+        return;
+      }
       let record = (icpCheck.icpRecord && NS.looksLikeIcpLicense(icpCheck.icpRecord)) ? icpCheck.icpRecord : "";
       const matched = icpCheck.matchedHost || icpCheck.queriedHost || pageHost;
       if (record && !NS.intelHostIsValidAttribution(matched, pageHost)) record = "";
@@ -281,20 +400,40 @@
         const triedNote = tried.length ? `，ICP 候选 ${tried.join(" -> ")}` : "";
         NS.addSignal("无ICP备案信息", 6, `当前域名 ${location.hostname}${whoisNote}${triedNote} 未查询到备案信息`);
       }
-      if (NS.hasValidIcpRecord() && !state._seoCloakKitDetected && !state._fakeSpaDetected && !state._desktopForceDlKit) {
-        NS.clearBrandSpoofFalsePositive("valid-icp");
-        state._pendingSoftBrandSpoof = false;
-        state._perfBenign = true; state._perfBenignAt = Date.now();
-        try { NS.notifyHooksOfficialSafe(true); } catch { /* ignore */ }
+      // 真硬套件（SEO/强制弹窗/乱码）即使有 ICP 也不得 officialSafe
+      const realHard = typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat();
+      // 有效 ICP 或超成熟 WHOIS：强制抬软误报（百度/pcsoft 等不应再显示「可疑安装包已禁用」）
+      if (!realHard && (NS.hasValidIcpRecord() || (ageDays != null && ageDays >= 3650) || NS.looksLikeUltraMatureWhoisDomain())) {
+        try {
+          if (typeof NS.forceLiftSoftProtectionForTrustedPortal === "function") {
+            NS.forceLiftSoftProtectionForTrustedPortal(NS.hasValidIcpRecord() ? "valid-icp-force-lift" : "whois-ultra-force-lift");
+          } else {
+            NS.clearBrandSpoofFalsePositive("valid-icp");
+            state.remoteDownloadDispatchDetected = false;
+            NS.enterIntelLightMode("valid-icp");
+            NS.maybeLiftDownloadGuard();
+          }
+        } catch { /* ignore */ }
         if (gen === c.intelGeneration) c.intelDoneForUrl = urlKey;
-        NS.maybeLiftDownloadGuard(); NS.markAnalysisComplete("valid-icp"); NS.emitRiskReport(true);
-        if (!(NS.looksLikeUltraMatureWhoisDomain() || NS.looksLikeUltraMatureIcpDomain() || (ageDays != null && ageDays >= 3650))) return;
+        NS.markAnalysisComplete(NS.hasValidIcpRecord() ? "valid-icp" : "whois-ultra-mature");
+        NS.emitRiskReport(true);
+        return;
       }
-      if (!NS.hasValidIcpRecord() && state._pendingSoftBrandSpoof && state._icpQuerySettled && !state._seoCloakKitDetected && !state._fakeSpaDetected) {
-        state._pendingSoftBrandSpoof = false;
-        try { if (NS.detectBrandSpoofDownloadPortal()) state._brandSpoofPortalDetected = true; } catch { /* ignore */ }
+      if (realHard && state.downloadGuardInstalled) {
+        try { NS.disableAllDownloadIntentControls(); NS.postToHooks({ type: "set-guard", enabled: true }); } catch { /* ignore */ }
+      }
+      if (!NS.hasValidIcpRecord() && state._icpQuerySettled && !state._seoCloakKitDetected && !state._fakeSpaDetected) {
+        if (state._pendingSoftBrandSpoof || !state._brandSpoofPortalDetected) {
+          state._pendingSoftBrandSpoof = false;
+          try {
+            state._analysisDone = false;
+            if (NS.detectBrandSpoofDownloadPortal()) state._brandSpoofPortalDetected = true;
+            NS.scanSuspiciousPackagesFast(true);
+          } catch { /* ignore */ }
+        }
       }
       if (NS.looksLikeUltraMatureWhoisDomain() || NS.looksLikeUltraMatureIcpDomain() || (NS.hasValidIcpRecord() && ageDays != null && ageDays >= 3650)) {
+        try { if (typeof NS.forceLiftSoftProtectionForTrustedPortal === "function") NS.forceLiftSoftProtectionForTrustedPortal("whois-ultra-mature"); } catch { /* ignore */ }
         NS.enterIntelLightMode("whois-ultra-mature"); NS.clearBrandSpoofFalsePositive("whois-ultra-mature");
         if (gen === c.intelGeneration) c.intelDoneForUrl = urlKey;
         NS.maybeLiftDownloadGuard(); NS.markAnalysisComplete("whois-ultra-mature"); NS.emitRiskReport(true); return;
@@ -347,8 +486,32 @@
     try { NS.startIcpWhoisIntelEarly("boot-document-start"); } catch (e) { console.warn("early WHOIS/ICP start failed", e); }
 
     try {
-      NS.scheduleIdle(() => { try { if (NS.pageLooksLikeLegitimateOfficialDownload() || NS.looksLikeMatureOfficialPortal()) { NS.notifyHooksOfficialSafe(true); if (state.downloadGuardInstalled || state._earlyShellArmed) NS.clearDownloadGuard("boot-official-portal"); } } catch { /* ignore */ } }, 400);
-      NS.scheduleIdle(() => { try { if (NS.pageLooksLikeLegitimateOfficialDownload() || NS.looksLikeMatureOfficialPortal() || NS.shouldNeverArmProtection()) { NS.notifyHooksOfficialSafe(true); NS.maybeLiftDownloadGuard(); } } catch { /* ignore */ } }, 2000);
+      NS.scheduleIdle(() => {
+        try {
+          if (typeof NS.hasHardThreatKitLocked === "function" && NS.hasHardThreatKitLocked()) {
+            NS.disableAllDownloadIntentControls();
+            NS.postToHooks({ type: "set-guard", enabled: true });
+            return;
+          }
+          if (NS.pageLooksLikeLegitimateOfficialDownload() || NS.looksLikeMatureOfficialPortal()) {
+            NS.notifyHooksOfficialSafe(true);
+            if (state.downloadGuardInstalled || state._earlyShellArmed) NS.clearDownloadGuard("boot-official-portal");
+          }
+        } catch { /* ignore */ }
+      }, 400);
+      NS.scheduleIdle(() => {
+        try {
+          if (typeof NS.hasHardThreatKitLocked === "function" && NS.hasHardThreatKitLocked()) {
+            NS.disableAllDownloadIntentControls();
+            NS.postToHooks({ type: "set-guard", enabled: true });
+            return;
+          }
+          if (NS.pageLooksLikeLegitimateOfficialDownload() || NS.looksLikeMatureOfficialPortal() || NS.shouldNeverArmProtection()) {
+            NS.notifyHooksOfficialSafe(true);
+            NS.maybeLiftDownloadGuard();
+          }
+        } catch { /* ignore */ }
+      }, 2000);
     } catch { /* ignore */ }
 
     try { if (chrome?.runtime?.id) chrome.runtime.sendMessage({ type: "set-tab-protect", enabled: false, url: location.href }, () => { void chrome.runtime.lastError; }); } catch { /* ignore */ }
@@ -426,13 +589,34 @@
           if (state._analysisDone && !state.downloadGuardInstalled) state._analysisDone = false;
           NS.scanSuspiciousPackagesFast(true); NS.emitRiskReport(true); return;
         }
-        if (state._analysisDone && !state.downloadGuardInstalled) { NS.emitRiskReport(true); return; }
+        // 早扫可能在 DOM/脚本未就绪时 primary-clean；load 时对下载壳/挂起品牌强制复扫
+        if (state._analysisDone && !state.downloadGuardInstalled && !state._pendingSoftBrandSpoof && !state._pendingEncryptedSpa) {
+          let needRescan = false;
+          try {
+            needRescan = !!(document.querySelector(".download-btn, #mainDownloadBtn, a.download-uri, [class*='btn-download']")
+              || /官网|官方下载|立即下载/i.test(document.title || "")
+              || state._pendingSoftBrandSpoof);
+          } catch { /* ignore */ }
+          if (!needRescan) { NS.emitRiskReport(true); return; }
+          state._analysisDone = false;
+          state._remoteApiChecked = false;
+        }
         if (NS.looksLikeUltraMatureIcpDomain() || state._intelLightMode) { NS.enterIntelLightMode("load-ultra-mature"); NS.maybeLiftDownloadGuard(); NS.markAnalysisComplete("load-ultra-mature"); return; }
-        NS.scanSuspiciousPackagesFast();
+        NS.scanSuspiciousPackagesFast(true);
         if (state._pendingEncryptedSpa || NS.shouldDeferAnalysisCompleteForEncryptedSpa()) { NS.armEncryptedSpaLateRescan(); NS.emitRiskReport(true); return; }
-        if (state._perfBenign || NS.isBenignContentPage() || NS.shouldNeverArmProtection()) { NS.maybeLiftDownloadGuard(); NS.markAnalysisComplete("load-benign"); return; }
-        if (state._analysisDone) { NS.emitRiskReport(true); return; }
-        NS.detectLinkedLandingPageSources().catch(() => {}).finally(() => { NS.maybeLiftDownloadGuard(); NS.finalize(); });
+        const hasDlTargets = typeof NS.pageHasProactiveDownloadButtonTargets === "function"
+          && NS.pageHasProactiveDownloadButtonTargets();
+        // 首页有下载按钮：不因 benign 跳过主动 fetch
+        if (NS.shouldNeverArmProtection()) { NS.maybeLiftDownloadGuard(); NS.markAnalysisComplete("load-trusted"); return; }
+        if ((state._perfBenign || NS.isBenignContentPage()) && !hasDlTargets) {
+          NS.maybeLiftDownloadGuard(); NS.markAnalysisComplete("load-benign"); return;
+        }
+        if (state._analysisDone && !hasDlTargets) { NS.emitRiskReport(true); return; }
+        // 主动探测下载按钮上的地址（与 scan 内互补；load 时再补一轮）
+        const probe = typeof NS.proactivelyProbeDownloadButtons === "function"
+          ? NS.proactivelyProbeDownloadButtons()
+          : NS.detectLinkedLandingPageSources();
+        Promise.resolve(probe).catch(() => {}).finally(() => { NS.maybeLiftDownloadGuard(); NS.finalize(); });
       }, 600);
       setTimeout(() => {
         if (state._analysisDone && !state.downloadGuardInstalled && !state._pendingEncryptedSpa) return;

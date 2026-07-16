@@ -5,6 +5,53 @@
 ;(function (NS) {
   "use strict";
 
+  /**
+   * 大型内容 SPA 结构启发（无域名白名单）。
+   * 用于同站 soft-nav 跳过全量复扫：DOM 巨大 + 无「官网下载」仿冒壳话术。
+   * GitHub / GitLab / 文档站等自然命中；银狐落地页通常节点少且标题含官方下载。
+   */
+  NS.pageLooksLikeHeavyContentSpa = function () {
+    try {
+      const state = NS.state;
+      if (state && (state.downloadGuardInstalled || state._seoCloakKitDetected || state._fakeSpaDetected
+        || state._brandSpoofPortalDetected || state._desktopForceDlKit || state._remoteGarbleDlDetected
+        || state._fakeBrandShellDetected)) return false;
+      const title = String(document.title || "");
+      // 仿冒下载壳话术 → 必须继续扫
+      if (/官网|官方下载|官方正版|官方网站|官方客户端|电脑版官网|立即免费下载|全平台官方/i.test(title)) return false;
+      let nodes = 0; let links = 0; let scripts = 0;
+      try { nodes = document.getElementsByTagName("*").length; } catch { nodes = 0; }
+      try { links = document.links ? document.links.length : document.querySelectorAll("a[href]").length; } catch { links = 0; }
+      try { scripts = document.scripts ? document.scripts.length : 0; } catch { scripts = 0; }
+      // 大型应用壳：节点/链接/脚本密度高
+      if (nodes >= 1200 && links >= 30) return true;
+      if (nodes >= 800 && links >= 40 && scripts >= 6) return true;
+      if (nodes >= 2000) return true;
+      return false;
+    } catch { return false; }
+  };
+
+  /**
+   * 同站 soft-nav 是否应保持 light、跳过 reset+全量复扫（纯状态/结构逻辑，非域名名单）。
+   */
+  NS.shouldKeepLightOnSameHostSoftNav = function () {
+    try {
+      const state = NS.state;
+      if (!state) return false;
+      if (state.downloadGuardInstalled || state._seoCloakKitDetected || state._fakeSpaDetected
+        || state._brandSpoofPortalDetected || state._desktopForceDlKit || state._remoteGarbleDlDetected
+        || state._fakeBrandShellDetected || state._indexNowPhishTemplate) return false;
+      if (/官网|官方下载|官方正版|官方客户端|立即免费下载/i.test(document.title || "")) return false;
+      if (state._intelLightMode || state._perfBenign) return true;
+      if (state._analysisDone && (state.score || 0) < 12) return true;
+      if (typeof NS.pageLooksLikeHeavyContentSpa === "function" && NS.pageLooksLikeHeavyContentSpa()) return true;
+      // WHOIS 超成熟（≥10 年）属证据逻辑，非站点名单
+      if (typeof NS.looksLikeUltraMatureWhoisDomain === "function" && NS.looksLikeUltraMatureWhoisDomain()) return true;
+      if (typeof NS.looksLikeUltraMatureIcpDomain === "function" && NS.looksLikeUltraMatureIcpDomain()) return true;
+      return false;
+    } catch { return false; }
+  };
+
   NS.getWhoisAgeDays = function () {
     try {
       const m = /已注册\s*(\d+)\s*天/.exec(NS.state.whoisInfo || "");
@@ -23,10 +70,24 @@
     } catch { return false; }
   };
 
-  NS.looksLikeUltraMatureIcpDomain = function () {
+  /** 纯 WHOIS 年龄 ≥10 年（百度/pcsoft 等）——不因套件标志失效 */
+  NS.isWhoisAgeUltraMature = function () {
+    try {
+      const days = NS.getWhoisAgeDays();
+      return days != null && days >= 3650;
+    } catch { return false; }
+  };
+
+  /** 真硬套件（SEO 壳/强制弹窗/乱码包）——超成熟域也仅这三类可继续锁 */
+  NS.hasRealHardKitThreat = function () {
     try {
       const state = NS.state;
-      if (state._seoCloakKitDetected || state._fakeSpaDetected) return false;
+      return !!(state._seoCloakKitDetected || state._desktopForceDlKit || state._remoteGarbleDlDetected || state._indexNowPhishTemplate);
+    } catch { return false; }
+  };
+
+  NS.looksLikeUltraMatureIcpDomain = function () {
+    try {
       if (!NS.hasValidIcpRecord()) return false;
       const days = NS.getWhoisAgeDays();
       return days != null && days >= 3650;
@@ -35,19 +96,90 @@
 
   NS.looksLikeUltraMatureWhoisDomain = function () {
     try {
-      const state = NS.state;
-      if (state._seoCloakKitDetected || state._fakeSpaDetected) return false;
-      const days = NS.getWhoisAgeDays();
-      return days != null && days >= 3650;
+      return typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature();
     } catch { return false; }
   };
 
   NS.looksLikeLongLivedWhoisDomain = function () {
     try {
-      const state = NS.state;
-      if (state._seoCloakKitDetected || state._fakeSpaDetected) return false;
       const days = NS.getWhoisAgeDays();
       return days != null && days >= 1825;
+    } catch { return false; }
+  };
+
+  /**
+   * 可信门户软误报一键解除：有效 ICP 或 WHOIS≥10 年。
+   * 清 soft flags + guard + packageBlocked，避免 popup 仍显示「可疑安装包已禁用」。
+   */
+  NS.forceLiftSoftProtectionForTrustedPortal = function (reason) {
+    try {
+      const state = NS.state;
+      if (typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat()) return false;
+      const trusted = NS.hasValidIcpRecord()
+        || (typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature())
+        || (NS.getWhoisAgeDays() != null && NS.getWhoisAgeDays() >= 3650);
+      if (!trusted) return false;
+      state._brandSpoofPortalDetected = false;
+      state._brandResourceMismatchDetected = false;
+      state._fakeBrandShellDetected = false;
+      state._cloneOfficialDetected = false;
+      state._multiPlatformSerpTrap = false;
+      // 大型门户 SPA 误报的「加密 SPA」不阻挡抬锁
+      if (!state._seoCloakKitDetected && !state._desktopForceDlKit && !state._remoteGarbleDlDetected) {
+        state._fakeSpaDetected = false;
+      }
+      state.remoteDownloadDispatchDetected = false;
+      state.spoofBrand = "";
+      state._pendingSoftBrandSpoof = false;
+      state._earlyShellArmed = false;
+      state.protectedTargets = [];
+      try {
+        state.details = (state.details || []).filter((d) => {
+          if (!d) return false;
+          if (/已启用安装包下载拦截|已启用仿冒站|已启用异常跳转|非用户手势|可疑安装包|页面嵌入可疑|探测到下载|仿冒品牌官网|主动探测仿冒|主动探测：|无ICP备案|跨域跳转|自动跳转|自动下载|与标题品牌|疑似仿冒官网/i.test(d.name || "")
+            || /主动探测仿冒|与标题品牌|疑似仿冒官网/i.test(d.reason || "")) return false;
+          return true;
+        });
+        if (state.signalSet && typeof state.signalSet.clear === "function") {
+          const keep = [];
+          state.signalSet.forEach((k) => {
+            if (!/已启用安装包|已启用仿冒|非用户手势|仿冒品牌|主动探测仿冒|跨域跳转|自动跳转/i.test(String(k))) keep.push(k);
+          });
+          state.signalSet.clear();
+          keep.forEach((k) => state.signalSet.add(k));
+        }
+        state.score = (state.details || []).reduce((s, d) => s + (Number(d.weight) || 0), 0);
+      } catch { /* ignore */ }
+      // 强制清 guard 标志后再 clear（避免 hard-lock 误挡）；并连发恢复 DOM
+      state.downloadGuardInstalled = false;
+      state._earlyShellArmed = false;
+      try { NS.clearDownloadGuard(reason || "trusted-portal-soft-lift"); } catch { /* ignore */ }
+      try {
+        NS.applyDownloadGuardDomLock(false);
+        NS.reEnableAllThreatDisabledElements();
+        NS.postToHooks({ type: "set-guard", enabled: false });
+        NS.notifyHooksOfficialSafe(true);
+        NS.postToHooks({ type: "set-light-page", enabled: true });
+        // 抗 SPA 重绘：短延迟再恢复一次
+        [0, 80, 300, 800, 2000].forEach((ms) => {
+          setTimeout(() => {
+            try {
+              if (NS.hasValidIcpRecord() || (typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature())) {
+                NS.state.downloadGuardInstalled = false;
+                NS.applyDownloadGuardDomLock(false);
+                NS.reEnableAllThreatDisabledElements();
+                NS.postToHooks({ type: "set-guard", enabled: false });
+                NS.notifyHooksOfficialSafe(true);
+              }
+            } catch { /* ignore */ }
+          }, ms);
+        });
+      } catch { /* ignore */ }
+      state._perfBenign = true;
+      state._perfBenignAt = Date.now();
+      state._intelLightMode = true;
+      try { NS.emitRiskReport(true); } catch { /* ignore */ }
+      return true;
     } catch { return false; }
   };
 
@@ -66,29 +198,42 @@
     } catch { /* ignore */ }
   };
 
-  /** 清除软品牌仿冒误报（有真实 ICP / 超长 WHOIS）。硬套件留给各自检测器。 */
+  /** 清除软品牌仿冒误报（有真实 ICP / 超长 WHOIS）。硬套件（品牌壳/SEO/乱码等）不抬 guard、不恢复按钮。 */
   NS.clearBrandSpoofFalsePositive = function (reason) {
     const state = NS.state;
     void reason;
+    const hardLocked = typeof NS.hasHardThreatKitLocked === "function" && NS.hasHardThreatKitLocked();
     state._brandSpoofPortalDetected = false;
     state.spoofBrand = "";
     state._pendingSoftBrandSpoof = false;
     try { NS.dismissPageToast(); } catch { /* ignore */ }
     try {
+      // 仅清软品牌信号；保留「仿冒品牌官网下载壳」等硬套件信号
       state.details = (state.details || []).filter((d) => {
         if (!d) return false;
         if (d.name === "无ICP备案信息") return false;
-        if (/仿冒品牌官网|仿冒站下载拦截|已启用仿冒站|已启用安装包下载拦截/i.test(d.name || "")) return false;
-        if (/仿冒|官网下载站|不匹配/i.test(d.reason || "") && /仿冒|品牌/i.test(d.name || "")) return false;
+        if (/仿冒品牌官网下载壳|多入口共用动态下载|反调试/i.test(d.name || "")) return true;
+        if (/仿冒品牌官网|仿冒站下载拦截|已启用仿冒站|主动探测仿冒|主动探测：/i.test(d.name || "")) return false;
+        if (/仿冒|官网下载站|不匹配|与标题品牌/i.test(d.reason || "") && /仿冒|品牌|主动探测/i.test(d.name || "") && !/下载壳/i.test(d.name || "")) return false;
         return true;
       });
       if (state.signalSet && typeof state.signalSet.forEach === "function") {
         const drop = [];
-        state.signalSet.forEach((k) => { if (/仿冒品牌官网|仿冒站下载|无ICP备案|安装包下载拦截/i.test(String(k))) drop.push(k); });
+        state.signalSet.forEach((k) => {
+          const s = String(k);
+          if (/仿冒品牌官网下载壳|多入口共用|反调试/i.test(s)) return;
+          if (/仿冒品牌官网|仿冒站下载|主动探测仿冒|无ICP备案/i.test(s)) drop.push(k);
+        });
         drop.forEach((k) => state.signalSet.delete(k));
       }
       state.score = (state.details || []).reduce((s, d) => s + (Number(d.weight) || 0), 0);
     } catch { /* ignore */ }
+    if (hardLocked) {
+      // 硬套件仍需禁用按钮
+      try { NS.disableAllDownloadIntentControls(); NS.postToHooks({ type: "set-guard", enabled: true }); } catch { /* ignore */ }
+      try { NS.emitRiskReport(true); } catch { /* ignore */ }
+      return;
+    }
     try {
       if (state.downloadGuardInstalled || state._earlyShellArmed || (state.protectedTargets && state.protectedTargets.length) || document.querySelector("[data-threat-detector-disabled='1'], [data-silverfox-greyed='1']")) {
         NS.clearDownloadGuard(reason || "icp-clear-brand-spoof");
@@ -109,8 +254,21 @@
     state._perfBenign = true;
     state._perfBenignAt = Date.now();
     state._intelLightMode = true;
-    if (NS.hasValidIcpRecord() || NS.looksLikeUltraMatureWhoisDomain() || NS.looksLikeUltraMatureIcpDomain()) {
+    // 真硬套件才保持锁；软假阳性在可信门户上强制抬
+    const realHard = typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat();
+    if (!realHard && (NS.hasValidIcpRecord() || NS.looksLikeUltraMatureWhoisDomain() || NS.looksLikeUltraMatureIcpDomain()
+      || (typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature()))) {
+      try {
+        if (typeof NS.forceLiftSoftProtectionForTrustedPortal === "function") {
+          NS.forceLiftSoftProtectionForTrustedPortal(reason || "intel-light");
+          return;
+        }
+      } catch { /* ignore */ }
       NS.clearBrandSpoofFalsePositive(reason || "intel-light");
+    }
+    if (realHard) {
+      try { NS.disableAllDownloadIntentControls(); NS.postToHooks({ type: "set-guard", enabled: true }); } catch { /* ignore */ }
+      return;
     }
     try { NS.notifyHooksOfficialSafe(true); NS.postToHooks({ type: "set-light-page", enabled: true }); } catch { /* ignore */ }
     if (state.downloadGuardInstalled || state._earlyShellArmed || (state.protectedTargets && state.protectedTargets.length) || document.querySelector("[data-threat-detector-disabled='1'], [data-silverfox-greyed='1']")) {
@@ -121,9 +279,10 @@
   NS.looksLikeMatureOfficialPortal = function () {
     try {
       const state = NS.state;
-      if (state._seoCloakKitDetected || state._fakeSpaDetected) return false;
+      // 真硬套件仍可判非成熟；纯年龄/ICP 不受 fakeSpa 误报影响
+      if (typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat()) return false;
       const days = NS.getWhoisAgeDays();
-      if (days != null && days >= 3650) return true; // 国际长生命周期域名（github.com）
+      if (days != null && days >= 3650) return true; // 百度/pcsoft 等超长生命周期
       if (!NS.hasValidIcpRecord()) return false;
       if (days == null || days < 365) return false;
       if (days >= 3650) return true;
@@ -157,12 +316,21 @@
   NS.shouldNeverArmProtection = function () {
     try {
       const state = NS.state;
-      if (NS.hasValidIcpRecord() && !state._seoCloakKitDetected && !state._fakeSpaDetected && !state._desktopForceDlKit) {
+      // 超成熟 WHOIS（≥10 年，如百度 9774 天）：仅 SEO/强制弹窗/乱码可继续视为威胁
+      if (typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature()) {
+        if (typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat()) return false;
+        state._brandSpoofPortalDetected = false;
+        state._brandResourceMismatchDetected = false;
+        return true;
+      }
+      // 有效 ICP：不被 fakeSpa / 软品牌仿冒卡住（大型门户易误报加密 SPA）
+      if (NS.hasValidIcpRecord() && !(typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat())) {
         if (state._brandSpoofPortalDetected) NS.clearBrandSpoofFalsePositive("should-never-arm-icp");
         state._brandResourceMismatchDetected = false;
         return true;
       }
-      if (NS.looksLikeUltraMatureWhoisDomain() || NS.looksLikeUltraMatureIcpDomain()) {
+      if (NS.looksLikeUltraMatureIcpDomain()) {
+        if (typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat()) return false;
         state._brandSpoofPortalDetected = false;
         state._brandResourceMismatchDetected = false;
         return true;
@@ -170,7 +338,9 @@
       if (state._seoCloakKitDetected || state._brandSpoofPortalDetected || state._fakeSpaDetected || state._brandResourceMismatchDetected) {
         if (state._brandResourceMismatchDetected && (NS.looksLikeUltraMatureIcpDomain() || NS.looksLikeMatureOfficialPortal() || NS.looksLikeLongLivedWhoisDomain())) {
           state._brandResourceMismatchDetected = false;
-        } else if (state._seoCloakKitDetected || state._fakeSpaDetected) {
+        } else if (state._seoCloakKitDetected || state._desktopForceDlKit || state._remoteGarbleDlDetected) {
+          return false;
+        } else if (state._fakeSpaDetected && !(NS.hasValidIcpRecord() || NS.looksLikeLongLivedWhoisDomain())) {
           return false;
         } else if (state._brandSpoofPortalDetected && NS.looksLikeLongLivedWhoisDomain()) {
           state._brandSpoofPortalDetected = false;
@@ -192,6 +362,8 @@
   };
 
   NS.pageClaimsOfficialDownload = function () {
+    // 应用商店/手机助手详情：是商店在分发 App，不是宣称自己是该 App 官网
+    if (typeof NS.pageLooksLikeAppMarketOrAppStoreListing === "function" && NS.pageLooksLikeAppMarketOrAppStoreListing()) return false;
     const title = document.title || "";
     const text = ((document.body && document.body.innerText) || "").replace(/\s+/g, " ").trim().slice(0, 4000);
     const blob = `${title} ${text}`;
@@ -229,6 +401,7 @@
   NS.pageClaimsBrandDownloadLanding = function () {
     if (NS.pageLooksLikeSearchEngineResultsPage()) return false;
     if (NS.pageLooksLikeThirdPartyBrandProxyOrMirror()) return false;
+    if (typeof NS.pageLooksLikeAppMarketOrAppStoreListing === "function" && NS.pageLooksLikeAppMarketOrAppStoreListing()) return false;
     if (NS.pageClaimsOfficialDownload()) return true;
     try {
       const title = document.title || "";
@@ -238,9 +411,22 @@
       const og = document.querySelector('meta[property="og:title"]')?.getAttribute("content") || "";
       const claim = `${title} ${headings} ${og}`;
       const body = ((document.body && (document.body.innerText || document.body.textContent)) || "").replace(/\s+/g, " ").trim().slice(0, 5000);
-      const blob = `${claim} ${String(desc).slice(0, 400)} ${body}`;
-      if (/客户端\s*完全\s*免费|客户端永久免费|免费下载|开始使用\s*[A-Za-z]{3,}|电脑版官网|官方桌面/i.test(claim) || /下载\s*(?!代理|加速|镜像)[A-Za-z一-鿿]{2,20}/i.test(claim) || /客户端\s*完全\s*免费|客户端永久免费|开始使用\s*[A-Za-z]{3,}/i.test(blob)) {
-        if (/免费下载/i.test(blob) && !/客户端|安装包|官方|开始使用|全平台|电脑版/i.test(claim + blob.slice(0, 500))) { /* weak */ }
+      // 导航/按钮「免费下载」也算（勿只扫 title——仿冒首页 title 常是「安静·纯净·强悍」）
+      let ctaBits = "";
+      try {
+        ctaBits = Array.from(document.querySelectorAll("a[href], button, .btn-header, .btn-primary, .btn-lg"))
+          .slice(0, 30)
+          .map((el) => (el.textContent || "").replace(/\s+/g, " ").trim())
+          .filter((t) => t.length >= 2 && t.length <= 28 && /下载|官方|客户端|安装|免费/i.test(t))
+          .join(" ");
+      } catch { /* ignore */ }
+      const blob = `${claim} ${String(desc).slice(0, 400)} ${body} ${ctaBits}`;
+      // 免费下载 须在 claim 或 CTA/正文中命中（原先只测 claim，首页误杀）
+      if (/客户端\s*完全\s*免费|客户端永久免费|免费下载|立即免费下载|立即下载|开始使用\s*[A-Za-z]{3,}|电脑版官网|官方桌面/i.test(claim)
+        || /免费下载|立即免费下载|立即下载|官方下载|客户端下载|个人版下载/i.test(ctaBits)
+        || /下载\s*(?!代理|加速|镜像)[A-Za-z一-鿿]{2,20}/i.test(claim)
+        || /客户端\s*完全\s*免费|客户端永久免费|开始使用\s*[A-Za-z]{3,}|免费下载|立即免费下载/i.test(blob)) {
+        if (/免费下载/i.test(blob) && !/客户端|安装包|官方|开始使用|全平台|电脑版|个人版|安全|杀毒|下载/i.test(claim + ctaBits + blob.slice(0, 500))) { /* weak */ }
         else if (/下载(?:代理|加速|镜像)|加速下载|代理服务/i.test(claim) && !/官方|客户端|安装包|官网/i.test(claim)) { /* proxy */ }
         else return true;
       }
@@ -304,9 +490,14 @@
     const h = String(html || "");
     const hasGlobalUri = /window\.download_uri\b|download_uri\s*=\s*|var\s+download_uri\b|let\s+download_uri\b|const\s+download_uri\b/i.test(h) || /window\.(?:downloadUrl|downloadURL|down_url|dl_url|packageUrl)\s*=/i.test(h);
     if (!hasGlobalUri) return false;
-    const multiAssign = /getElementsByClassName\s*\(\s*['"]download-uri['"]\s*\)/i.test(h) || /querySelectorAll\s*\(\s*['"][^'"]*download-uri[^'"]*['"]\s*\)/i.test(h) || /initDownloadLinks/i.test(h)
+    const multiAssign = /getElementsByClassName\s*\(\s*['"]download-uri['"]\s*\)/i.test(h)
+      || /querySelectorAll\s*\(\s*['"][^'"]*download-uri[^'"]*['"]\s*\)/i.test(h)
+      || /getElementsByClassName\s*\(\s*['"]download-btn['"]\s*\)/i.test(h)
+      || /querySelectorAll\s*\(\s*['"][^'"]*download-btn[^'"]*['"]\s*\)/i.test(h)
+      || /initDownloadLinks/i.test(h)
       || (/downloadElements/i.test(h) && /\.href\s*=\s*window\.download_uri|location\.href\s*=\s*window\.download_uri/i.test(h))
-      || (/\.href\s*=\s*window\.download_uri/i.test(h) && /for\s*\s*\(/i.test(h));
+      || (/\.href\s*=\s*window\.download_uri/i.test(h) && /for\s*\s*\(/i.test(h))
+      || (/download_uri/i.test(h) && /\.href\s*=\s*download_uri/i.test(h) && /for\s*\(/i.test(h));
     return multiAssign || (/download_uri/i.test(h) && /downloadElements\.length|for\s*\(\s*let\s+i\s*=\s*0/i.test(h));
   };
 
@@ -457,6 +648,8 @@
 
   NS.pageLooksLikeLegitimateOfficialDownload = function () {
     try {
+      // 发行版 ISO/镜像列表：合法下载页，非银狐 exe 壳
+      if (typeof NS.pageLooksLikeOsDistroIsoDownload === "function" && NS.pageLooksLikeOsDistroIsoDownload()) return true;
       try { const corr = NS.evaluateTitleHostBrandCorrelation(); if (corr && corr.mismatch) return false; } catch { /* ignore */ }
       if (typeof NS.hostLooksLikeBrandMarketingSpoof === "function" && NS.hostLooksLikeBrandMarketingSpoof()) return false;
       const full = NS.getHtmlSlice(100000);
@@ -483,7 +676,9 @@
 
   NS.isTrustedOfficialDownloadContext = function () {
     try {
+      if (typeof NS.hasHardThreatKitLocked === "function" && NS.hasHardThreatKitLocked()) return false;
       if (NS.hostLooksLikeBrandMarketingSpoof()) return false;
+      if (NS.state && NS.state._fakeBrandShellDetected) return false;
       if (NS.looksLikeMatureOfficialPortal()) return true;
       if (typeof NS.pageLooksLikeLegitimateOfficialDownload === "function" && NS.pageLooksLikeLegitimateOfficialDownload()) return true;
       if (NS.looksLikeOfficialBrandDownloadPage()) return true;
@@ -513,12 +708,42 @@
   NS.looksLikeSafeOfficialContext = function () {
     try {
       const state = NS.state;
-      if (state._seoCloakKitDetected || state._brandSpoofPortalDetected || state._fakeSpaDetected) return false;
+      if (state._seoCloakKitDetected || state._brandSpoofPortalDetected || state._fakeSpaDetected || state._fakeBrandShellDetected || state._desktopForceDlKit || state._remoteGarbleDlDetected || state._indexNowPhishTemplate) return false;
+      if (typeof NS.hasHardThreatKitLocked === "function" && NS.hasHardThreatKitLocked()) return false;
+      // 中文产品名 + 下载导流 + 域名无品牌拼音 → 绝非安全官方上下文（仿冒火绒首页）
+      try {
+        const title0 = document.title || "";
+        const cn0 = typeof NS.pickChineseBrandFromPageSurface === "function"
+          ? (NS.pickChineseBrandFromPageSurface(title0) || "")
+          : ((title0.match(/[一-鿿]{2,4}/) || [])[0] || "");
+        const host0 = (location.hostname || "").toLowerCase().replace(/^www\./, "");
+        const lab0 = (host0.split(".")[0] || "").replace(/-/g, "");
+        const hasDlHub0 = !!document.querySelector("a[href*='download.html'], a[href*='/download'], a.btn-header[href]");
+        const hasDlCta0 = /免费下载|立即下载|官方下载/i.test(
+          Array.from(document.querySelectorAll("a,button")).slice(0, 20).map((e) => e.textContent || "").join(" ")
+        );
+        // 夹带域 huorong-pc 也不是安全官方；仅精确品牌根域才可能安全
+        const labRaw0 = (host0.split(".")[0] || "").toLowerCase();
+        const core0 = typeof NS.inferMarketingPaddedBrandCore === "function"
+          ? (NS.inferMarketingPaddedBrandCore(labRaw0) || "")
+          : "";
+        const padded0 = !!(core0 && typeof NS.hostLabelIsPaddedBrand === "function"
+          && NS.hostLabelIsPaddedBrand(lab0, core0));
+        if (cn0 && cn0.length >= 2 && hasDlHub0 && hasDlCta0
+          && (padded0
+            || (!/^(huorong|hongrong|qihoo|sogou|baidu|dingtalk|todesk)$/i.test(lab0)
+              && !lab0.includes(String(cn0).slice(0, 2))))) {
+          return false;
+        }
+      } catch { /* ignore */ }
       try {
         const lab = (location.hostname || "").toLowerCase().replace(/^www\./, "").split(".")[0] || "";
         const claim = typeof NS.collectTitleAndHeadingClaimText === "function" ? NS.collectTitleAndHeadingClaimText() : (document.title || "");
-        const squat = typeof NS.titleBrandVsHostSquatShape === "function" ? NS.titleBrandVsHostSquatShape(claim, lab, "") : "";
+        const inferred = typeof NS.inferMarketingPaddedBrandCore === "function" ? (NS.inferMarketingPaddedBrandCore(lab) || "") : "";
+        const squat = typeof NS.titleBrandVsHostSquatShape === "function" ? NS.titleBrandVsHostSquatShape(claim, lab, inferred) : "";
         if (squat === "padded" || squat === "typo" || squat === "hyphen") return false;
+        if (inferred && typeof NS.hostLabelIsPaddedBrand === "function" && NS.hostLabelIsPaddedBrand(lab.replace(/-/g, ""), inferred)
+          && /[一-鿿]{2,}/.test(claim || document.title || "")) return false;
       } catch { /* ignore */ }
       if (typeof NS.hostLooksLikeBrandMarketingSpoof === "function" && NS.hostLooksLikeBrandMarketingSpoof()) return false;
       try {

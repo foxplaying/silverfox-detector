@@ -136,6 +136,7 @@
       if (PackageHeuristicsBg.looksLikeAndroidPackageIdName(baseName)) return false;
       if (PackageHeuristicsBg.looksLikeReadableInstallerStemBg(baseName)) return false;
       if (PackageHeuristicsBg.looksLikeProductSetupWithBuildId(baseName)) return false;
+      // 内容寻址哈希包名（MD5/SHA）：应用商店 CDN，非乱码
       if (/^[a-f0-9]{16,64}$/i.test(baseCheck)) return false;
       const withoutArch = baseName.replace(/[._-](x64|x86|x86_64|amd64|arm64|arm|win32|win64)$/i, "");
       if (PackageHeuristicsBg.hasGarbleDigitLetterSoup(withoutArch)) return true;
@@ -143,7 +144,8 @@
       if (/\.[0-9]{3,7}$/.test(baseName) && !/\d+\.\d+/.test(baseName) && !/^(?:[a-z][a-z0-9_]*\.){2,}/i.test(baseName)) return true;
       if (/^(?:app[_-]?setup|setup)[._-]\d{5,}/i.test(baseName)) return true;
       if (/(?:^|[._-])setup[._-]\d{5,}/i.test(baseName) && !/[a-zA-Z一-鿿]{4,}[._-]setup[._-]\d{5,}/i.test(baseName)) return true;
-      if (/^[a-f0-9]{12,}$/i.test(baseName)) return true;
+      // 短于 16 的 hex 仍可疑；16–64 已在上方放过
+      if (/^[a-f0-9]{12,15}$/i.test(baseName)) return true;
       if (/(?:^|[_\-.])(app|soft|client|proxy|intsoft)(?![a-z])[_\-.]?\d{5,}$/i.test(baseName)) return true;
       if (/(?:\d{3,}down|down\d{3,}|dl\d{3,})/i.test(baseName)) return true;
       if (/^(?:\d+down|down\d+|dl\d+)$/i.test(name)) return true;

@@ -117,7 +117,7 @@
 
   NS.NavBoot = NavBoot;
 
-  // 搜索页：no-op 轻路径；否则全量安装
+  // 搜索页：no-op 轻路径；否则全量安装（大站 light 由 content 侧 soft-nav 结构逻辑负责，非域名名单）
   const boot = new NavBoot();
   if (PageShellDetector.isSearchUrlShapeEarly()) {
     boot.installSearchLight();

@@ -49,7 +49,8 @@
     _analysisDone: false, _analysisDoneAt: 0,
     _icpQuerySettled: false, _icpQueryFailed: false,
     _pageBootAt: Date.now(),
-    _pendingEncryptedSpa: false, _encryptedSpaRescanArmed: false
+    _pendingEncryptedSpa: false, _encryptedSpaRescanArmed: false,
+    _proactiveProbeAt: 0, _proactiveProbeBusy: false
   };
 
   // 模块级缓存（HTML / 下载按钮 / SERP）

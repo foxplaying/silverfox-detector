@@ -9,6 +9,7 @@
 
   NS.ICP_FETCH_HOSTS = new Set([
     "icp.aizhan.com",
+    "beiancx.com",
     "uapis.cn",
     "rdap.ss",
     "whoiscx.com"
@@ -137,7 +138,18 @@
         if (tabId != null) {
           chrome.storage.local.get(["latestNotice"], (r) => { if (r.latestNotice && (r.latestNotice.tabId == null || r.latestNotice.tabId === tabId)) chrome.storage.local.remove(["latestNotice"], () => { void chrome.runtime.lastError; }); });
         }
-        try { chrome.notifications.getAll((all) => { void chrome.runtime.lastError; const ids = Object.keys(all || {}); for (const id of ids) { try { chrome.notifications.clear(id, () => { void chrome.runtime.lastError; }); } catch { /* ignore */ } } }); } catch { /* ignore */ }
+        try {
+          if (typeof NS.clearAllSilverfoxNotifications === "function") NS.clearAllSilverfoxNotifications();
+          else {
+            chrome.notifications.getAll((all) => {
+              void chrome.runtime.lastError;
+              const ids = Object.keys(all || {});
+              for (const id of ids) {
+                try { chrome.notifications.clear(id, () => { void chrome.runtime.lastError; }); } catch { /* ignore */ }
+              }
+            });
+          }
+        } catch { /* ignore */ }
         try { sendResponse({ success: true }); } catch { /* ignore */ }
         return;
       }
@@ -219,7 +231,9 @@
           NS.withExistingTab(tabId, () => { try { chrome.action.setTitle({ tabId, title: `${title}: ${message}` }, () => { void chrome.runtime.lastError; }); } catch { /* ignore */ } });
         }
         chrome.storage.local.set({ latestNotice: { title, message, tabId, url: sender.tab?.url || msg.url || "", timestamp: Date.now() } });
-        NS.showBlockedNotification(title, message, tabId, !!msg.force).then((ok) => { try { sendResponse({ success: !!ok }); } catch { /* ignore */ } }).catch(() => { try { sendResponse({ success: false }); } catch { /* ignore */ } });
+        // 仿冒/跳转身份类：始终 force，避免 40min 冷却吞掉右下角系统通知
+        const forceNotice = !!msg.force || isIdentityNotice;
+        NS.showBlockedNotification(title, message, tabId, forceNotice).then((ok) => { try { sendResponse({ success: !!ok }); } catch { /* ignore */ } }).catch(() => { try { sendResponse({ success: false }); } catch { /* ignore */ } });
         return true;
       }
       if (msg.type === "fetchPageText") return handleFetchPageText(msg, sendResponse);

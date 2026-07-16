@@ -70,10 +70,43 @@
       this._installProgrammaticClickPatch();
       // 搜索框聚焦 -> light（建议列表即将爆炸 DOM）
       this._installSearchFocusPromote();
+      // 大型内容 SPA：DOM 变大后 light 并拆掉原型 wrap（行为启发，非域名名单）
+      this._installBenignSpaLightPromote();
       // content -> MAIN 消息桥
       this._installContentBridge();
 
       try { window.postMessage({ source: "silverfox-detector-hooks", type: "hooks-ready" }, "*"); } catch { /* ignore */ }
+    }
+
+    /**
+     * 大型内容应用壳：节点/链接密集且无仿冒下载话术 → light + 还原原型。
+     * 避免 GitHub 类 SPA 上 setAttribute wrap 拖死主线程。
+     */
+    _installBenignSpaLightPromote() {
+      const policy = this.policy;
+      const restoreList = this.restoreList;
+      let done = false;
+      const promote = () => {
+        if (done) return;
+        try {
+          const alreadyLight = !!(policy.officialSafe || policy.lightPage);
+          const heavy = typeof PageContext.pageLooksLikeHeavyContentAppShell === "function"
+            && PageContext.pageLooksLikeHeavyContentAppShell();
+          if (!alreadyLight && !heavy) return;
+          if (heavy) policy.lightPage = true;
+          try { DomGuard.restoreNativeDomProtos(restoreList); } catch { /* ignore */ }
+          done = true;
+        } catch { /* ignore */ }
+      };
+      try {
+        [0, 50, 150, 400, 1000, 2500].forEach((ms) => { setTimeout(promote, ms); });
+        if (document.readyState === "loading") {
+          document.addEventListener("DOMContentLoaded", promote, { once: true });
+        }
+        document.addEventListener("readystatechange", () => {
+          if (document.readyState === "interactive" || document.readyState === "complete") promote();
+        });
+      } catch { /* ignore */ }
     }
 
     _installClickInterceptor() {
@@ -378,7 +411,10 @@
   NS.PageHooks = PageHooks;
 
   const hooks = new PageHooks();
-  if (PageContext.isSearchUrlShapeEarly()) {
+  // 搜索 / densitydpi 等 document_start 行为信号：不装重型 wrap；其余先装，再按 DOM 结构 promote light
+  if (PageContext.isSearchUrlShapeEarly()
+    || (typeof PageContext.shouldUseLightHooksEarly === "function" && PageContext.shouldUseLightHooksEarly())) {
+    try { hooks.policy.lightPage = true; } catch { /* ignore */ }
     hooks.installSearchLight();
   } else {
     hooks.install();

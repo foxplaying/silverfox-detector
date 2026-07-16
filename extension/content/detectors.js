@@ -42,7 +42,7 @@
           if (/^zhizhu[_-]/i.test(k) || /zhizhu_(?:main_domain|processed|timestamp)/i.test(k)) {
             state._seoCloakKitDetected = true;
             NS.addSignal("SEO伪装跳转脚本", 24, `localStorage 键: ${k}`);
-            NS.installDownloadGuard("检测到 SEO 伪装跳转套件 (storage)", { notify: true, message: "SEO伪装跳转", forceNotify: true });
+            NS.installDownloadGuard("检测到 SEO 伪装跳转套件 (storage)", { notify: true, message: "SEO伪装跳转", forceNotify: true, lockHard: true });
             NS.postToHooks({ type: "set-guard", enabled: true });
             NS.armBackgroundProtect("full");
             return true;
@@ -53,7 +53,7 @@
         if (typeof window.zhizhuDebug === "object" && window.zhizhuDebug) {
           state._seoCloakKitDetected = true;
           NS.addSignal("SEO伪装跳转脚本", 24, "window.zhizhuDebug 调试接口");
-          NS.installDownloadGuard("检测到 SEO 伪装跳转套件 (debug API)", { notify: true, message: "SEO伪装跳转", forceNotify: true });
+          NS.installDownloadGuard("检测到 SEO 伪装跳转套件 (debug API)", { notify: true, message: "SEO伪装跳转", forceNotify: true, lockHard: true });
           NS.postToHooks({ type: "set-guard", enabled: true });
           NS.armBackgroundProtect("full");
           return true;
@@ -69,7 +69,7 @@
       if (NS.pageLooksLikeLegitimateOfficialDownload()) return false;
       state._seoCloakKitDetected = true;
       NS.addSignal("SEO伪装跳转脚本", 24, `命中伪装跳转套件逻辑 (score=${score}): ${reasons.join(", ")}`);
-      NS.installDownloadGuard("检测到 SEO 伪装跳转套件，已拦截自动跳转", { notify: true, message: "SEO伪装跳转", forceNotify: true });
+      NS.installDownloadGuard("检测到 SEO 伪装跳转套件，已拦截自动跳转", { notify: true, message: "SEO伪装跳转", forceNotify: true, lockHard: true });
       NS.postToHooks({ type: "set-guard", enabled: true });
       NS.armBackgroundProtect("full");
       return true;
@@ -114,7 +114,7 @@
       let pkgTarget = "";
       try { const pkgs = NS.collectAllPagePackageHrefs(); pkgTarget = pkgs[0] || ""; } catch { /* ignore */ }
       if (pkgTarget && !state.protectedTargets.includes(pkgTarget)) state.protectedTargets.push(pkgTarget);
-      NS.installDownloadGuard("检测到量产 SEO 仿冒下载站模板 (IndexNow kit)", { notify: true, href: pkgTarget || "", message: pkgTarget ? NS.formatPackageLabel(pkgTarget) : "SEO仿冒下载模板", forceNotify: true });
+      NS.installDownloadGuard("检测到量产 SEO 仿冒下载站模板 (IndexNow kit)", { notify: true, href: pkgTarget || "", message: pkgTarget ? NS.formatPackageLabel(pkgTarget) : "SEO仿冒下载模板", forceNotify: true, lockHard: true });
       NS.postToHooks({ type: "set-guard", enabled: true });
       NS.armBackgroundProtect("full");
       NS.disableAllDownloadIntentControls();
@@ -126,7 +126,7 @@
     try {
       const state = NS.state;
       if (state._multiPlatformSerpTrap) return true;
-      if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) return false;
+      if ((NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) && !state._multiPlatformSerpTrap) return false;
       const { claimsOfficial, tokens } = NS.getClaimedBrandContext();
       const officialPitch = claimsOfficial || NS.pageClaimsOfficialDownload();
       if (!officialPitch && tokens.size === 0) return false;
@@ -157,7 +157,7 @@
       let hostLabel = sample;
       try { hostLabel = new URL(sample).hostname.replace(/^www\./, ""); } catch { /* keep */ }
       NS.addSignal("多平台下载指向搜索引擎", 18, `多平台下载入口（Windows/macOS/Linux 等）统一跳转搜索引擎/非安装包地址（${hostLabel || "外链"}），非真实安装包`);
-      NS.installDownloadGuard("多平台下载跳转搜索引擎（非安装包）", { notify: true, href: "", message: `多平台下载按钮跳转搜索引擎（${hostLabel || "外链"}），不是安装包`, title: "已拦截异常下载跳转", guardKind: "nav-trap", forceNotify: true });
+      NS.installDownloadGuard("多平台下载跳转搜索引擎（非安装包）", { notify: true, href: "", message: `多平台下载按钮跳转搜索引擎（${hostLabel || "外链"}），不是安装包`, title: "已拦截异常下载跳转", guardKind: "nav-trap", forceNotify: true, lockHard: true });
       NS.postToHooks({ type: "set-guard", enabled: true });
       NS.armBackgroundProtect("full");
       NS.disableAllDownloadIntentControls();
@@ -168,16 +168,20 @@
   NS.findSuspiciousOffsitePackagesInPage = function () {
     const out = [];
     const seen = new Set();
+    const MAX_SCAN = 36;
     const push = (raw) => {
-      if (!raw || seen.has(raw)) return;
+      if (!raw || seen.has(raw) || out.length >= MAX_SCAN) return;
       try { const abs = new URL(raw, location.href).href; if (seen.has(abs)) return; seen.add(raw); seen.add(abs); out.push(abs); } catch { seen.add(raw); out.push(raw); }
     };
     try {
-      const html = NS.getHtmlSlice(120000);
+      // 高密度归档站：只抽样 DOM 锚点，避免 120KB HTML 正则扫 200+ 包卡死
+      const archiveHeavy = typeof NS.pageLooksLikeHighVolumePackageArchive === "function" && NS.pageLooksLikeHighVolumePackageArchive();
+      const html = NS.getHtmlSlice(archiveHeavy ? 40000 : 120000);
       const pageApex = NS.getRegistrableDomain(location.hostname);
       const reAbs = /https?:\/\/[^\s"'<>\\]+?\.(?:zip|exe|apk|msi|dmg|rar|7z)(?:\?[^\s"'<>\\]*)?/gi;
-      let m;
-      while ((m = reAbs.exec(html)) !== null) {
+      let m; let absN = 0;
+      while ((m = reAbs.exec(html)) !== null && absN < MAX_SCAN && out.length < MAX_SCAN) {
+        absN++;
         const raw = m[0];
         try {
           const u = new URL(raw);
@@ -196,23 +200,30 @@
           if (NS.isSuspiciousDownloadFilename(fn) || NS.packageMismatchesPageBrand(raw) || NS.looksLikeRandomDownloadHost(u.hostname) || NS.looksLikeObjectStoragePackageUrl(raw) || (publicOss && oversimple)) push(raw);
         } catch { /* ignore */ }
       }
-      const reRel = /["'(=\s](\/?[A-Za-z0-9._/-]{3,120}\.(?:zip|exe|apk|msi|dmg|rar|7z))(?:\?[^"'>\s]*)?["')\s>]/gi;
-      while ((m = reRel.exec(html)) !== null) {
-        const raw = m[1];
-        if (!raw || /^https?:/i.test(raw)) continue;
-        try {
-          const abs = new URL(raw, location.href).href;
-          const fn = NS.getFilenameFromUrl(abs);
-          if (NS.looksLikeStrongProductInstallerName(fn) && NS.packageFilenameSharesPageBrand(fn)) continue;
-          if (NS.packageMismatchesPageBrand(abs) || NS.looksLikeHiddenPackagePath(abs) || NS.looksLikeBrandNearMissPackageName(fn) || NS.isSuspiciousDownloadFilename(fn)) push(abs);
-        } catch { /* ignore */ }
+      if (!archiveHeavy || out.length < 8) {
+        const reRel = /["'(=\s](\/?[A-Za-z0-9._/-]{3,120}\.(?:zip|exe|apk|msi|dmg|rar|7z))(?:\?[^"'>\s]*)?["')\s>]/gi;
+        let relN = 0;
+        while ((m = reRel.exec(html)) !== null && relN < MAX_SCAN && out.length < MAX_SCAN) {
+          relN++;
+          const raw = m[1];
+          if (!raw || /^https?:/i.test(raw)) continue;
+          try {
+            const abs = new URL(raw, location.href).href;
+            const fn = NS.getFilenameFromUrl(abs);
+            if (NS.looksLikeStrongProductInstallerName(fn) && NS.packageFilenameSharesPageBrand(fn)) continue;
+            if (NS.packageMismatchesPageBrand(abs) || NS.looksLikeHiddenPackagePath(abs) || NS.looksLikeBrandNearMissPackageName(fn) || NS.isSuspiciousDownloadFilename(fn)) push(abs);
+          } catch { /* ignore */ }
+        }
       }
       try {
-        NS.collectAllPagePackageHrefs().forEach((href) => {
+        const hrefs = NS.collectAllPagePackageHrefs();
+        const lim = Math.min(hrefs.length, archiveHeavy ? 24 : 80);
+        for (let i = 0; i < lim && out.length < MAX_SCAN; i++) {
+          const href = hrefs[i];
           const fn = NS.getFilenameFromUrl(href);
-          if (NS.looksLikeStrongProductInstallerName(fn) && NS.packageFilenameSharesPageBrand(fn)) return;
+          if (NS.looksLikeStrongProductInstallerName(fn) && NS.packageFilenameSharesPageBrand(fn)) continue;
           if (NS.packageMismatchesPageBrand(href) || NS.looksLikeHiddenPackagePath(href) || NS.looksLikeBrandNearMissPackageName(fn) || NS.isSuspiciousDownloadFilename(fn)) push(href);
-        });
+        }
       } catch { /* ignore */ }
     } catch { /* ignore */ }
     return out;
