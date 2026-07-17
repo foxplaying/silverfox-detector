@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SilverFox Detector",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Detect suspicious download landing pages via DOM heuristics and MAIN-world behavioral hooks.",
   "permissions": [
     "storage",
@@ -31,6 +31,8 @@
         "nav-boot/index.js"
       ],
       "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true,
       "world": "MAIN"
     },
     {
@@ -45,6 +47,8 @@
         "page-hooks/index.js"
       ],
       "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true,
       "world": "MAIN"
     },
     {
@@ -65,7 +69,9 @@
         "content/scanner.js",
         "content/lifecycle.js"
       ],
-      "run_at": "document_start"
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true
     }
   ],
   "action": {

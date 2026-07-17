@@ -136,8 +136,12 @@
       if (PackageHeuristicsBg.looksLikeAndroidPackageIdName(baseName)) return false;
       if (PackageHeuristicsBg.looksLikeReadableInstallerStemBg(baseName)) return false;
       if (PackageHeuristicsBg.looksLikeProductSetupWithBuildId(baseName)) return false;
-      // 内容寻址哈希包名（MD5/SHA）：应用商店 CDN，非乱码
+      // 内容寻址哈希包名（MD5/SHA / 资源号_哈希）：应用商店 CDN，非乱码
+      // 例：F413…96.apk；105065437_ecfe32872db0a584cf7649348ad0bc97.exe
       if (/^[a-f0-9]{16,64}$/i.test(baseCheck)) return false;
+      if (/^\d{4,20}[._-][a-f0-9]{16,64}$/i.test(baseCheck)) return false;
+      if (/^[a-f0-9]{16,64}[._-]\d{4,20}$/i.test(baseCheck)) return false;
+      if (/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(baseCheck)) return false;
       const withoutArch = baseName.replace(/[._-](x64|x86|x86_64|amd64|arm64|arm|win32|win64)$/i, "");
       if (PackageHeuristicsBg.hasGarbleDigitLetterSoup(withoutArch)) return true;
       if (/^[a-z]{2,4}-\d+[a-z0-9]/i.test(baseName)) return true;

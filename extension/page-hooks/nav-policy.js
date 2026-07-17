@@ -260,7 +260,11 @@
             const fn = PackageHeuristics.getFilenameFromUrl(href);
             const base = (fn || "").replace(/\.[^.]+$/, "");
             // 内容寻址哈希 APK/包：应用商店 CDN，放行
-            if (/^[a-f0-9]{16,64}$/i.test(base) || (typeof PackageHeuristics.isContentAddressedPackageName === "function" && PackageHeuristics.isContentAddressedPackageName(fn))) return false;
+            if (typeof PackageHeuristics.isContentAddressedPackageName === "function"
+              ? PackageHeuristics.isContentAddressedPackageName(fn)
+              : (/^[a-f0-9]{16,64}$/i.test(base)
+                || /^\d{4,20}[._-][a-f0-9]{16,64}$/i.test(base)
+                || /^[a-f0-9]{16,64}[._-]\d{4,20}$/i.test(base))) return false;
           } catch { /* ignore */ }
           if (this.officialSafe && !kit && !this.guardEnabled) return false;
           this._emitAutoNavBlock(href, `auto-nav-no-gesture -> ${reason || href}`, "非用户手势自动下载");

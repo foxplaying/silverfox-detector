@@ -155,6 +155,11 @@
       }
       if (msg.type === "threat-risk") {
         try {
+          // 子 frame（广告 iframe）报告不写 risk_tab，避免盖掉顶层结果
+          if (sender.frameId != null && sender.frameId !== 0) {
+            try { sendResponse({ success: true, ignored: "subframe" }); } catch { /* ignore */ }
+            return;
+          }
           const tabId = sender.tab?.id ?? null;
           let riskLevel = msg.riskLevel || "low";
           if ((msg.downloadGuardInstalled || msg.packageBlocked) && riskLevel === "low") riskLevel = msg.packageBlocked ? "high" : "medium";
@@ -166,13 +171,53 @@
           if (tabId != null && cleanReport) {
             chrome.storage.local.get(["latestNotice"], (r) => { if (r.latestNotice && (r.latestNotice.tabId == null || r.latestNotice.tabId === tabId)) chrome.storage.local.remove(["latestNotice"], () => { void chrome.runtime.lastError; }); });
           }
-          if (tabId != null) {
-            NS.safeSetBadge(tabId, badgeText, badgeColor);
-            const stamped = { ...msg, url: msg.url || sender.tab?.url || "", tabId, riskLevel };
-            chrome.storage.local.set({ [`risk_${tabId}`]: stamped }, () => { if (chrome.runtime.lastError) console.warn("background: store risk_tab failed", chrome.runtime.lastError.message); });
-            chrome.storage.local.set({ risk_latest: stamped }, () => { if (chrome.runtime.lastError) console.warn("background: store risk_latest failed", chrome.runtime.lastError.message); });
+          const storeRisk = (stamped) => {
+            if (tabId != null) {
+              NS.safeSetBadge(tabId, badgeText, badgeColor);
+              chrome.storage.local.set({ [`risk_${tabId}`]: stamped }, () => { if (chrome.runtime.lastError) console.warn("background: store risk_tab failed", chrome.runtime.lastError.message); });
+              chrome.storage.local.set({ risk_latest: stamped }, () => { if (chrome.runtime.lastError) console.warn("background: store risk_latest failed", chrome.runtime.lastError.message); });
+            } else {
+              chrome.storage.local.set({ risk_latest: stamped }, () => { if (chrome.runtime.lastError) console.warn("background: store risk_latest failed", chrome.runtime.lastError.message); });
+            }
+          };
+          const stamped = { ...msg, url: msg.url || sender.tab?.url || "", tabId, riskLevel };
+          // 同主机：incomplete 合并进已 complete，禁止盖成「正在分析」
+          if (tabId != null && msg.analysisComplete === false) {
+            chrome.storage.local.get([`risk_${tabId}`], (r) => {
+              try {
+                const prev = r && r[`risk_${tabId}`];
+                if (prev && (prev.analysisComplete === true || typeof prev.score === "number")) {
+                  let sameHost = false;
+                  try {
+                    const a = new URL(prev.url || "").hostname.replace(/^www\./, "");
+                    const b = new URL(stamped.url || "").hostname.replace(/^www\./, "");
+                    sameHost = !!(a && b && a === b);
+                  } catch { sameHost = false; }
+                  if (sameHost) {
+                    storeRisk({
+                      ...prev,
+                      ...stamped,
+                      url: stamped.url || prev.url,
+                      tabId,
+                      analysisComplete: true,
+                      score: typeof stamped.score === "number" ? stamped.score : prev.score,
+                      riskLevel: stamped.riskLevel || prev.riskLevel,
+                      icpInfo: stamped.icpInfo || prev.icpInfo,
+                      whoisInfo: stamped.whoisInfo || prev.whoisInfo,
+                      details: (Array.isArray(stamped.details) && stamped.details.length) ? stamped.details : prev.details
+                    });
+                    return;
+                  }
+                }
+              } catch { /* fall through */ }
+              // 无 prev 时：有 score 也标 complete，避免只剩「正在分析」
+              if (typeof stamped.score === "number" && stamped.riskLevel) {
+                stamped.analysisComplete = true;
+              }
+              storeRisk(stamped);
+            });
           } else {
-            chrome.storage.local.set({ risk_latest: msg }, () => { if (chrome.runtime.lastError) console.warn("background: store risk_latest failed", chrome.runtime.lastError.message); });
+            storeRisk(stamped);
           }
         } catch (e) { console.warn("background: error handling threat-risk", e && e.message ? e.message : e); }
         try { sendResponse({ success: true }); } catch { /* ignore */ }

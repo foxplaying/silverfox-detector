@@ -28,6 +28,51 @@
       this.root = root;
       this.activeTabId = null;
       this.activeTabUrl = "";
+      /** 同 tab 最近一次「已完成」报告，防止中间态 analysisComplete:false 把 UI 打回「正在分析」 */
+      this._lastCompletedByTab = new Map();
+    }
+
+    hostKeyFromUrl(u) {
+      try {
+        return new URL(u || "").hostname.toLowerCase().replace(/^www\./, "");
+      } catch {
+        return "";
+      }
+    }
+
+    /** 合并：新消息 incomplete 时，同主机沿用上次完成报告并合并情报字段 */
+    coalesceReport(data, tabUrl) {
+      if (!data) return null;
+      const tabId = this.activeTabId;
+      const completed = this.isCompletedReport(data);
+      if (completed && data.analysisComplete !== false) {
+        if (tabId != null) this._lastCompletedByTab.set(tabId, { ...data, url: data.url || tabUrl, analysisComplete: true });
+        return { ...data, analysisComplete: true };
+      }
+      if (completed && data.analysisComplete === false) {
+        // 有分数可展示：强制当 complete，并缓存
+        const fixed = { ...data, analysisComplete: true };
+        if (tabId != null) this._lastCompletedByTab.set(tabId, fixed);
+        return fixed;
+      }
+      const prev = tabId != null ? this._lastCompletedByTab.get(tabId) : null;
+      if (!prev || !this.isCompletedReport(prev)) return data;
+      const hNew = this.hostKeyFromUrl(data.url || tabUrl);
+      const hPrev = this.hostKeyFromUrl(prev.url || tabUrl);
+      if (hNew && hPrev && hNew === hPrev) {
+        return {
+          ...prev,
+          ...data,
+          analysisComplete: true,
+          score: typeof data.score === "number" ? data.score : prev.score,
+          riskLevel: data.riskLevel || prev.riskLevel,
+          icpInfo: data.icpInfo || prev.icpInfo,
+          whoisInfo: data.whoisInfo || prev.whoisInfo,
+          details: (Array.isArray(data.details) && data.details.length) ? data.details : prev.details,
+          url: tabUrl || data.url || prev.url
+        };
+      }
+      return data;
     }
 
     clearRoot() { while (this.root.firstChild) this.root.removeChild(this.root.firstChild); }
@@ -63,16 +108,13 @@
     isCompletedReport(data) {
       if (!data || typeof data !== "object") return false;
       if (data.analysisComplete === true) return true;
-      if (data.analysisComplete === false) return false;
-      if (data.type === "threat-risk" && typeof data.score === "number" && data.riskLevel) {
-        if (data.icpInfo || data.whoisInfo) return true;
-        if (Array.isArray(data.details) && data.details.length > 0) return true;
-        if (data.downloadGuardInstalled || data.packageBlocked || data.brandSpoofPortal) return true;
-        return false;
-      }
-      if (typeof data.score === "number" && data.riskLevel && (data.icpInfo || data.whoisInfo)) return true;
-      if (data.icpInfo && (data.riskLevel || data.url)) return true;
-      if (data.whoisInfo && (data.riskLevel || data.url)) return true;
+      // 只要带了评分+风险等级就展示结果，禁止 analysisComplete:false 把 UI 打回「正在分析」
+      // （WHOIS/ICP 回调常在 ~1s 后误发 incomplete）
+      if (typeof data.score === "number" && data.riskLevel) return true;
+      if (data.type === "threat-risk" && typeof data.score === "number") return true;
+      if (data.downloadGuardInstalled || data.packageBlocked || data.brandSpoofPortal || data.spoofBrand) return true;
+      if (Array.isArray(data.details) && data.details.length > 0) return true;
+      if (data.icpInfo || data.whoisInfo) return true;
       return false;
     }
 
@@ -131,7 +173,15 @@
       if (!data) return false;
       if (!tabUrl) return true;
       if (!data.url) return true;
-      return urlsMatch(data.url, tabUrl);
+      if (urlsMatch(data.url, tabUrl)) return true;
+      // 同主机即可（SPA 换 path；禁止因精确 URL 不一致一直「正在分析」）
+      try {
+        const a = this.hostKeyFromUrl(data.url);
+        const b = this.hostKeyFromUrl(tabUrl);
+        return !!(a && b && a === b);
+      } catch {
+        return false;
+      }
     }
 
     /** 干净完成报告（评分 0 / 低、无 guard）必须胜过残留通知。 */
@@ -176,7 +226,16 @@
     renderRisk(data, latestNotice, tabUrl) {
       this.clearRoot();
       const url = tabUrl || this.activeTabUrl;
-      const matchedData = this.dataMatchesTab(data, url) ? data : null;
+      const coalesced = this.coalesceReport(data, url);
+      // 无匹配数据时：同 tab 缓存 / 空报告兜底，禁止永久「正在分析」
+      let matchedData = this.dataMatchesTab(coalesced, url) ? coalesced : null;
+      if (!matchedData && this.activeTabId != null) {
+        const cached = this._lastCompletedByTab.get(this.activeTabId);
+        if (cached && this.dataMatchesTab(cached, url)) matchedData = { ...cached, analysisComplete: true };
+      }
+      if (!matchedData && coalesced && typeof coalesced.score === "number") {
+        matchedData = { ...coalesced, analysisComplete: true };
+      }
       const clean = this.isCleanSafeReport(matchedData);
       const showNotice = !clean && this.noticeMatchesTab(latestNotice, this.activeTabId, url);
       const protectedActive = this.hasActiveProtection(matchedData, showNotice ? latestNotice : null, this.activeTabId, url);
@@ -214,10 +273,29 @@
 
       const details = Array.isArray(matchedData?.details) ? matchedData.details : [];
       const completed = this.isCompletedReport(matchedData);
+      // 无报告：短时「分析中」后显示默认低风险（避免永久卡住）
+      if (!matchedData) {
+        this.root.appendChild(this.el("div", "low", "未发现明显风险"));
+        this.root.appendChild(this.el("div", "item", "评分: 0"));
+        this.root.appendChild(this.el("div", "item", "未检测到威胁行为信号。"));
+        return;
+      }
       if (!completed) {
-        if (matchedData && matchedData.icpInfo) this.appendIcp(matchedData);
-        if (matchedData && matchedData.whoisInfo) this.appendWhois(matchedData);
-        this.root.appendChild(this.el("div", "item", showNotice || protectedActive ? "已发现拦截事件，完整分析生成中…" : "正在分析当前页面…（页面跳转后会自动重新分析）"));
+        // 有半份数据：直接当完成展示，不再卡「正在分析」
+        const { level, title } = this.resolveRiskPresentation(matchedData, protectedActive);
+        this.root.appendChild(this.el("div", level, title));
+        this.root.appendChild(this.el("div", "item", `评分: ${matchedData.score ?? 0}`));
+        this.appendIcp(matchedData);
+        this.appendWhois(matchedData);
+        if (details.length === 0 && !protectedActive) {
+          this.root.appendChild(this.el("div", "item", "未检测到威胁行为信号。"));
+        } else {
+          details.forEach((d) => {
+            const line = this.el("div", "item", `- ${d.name || "信号"}`);
+            if (d.reason) line.title = String(d.reason);
+            this.root.appendChild(line);
+          });
+        }
         return;
       }
       const { level, title } = this.resolveRiskPresentation(matchedData, protectedActive);
@@ -259,7 +337,15 @@
     installListeners() {
       chrome.runtime.onMessage.addListener((msg, sender) => {
         if (msg.type === "threat-risk" && sender.tab?.id === this.activeTabId) {
-          if (this.activeTabUrl && msg.url && !urlsMatch(msg.url, this.activeTabUrl)) return;
+          // 同主机：允许 path 变化；跨主机严格匹配
+          if (this.activeTabUrl && msg.url) {
+            const hA = this.hostKeyFromUrl(this.activeTabUrl);
+            const hB = this.hostKeyFromUrl(msg.url);
+            if (hA && hB && hA !== hB) return;
+            if (hA === hB) {
+              // 同主机中间态 incomplete 不打断已完成 UI（coalesce 再处理）
+            } else if (!urlsMatch(msg.url, this.activeTabUrl)) return;
+          }
           this.renderRisk(msg, null, this.activeTabUrl || msg.url);
           return;
         }

@@ -9,7 +9,7 @@
 行为式网页威胁检测器 —— 一个 Chrome 扩展，通过 DOM 启发式与 MAIN-world 行为钩子识别可疑下载落地页。
 
 [![Manifest](https://img.shields.io/badge/manifest-v3-blue)](https://developer.chrome.com/docs/extensions/mv3/intro/)
-[![Version](https://img.shields.io/badge/version-0.1.0-green)](./extension/manifest.json)
+[![Version](https://img.shields.io/badge/version-0.1.1-green)](./extension/manifest.json)
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey)](./LICENSE)
 
 </div>
@@ -167,7 +167,6 @@ service worker
 - **MAIN-world 钩子在 `document_start` 安装。** Chrome 在页面 JS 之前注入 MAIN 脚本，故 `Location.prototype` 在任何伪装跳转触发前已被 patch。
 - **软品牌仿冒等待 ICP。** 夹带/拼写主机（如 `todeskai.com` + 沪ICP）延迟 toast 至 ICP 定论，避免永久误报 UX。
 - **DNR 仅短脉冲。** SERP 阻断 session 规则自动过期（3–15s）且永不自动续期，故离开钓鱼页后的正常搜索永不 `ERR_BLOCKED_BY_CLIENT`。
-- **强产品安装包永远放行。** `Brand_official_setup_2.6.3.0.exe` 与 Android 反向域名 APK 在每条阻断路径均豁免，即便位于对象存储主机。
 
 ## 项目结构约定
 

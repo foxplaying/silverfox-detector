@@ -25,7 +25,7 @@
       try { if (Element.prototype.__silverfoxSetAttr) delete Element.prototype.__silverfoxSetAttr; } catch { /* ignore */ }
     }
 
-    /** 清除页面中已存在的 dlp 套件 DOM/CSS 与隐藏的自动下载 a/iframe。 */
+    /** 清除页面中已存在的 dlp 套件 DOM/CSS、ld-wrap 全屏加载层与隐藏的自动下载 a/iframe。 */
     static scrubDesktopForceDownloadDom() {
       try {
         document.querySelectorAll(
@@ -33,6 +33,8 @@
         ).forEach((el) => {
           try { el.remove(); } catch { try { el.style.setProperty("display", "none", "important"); } catch { /* ignore */ } }
         });
+        // 全屏「请稍等正在加载」(.ld-wrap / fixed z-index 999999)
+        DomGuard.scrubHostileLoadingOverlaysMain();
         document.querySelectorAll("style").forEach((st) => {
           if (CloakingKit.isDesktopForceDownloadKitBlob(st.textContent || "")) {
             try { st.remove(); } catch { try { st.textContent = ""; } catch { /* ignore */ } }
@@ -54,6 +56,50 @@
       } catch { /* ignore */ }
     }
 
+    /** MAIN-world：删全屏加载遮罩（与 content scrubHostileLoadingOverlays 同语义） */
+    static scrubHostileLoadingOverlaysMain() {
+      try {
+        const kill = (el) => {
+          if (!el || el.nodeType !== 1) return;
+          try {
+            if (el.id && /silverfox/i.test(el.id)) return;
+            if (el.className && /silverfox/i.test(String(el.className))) return;
+          } catch { /* ignore */ }
+          try { el.remove(); } catch {
+            try { el.style.setProperty("display", "none", "important"); } catch { /* ignore */ }
+          }
+        };
+        document.querySelectorAll(".ld-wrap, .ld-spinner, .ld-text, [class*='ld-wrap'], [class*='ld-spinner']").forEach((el) => {
+          try {
+            let p = el;
+            for (let i = 0; i < 5 && p; i++) {
+              const s = (p.style && p.style.cssText) || p.getAttribute("style") || "";
+              const zi = parseInt((p.style && p.style.zIndex) || "0", 10) || 0;
+              if (/position\s*:\s*fixed/i.test(s) && (zi >= 999 || /z-index\s*:\s*999/i.test(s))) {
+                kill(p);
+                return;
+              }
+              p = p.parentElement;
+            }
+            kill(el.parentElement || el);
+          } catch { /* ignore */ }
+        });
+        document.querySelectorAll("div").forEach((el) => {
+          try {
+            const st = el.getAttribute("style") || "";
+            if (!/position\s*:\s*fixed/i.test(st)) return;
+            const zi = el.style ? parseInt(el.style.zIndex || "0", 10) : 0;
+            if (zi < 9999 && !/z-index\s*:\s*999/i.test(st)) return;
+            const t = (el.textContent || "").replace(/\s+/g, " ").trim();
+            if (t.length > 80) return;
+            if (!/请稍等|正在加载|加载中|请稍候|loading/i.test(t)) return;
+            if (!/100%|100vw|100vh|top:\s*0/i.test(st)) return;
+            kill(el);
+          } catch { /* ignore */ }
+        });
+      } catch { /* ignore */ }
+    }
+
     /** 注入节点是否应拒绝（dlp 套件 / 隐藏包 iframe）。 */
     static shouldRejectInjectedNode(node, policy) {
       if (!node || node.nodeType !== 1) return false;
@@ -69,6 +115,23 @@
         policy.armDesktopForceDownloadKit("拦截 dlp 套件 DOM/CSS 注入");
         return true;
       }
+      // 全屏「请稍等正在加载」/ .ld-wrap 注入（常在 guard 后延迟插入）
+      try {
+        const t = (node.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60);
+        const st = (node.getAttribute && node.getAttribute("style")) || "";
+        const cls = typeof node.className === "string" ? node.className : "";
+        if (/\bld-(?:wrap|spinner|text)\b/i.test(cls)
+          || (policy.guardEnabled && /position\s*:\s*fixed/i.test(st)
+            && /z-index\s*:\s*999/i.test(st) && /请稍等|正在加载|加载中/i.test(t))) {
+          if (policy.guardEnabled || policy.forceDesktopDlKit) {
+            policy.post({ type: "signal", name: "保护模式清除加载遮罩", weight: 0, reason: "ld-wrap / 全屏加载层" });
+            return true;
+          }
+        }
+        if (node.querySelector && node.querySelector(".ld-wrap, .ld-spinner, .ld-text")) {
+          if (policy.guardEnabled || policy.forceDesktopDlKit) return true;
+        }
+      } catch { /* ignore */ }
       try {
         if (/dlp/i.test(cls + id) && node.querySelector) {
           const hit = node.querySelector(".dlp-overlay, .dlp-topbar, .dlp-modal");
@@ -87,6 +150,18 @@
           const href = node.getAttribute("href") || node.getAttribute("src") || "";
           if (href && PackageHeuristics.isPackageFileUrl(href) && !PackageHeuristics.isStrongProductInstallerUrl(href)) {
             policy._rememberHop(href);
+            return true;
+          }
+          // guard 开启：拒绝再注入 iframe/embed（盗版页常用晚加载 HTML 壳，非 .exe 直链）
+          if (policy.guardEnabled && (tag === "IFRAME" || tag === "EMBED" || tag === "OBJECT")) {
+            try {
+              node.setAttribute("src", "about:blank");
+              node.removeAttribute("srcdoc");
+              if (tag === "IFRAME") node.setAttribute("sandbox", "");
+              node.style.setProperty("pointer-events", "none", "important");
+              node.setAttribute("data-silverfox-frame-locked", "1");
+            } catch { /* ignore */ }
+            policy.post({ type: "signal", name: "保护模式拦截框架注入", weight: 0, reason: `guard 下拒绝 ${tag}` });
             return true;
           }
         } catch { /* ignore */ }
@@ -248,6 +323,14 @@
           }
           if (tag === "iframe" || tag === "embed") {
             try {
+              // guard 下创建的框架直接锁死，防止晚插入下载壳
+              if (policy.guardEnabled) {
+                try {
+                  el.setAttribute("sandbox", "");
+                  el.setAttribute("data-silverfox-frame-locked", "1");
+                  el.style.setProperty("pointer-events", "none", "important");
+                } catch { /* ignore */ }
+              }
               const desc = Object.getOwnPropertyDescriptor(tag === "iframe" ? HTMLIFrameElement.prototype : HTMLEmbedElement.prototype, "src");
               if (desc && desc.set) {
                 Object.defineProperty(el, "src", {
@@ -259,6 +342,12 @@
                     if ((policy.forceDesktopDlKit || policy.guardEnabled) && PackageHeuristics.isPackageFileUrl(val) && !PackageHeuristics.isStrongProductInstallerUrl(val)) {
                       policy._rememberHop(val);
                       return;
+                    }
+                    // guard：拦截一切非 blank 的框架导航（HTML 下载落地页也拦）
+                    if (policy.guardEnabled && val && !/^about:blank$/i.test(val) && !/^javascript:/i.test(val)) {
+                      policy._rememberHop(val);
+                      policy.post({ type: "signal", name: "保护模式拦截框架加载", weight: 0, reason: `${tag}.src 被拦: ${val.slice(0, 160)}` });
+                      try { return desc.set.call(this, "about:blank"); } catch { return; }
                     }
                     return desc.set.call(this, v);
                   }
@@ -342,6 +431,18 @@
           set(v) {
             const val = String(v || "");
             if (policy.tryBlockNavigation(val, `${tag}.src -> ${val}`)) return;
+            if ((policy.forceDesktopDlKit || policy.guardEnabled) && PackageHeuristics.isPackageFileUrl(val)
+              && !PackageHeuristics.isStrongProductInstallerUrl(val)) {
+              policy._rememberHop(val);
+              try { return desc.set.call(this, "about:blank"); } catch { return; }
+            }
+            // 盗版 guard：晚加载 HTML 下载壳（非 .exe）也必须拦
+            if (policy.guardEnabled && val && !/^about:blank$/i.test(val) && !/^javascript:/i.test(val)
+              && !policy.officialSafe) {
+              policy._rememberHop(val);
+              policy.post({ type: "signal", name: "保护模式拦截框架加载", weight: 0, reason: `${tag}.src 被拦: ${val.slice(0, 160)}` });
+              try { return desc.set.call(this, "about:blank"); } catch { return; }
+            }
             return desc.set.call(this, v);
           }
         });
@@ -388,6 +489,15 @@
                   if (PackageHeuristics.looksLikeObjectStoragePackageUrl(v) || policy.forceDesktopDlKit) policy.armDesktopForceDownloadKit(`setAttribute ${n} 安装包`);
                   return;
                 }
+                // guard：iframe/embed setAttribute('src', 下载壳HTML) 也必须拦
+                if (n === "src" && policy.guardEnabled && !policy.officialSafe && v && !/^about:blank$/i.test(v)) {
+                  const tag = (this.tagName || "").toUpperCase();
+                  if (tag === "IFRAME" || tag === "EMBED" || tag === "OBJECT") {
+                    policy._rememberHop(v);
+                    policy.post({ type: "signal", name: "保护模式拦截框架加载", weight: 0, reason: `setAttribute(src) ${tag}: ${v.slice(0, 160)}` });
+                    return origSetAttr.call(this, name, "about:blank");
+                  }
+                }
               }
             } catch { /* ignore */ }
             return origSetAttr.call(this, name, value);
@@ -408,9 +518,17 @@
           const orig = proto[method];
           DomGuard.saveProtoMethod(restoreList, proto, method, orig);
           const wrapped = function (...args) {
+            // light/safe：直接原生路径（拆 wrap 后此函数不应再被调用）
             if (policy.lightPage || policy.officialSafe) return orig.apply(this, args);
             try {
               const node = method === "replaceChild" ? args[0] : args[0];
+              // META/LINK/TITLE：透传（CSP Report-Only 等页面自有策略勿经威胁分支拉长堆栈）
+              if (node && node.nodeType === 1) {
+                const tag0 = node.tagName || "";
+                if (tag0 === "META" || tag0 === "LINK" || tag0 === "TITLE" || tag0 === "BASE") {
+                  return orig.apply(this, args);
+                }
+              }
               if (DomGuard.shouldRejectInjectedNode(node, policy)) return method === "replaceChild" ? args[1] : node;
               if (node && node.nodeType === 1 && node.tagName === "STYLE" && CloakingKit.isDesktopForceDownloadKitBlob(node.textContent || "")) {
                 policy.armDesktopForceDownloadKit("append style dlp CSS");

@@ -16,11 +16,18 @@
     static pageLooksLikeHeavyContentAppShell() {
       try {
         const title = String(document.title || "");
-        if (/官网|官方下载|官方正版|官方网站|官方客户端|电脑版官网|立即免费下载|全平台官方/i.test(title)) return false;
+        // 中文「官网/官方下载」标题多为仿冒落地：默认保留全量 hook
+        // 但多平台正品目录（firefox.com/download/all）可单独 light
+        const cnOfficialPitch = /官网|官方下载|官方正版|官方网站|官方客户端|电脑版官网|立即免费下载|全平台官方/i.test(title);
         try {
           if (typeof PageContext.pageLooksLikeDownloadPhishShell === "function"
             && PageContext.pageLooksLikeDownloadPhishShell()) return false;
         } catch { /* ignore */ }
+        try {
+          if (typeof PageContext.pageLooksLikeMultiPlatformProductDownloadCatalog === "function"
+            && PageContext.pageLooksLikeMultiPlatformProductDownloadCatalog()) return true;
+        } catch { /* ignore */ }
+        if (cnOfficialPitch) return false;
         // densitydpi：行为信号（常见于部分门户），非域名名单
         try {
           const vp = document.querySelector('meta[name="viewport"]');
@@ -33,6 +40,76 @@
         if (nodes >= 1200 && links >= 30) return true;
         if (nodes >= 800 && links >= 40 && scripts >= 6) return true;
         if (nodes >= 2000) return true;
+        return false;
+      } catch {
+        return false;
+      }
+    }
+
+    /**
+     * 多平台正品下载目录（结构启发，无域名名单）。
+     * 例：/zh-CN/download/all/ 同时列 Windows/macOS/Linux + 清晰安装包名。
+     * 尽早 light + 还原 DOM 原型，避免 appendChild wrap 出现在页面 CSP 控制台堆栈。
+     */
+    static pageLooksLikeMultiPlatformProductDownloadCatalog() {
+      try {
+        if (typeof PageContext.pageLooksLikeDownloadPhishShell === "function"
+          && PageContext.pageLooksLikeDownloadPhishShell()) return false;
+        const path = String(location.pathname || "").toLowerCase();
+        const title = String(document.title || "");
+        const pathHit = /(?:^|\/)download(?:\/|$)/i.test(path) || /\/download\//i.test(path);
+        const titleHit = /\bdownload\b|下载|安装包|installer|get\s+firefox|get\s+chrome/i.test(title);
+        if (!pathHit && !titleHit) return false;
+        // 营销夹带主机（ie-huorong / huorong-pc）绝不当正品目录
+        try {
+          const lab = String(location.hostname || "").toLowerCase().replace(/^www\./, "").split(".")[0] || "";
+          if (/^(?:ie|im|aa|bb|cc|ca|get|pr|ott|app)[-_]/i.test(lab)) return false;
+          if (/[-_](?:pc|app|soft|safe|vip|pro|cn|win|download|client|free|official)$/i.test(lab)) return false;
+        } catch { /* ignore */ }
+
+        let textSample = title;
+        try {
+          textSample += ` ${((document.body && document.body.innerText) || "").replace(/\s+/g, " ").slice(0, 6000)}`;
+        } catch { /* ignore */ }
+        let osHits = 0;
+        if (/\bwindows\b|win64|win32|windows\s*10|windows\s*11/i.test(textSample)) osHits++;
+        if (/\bmac\s*os\b|\bmacos\b|\bos\s*x\b|\.dmg\b|apple\s*silicon|intel\s*mac/i.test(textSample)) osHits++;
+        if (/\blinux\b|ubuntu|fedora|\.tar\.(?:gz|xz|bz2)\b/i.test(textSample)) osHits++;
+        if (/\bandroid\b|\.apk\b|\bios\b|iphone|ipad/i.test(textSample)) osHits++;
+        if (osHits < 2) return false;
+
+        let strong = 0;
+        let suspicious = 0;
+        let pkgLinks = 0;
+        try {
+          const links = document.querySelectorAll("a[href]");
+          const lim = Math.min(links.length, 100);
+          for (let i = 0; i < lim; i++) {
+            const h = links[i].href || links[i].getAttribute("href") || "";
+            if (!h || h.length < 8) continue;
+            if (!PackageHeuristics.isPackageFileUrl(h) && !/\.(?:exe|dmg|msi|pkg|apk|zip)(?:$|\?)/i.test(h)) continue;
+            pkgLinks++;
+            const fn = typeof PackageHeuristics.getFilenameFromUrl === "function"
+              ? PackageHeuristics.getFilenameFromUrl(h)
+              : (h.split("/").pop() || "");
+            if (typeof PackageHeuristics.isStrongProductInstallerUrl === "function"
+              && PackageHeuristics.isStrongProductInstallerUrl(h)) strong++;
+            else if (typeof PackageHeuristics.looksLikeProductPackageName === "function"
+              && PackageHeuristics.looksLikeProductPackageName(fn)) strong++;
+            else if (typeof PackageHeuristics.isSuspiciousPackageFilename === "function"
+              && PackageHeuristics.isSuspiciousPackageFilename(fn)) suspicious++;
+            else if (/firefox|chrome|edge|opera|brave|thunderbird|libreoffice|vlc/i.test(fn)
+              && /setup|installer|install|\d+\.\d+/i.test(fn)) strong++;
+          }
+        } catch { /* ignore */ }
+
+        if (suspicious > 0) return false;
+        if (strong >= 2 && osHits >= 2) return true;
+        let linkCount = 0;
+        try { linkCount = document.links ? document.links.length : 0; } catch { linkCount = 0; }
+        // SPA 目录：多 OS 文案 + 大量导航链，包链可能尚未展开
+        if (osHits >= 3 && linkCount >= 24) return true;
+        if (osHits >= 2 && linkCount >= 40 && pathHit && (strong >= 1 || pkgLinks === 0)) return true;
         return false;
       } catch {
         return false;

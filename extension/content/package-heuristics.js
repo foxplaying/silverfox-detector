@@ -151,15 +151,25 @@
   };
 
   /**
-   * 内容寻址/哈希文件名（应用商店 CDN 常见）：MD5(32)/SHA1(40)/SHA256(64) 等纯十六进制 stem。
-   * 例：F4138527CA4023F251FD9EE076449A96.apk —— 非银狐乱码包。
+   * 内容寻址/哈希文件名（应用商店 / 对象 CDN 常见），非银狐乱码包：
+   * - 纯 MD5(32)/SHA1(40)/SHA256(64) stem：F4138527…96.apk
+   * - 资源号 + 哈希：105065437_ecfe32872db0a584cf7649348ad0bc97.exe
+   * - 哈希 + 资源号 / UUID
    */
   NS.isContentAddressedPackageName = function (fileName) {
     const name = NS.normalizeFileName(fileName);
     if (!name || !PACKAGE_NAME.test(name)) return false;
     const base = name.replace(/\.[^.]+$/, "");
-    // 16–64 位 hex；常见 32(MD5)/40(SHA1)/64(SHA256)
-    return /^[a-f0-9]{16,64}$/i.test(base);
+    if (!base || base.length > 120) return false;
+    // 纯 16–64 位 hex
+    if (/^[a-f0-9]{16,64}$/i.test(base)) return true;
+    // 数字资源 ID + 分隔 + 16–64 hex（CDN 常见）
+    if (/^\d{4,20}[._-][a-f0-9]{16,64}$/i.test(base)) return true;
+    // hex + 分隔 + 数字资源 ID
+    if (/^[a-f0-9]{16,64}[._-]\d{4,20}$/i.test(base)) return true;
+    // UUID
+    if (/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(base)) return true;
+    return false;
   };
 
   NS.looksLikeProductPackageName = function (fileName) {
@@ -297,8 +307,8 @@
     const name = NS.normalizeFileName(/https?:\/\//i.test(String(fileNameOrUrl)) ? NS.getFilenameFromUrl(fileNameOrUrl) : fileNameOrUrl);
     if (!name) return false;
     const base = name.replace(/\.[^.]+$/, "");
-    // 哈希 APK：应用商店内容寻址（F413…96.apk）
-    if (/\.(?:apk|xapk|apks|aab)$/i.test(name) && NS.isContentAddressedPackageName(name)) return true;
+    // 内容寻址包名：应用商店 / CDN（纯 hex 或 资源号_哈希.exe/.apk）
+    if (NS.isContentAddressedPackageName(name)) return true;
     if (NS.looksLikeAndroidPackageIdName(base) || NS.looksLikeAndroidPackageIdName(name)) return true;
     if (NS.isBenignShortInstallerName(name)) return true;
     if (NS.looksLikeProductPackageName(name)) return true;
@@ -816,7 +826,27 @@
   };
 
   NS.getAllDownloadIntentElements = function () {
-    return Array.from(document.querySelectorAll("a, button, [role='button'], input[type='button'], input[type='submit']")).filter((el) => NS.isDownloadIntentElement(el));
+    // 海量镜像/归档页禁止全量扫 a，否则主线程卡死
+    try {
+      if ((typeof NS.pageLooksLikeHighDensityDownloadList === "function" && NS.pageLooksLikeHighDensityDownloadList())
+        || (typeof NS.pageLooksLikeHighVolumePackageArchive === "function" && NS.pageLooksLikeHighVolumePackageArchive())
+        || (typeof NS.pageLooksLikeOsDistroIsoDownload === "function" && NS.pageLooksLikeOsDistroIsoDownload())) {
+        const small = document.querySelectorAll(
+          "a.download-btn, a.btn-download, .download-btn, button[class*='download'], a[href*='.exe'], a[href*='.zip']"
+        );
+        return Array.from(small).filter((el) => NS.isDownloadIntentElement(el)).slice(0, 24);
+      }
+    } catch { /* ignore */ }
+    const nodes = document.querySelectorAll("a, button, [role='button'], input[type='button'], input[type='submit']");
+    const cap = Math.min(nodes.length, 200);
+    const out = [];
+    for (let i = 0; i < cap; i++) {
+      if (NS.isDownloadIntentElement(nodes[i])) {
+        out.push(nodes[i]);
+        if (out.length >= 40) break;
+      }
+    }
+    return out;
   };
 
   NS.disableAllDownloadIntentControls = function () {
@@ -841,7 +871,31 @@
         if (t.length > 0 && t.length < 36 && /立即下载|免费下载|官方下载|客户端下载|电脑版|Windows\s*版|Mac\s*版|下载客户端|一键下载/i.test(t)) disableEl(el);
       });
     } catch { /* ignore */ }
+    // 同源 iframe 内部下载按钮（跨源由 postToHooks 广播 + all_frames MAIN 钩子处理）
+    try {
+      document.querySelectorAll("iframe").forEach((frame) => {
+        try {
+          const doc = frame.contentDocument;
+          if (!doc) return;
+          doc.querySelectorAll(
+            "a, button, [role='button'], a.download-btn, .download-btn, [class*='download']"
+          ).forEach((el) => {
+            try {
+              const t = (el.textContent || "").replace(/\s+/g, " ").trim();
+              const href = (el.getAttribute("href") || el.getAttribute("data-href") || "").trim();
+              if (NS.isDownloadIntentElement(el)
+                || (t.length > 0 && t.length < 40 && /下载|安装|客户端|Download/i.test(t))
+                || /\.(?:exe|zip|msi|apk|dmg)(?:\?|$)/i.test(href)) {
+                disableEl(el);
+              }
+            } catch { /* ignore */ }
+          });
+        } catch { /* cross-origin */ }
+      });
+    } catch { /* ignore */ }
     try { if (state.downloadGuardInstalled && typeof NS.applyDownloadGuardDomLock === "function") NS.applyDownloadGuardDomLock(true); } catch { /* ignore */ }
+    try { if (state.downloadGuardInstalled && typeof NS.neutralizePageFramesForGuard === "function") NS.neutralizePageFramesForGuard(true); } catch { /* ignore */ }
+    try { if (state.downloadGuardInstalled && typeof NS.scrubHostileLoadingOverlays === "function") NS.scrubHostileLoadingOverlays(); } catch { /* ignore */ }
   };
 
   NS.tryDecodeBase64Payload = function (str, maxLayers = 5) {

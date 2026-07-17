@@ -123,12 +123,33 @@
   };
 
   NS.emitRiskReport = function (force = false) {
+    // ★ 仅顶层上报：广告 iframe 的 incomplete 会盖掉主页面结果 → popup 永久「正在分析」
+    try {
+      if (typeof NS.isTopFrame === "function" && !NS.isTopFrame()) return;
+    } catch { /* continue */ }
     const state = NS.state;
     const c = NS.caches;
     const now = Date.now();
     if (state._analysisDone && !force && now - c.lastReportAt < 2500) return;
     if (!force && now - c.lastReportAt < 600) return;
     c.lastReportAt = now;
+    const hostKey = String(location.hostname || "").toLowerCase().replace(/^www\./, "");
+    // ★ 同主机粘性 complete：一旦完成，后续 emit 一律 analysisComplete=true
+    // （WHOIS/ICP 回调、DOM/CSS 噪声不得把 popup 打回「正在分析」）
+    try {
+      if (state._analysisDone) {
+        state._stickyCompleteHost = hostKey;
+        state._stickyComplete = true;
+      } else if (state._stickyComplete && state._stickyCompleteHost === hostKey) {
+        const hardKit = typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat();
+        if (!hardKit) state._analysisDone = true;
+      } else if (state._perfBenign || state._intelLightMode) {
+        // light 页即使漏标 done，报告也按 complete 发，避免闪一下再卡住
+        state._analysisDone = true;
+        state._stickyComplete = true;
+        state._stickyCompleteHost = hostKey;
+      }
+    } catch { /* ignore */ }
     const threatDetails = state.details.filter((d) => (d.weight || 0) > 0);
     const signalCount = threatDetails.length;
     // 可信门户：报告侧不展示 packageBlocked（即使残留 remote 标志）
@@ -150,8 +171,10 @@
     const pkgTargets = trustedPortal ? [] : (state.protectedTargets || []).filter((t) => {
       try { return NS.isPackageFileUrl(t) || /\.(zip|exe|apk|dmg|msi|rar|7z)(?:\?|#|$)/i.test(String(t)); } catch { return false; }
     }).slice(0, 5);
+    const analysisComplete = !!(state._analysisDone
+      || (state._stickyComplete && state._stickyCompleteHost === hostKey));
     const payload = {
-      type: "threat-risk", score, riskLevel, analysisComplete: !!state._analysisDone,
+      type: "threat-risk", score, riskLevel, analysisComplete,
       details: state.details.filter((d) => {
         if (d.name === "已查询到ICP备案号") return false;
         if (d.name === "无ICP备案信息" && (NS.looksLikeUltraMatureWhoisDomain() || NS.looksLikeLongLivedWhoisDomain() || (NS.getWhoisAgeDays() != null && NS.getWhoisAgeDays() >= 365))) return false;
@@ -342,6 +365,63 @@
     } catch { return false; }
   };
 
+  /**
+   * 清除盗版/强制下载套件的全屏「请稍等正在加载」遮罩（.ld-wrap / 定高 z-index 白屏）。
+   * 与 dlp-overlay 不同类名，旧 scrub 扫不到。
+   */
+  NS.scrubHostileLoadingOverlays = function () {
+    try {
+      const kill = (el) => {
+        if (!el || el.nodeType !== 1) return;
+        // 勿动扩展自己的 toast
+        try {
+          if (el.id && /silverfox/i.test(el.id)) return;
+          if (el.className && /silverfox/i.test(String(el.className))) return;
+        } catch { /* ignore */ }
+        try { el.remove(); } catch {
+          try { el.style.setProperty("display", "none", "important"); el.style.setProperty("visibility", "hidden", "important"); } catch { /* ignore */ }
+        }
+      };
+
+      // 1) 明确 class：ld-wrap / ld-spinner / ld-text
+      document.querySelectorAll(".ld-wrap, .ld-spinner, .ld-text, [class*='ld-wrap'], [class*='ld-spinner']").forEach((el) => {
+        try {
+          // 删最外层 fixed 全屏容器
+          let p = el;
+          for (let i = 0; i < 5 && p; i++) {
+            const s = (p.style && p.style.cssText) || p.getAttribute("style") || "";
+            const zi = parseInt((p.style && p.style.zIndex) || "0", 10) || 0;
+            if (/position\s*:\s*fixed/i.test(s) && zi >= 999) { kill(p); return; }
+            p = p.parentElement;
+          }
+          kill(el.parentElement || el);
+        } catch { /* ignore */ }
+      });
+
+      // 2) 结构启发：fixed + 近全屏 + 高 z-index + 加载文案
+      document.querySelectorAll("div, section, aside").forEach((el) => {
+        try {
+          const st = el.getAttribute("style") || "";
+          if (!/position\s*:\s*fixed/i.test(st)) return;
+          if (!/(?:z-index\s*:\s*(?:999|9\d{3,}|[1-9]\d{4,})|z-index:\s*999999)/i.test(st)
+            && !((el.style && parseInt(el.style.zIndex || "0", 10) >= 9999))) {
+            // 仍可能是 999999 写在 style 对象里
+            const zi = el.style ? parseInt(el.style.zIndex || "0", 10) : 0;
+            if (zi < 9999 && !/z-index\s*:\s*999/i.test(st)) return;
+          }
+          const t = (el.textContent || "").replace(/\s+/g, " ").trim();
+          if (t.length > 80) return; // 不像纯加载层
+          if (!/请稍等|正在加载|加载中|请稍候|loading|wait/i.test(t)) return;
+          // 近全屏
+          const w = el.style.width || "";
+          const h = el.style.height || "";
+          if (!/100%|100vw|100vh/i.test(w + h) && !/top:\s*0/i.test(st)) return;
+          kill(el);
+        } catch { /* ignore */ }
+      });
+    } catch { /* ignore */ }
+  };
+
   /** CSS + class 全局锁下载控件（比逐按钮 style 更抗 SPA 重绘） */
   NS.applyDownloadGuardDomLock = function (on) {
     try {
@@ -358,16 +438,23 @@
             "html.silverfox-dl-guard-on .platform-btn,html.silverfox-dl-guard-on button.platform-btn,",
             "html.silverfox-dl-guard-on [class*='btn-download'],html.silverfox-dl-guard-on [class*='download-btn'],",
             "html.silverfox-dl-guard-on [data-threat-detector-disabled='1'],html.silverfox-dl-guard-on [data-silverfox-greyed='1']{",
-            "pointer-events:none!important;opacity:.45!important;filter:grayscale(.6)!important;cursor:not-allowed!important;}"
+            "pointer-events:none!important;opacity:.45!important;filter:grayscale(.6)!important;cursor:not-allowed!important;}",
+            /* 顶层锁住内嵌框架交互，防盗版页把下载按钮塞进 iframe 绕过灰化 */
+            "html.silverfox-dl-guard-on iframe[data-silverfox-frame-locked='1'],",
+            "html.silverfox-dl-guard-on embed[data-silverfox-frame-locked='1'],",
+            "html.silverfox-dl-guard-on object[data-silverfox-frame-locked='1']{",
+            "pointer-events:none!important;}"
           ].join("");
           (document.head || document.documentElement).appendChild(st);
         }
         document.documentElement.classList.add("silverfox-dl-guard-on");
         try { if (document.body) document.body.classList.add("silverfox-dl-guard-on"); } catch { /* ignore */ }
+        try { if (typeof NS.neutralizePageFramesForGuard === "function") NS.neutralizePageFramesForGuard(true); } catch { /* ignore */ }
       } else {
         document.documentElement.classList.remove("silverfox-dl-guard-on");
         try { if (document.body) document.body.classList.remove("silverfox-dl-guard-on"); } catch { /* ignore */ }
         if (st) try { st.remove(); } catch { /* ignore */ }
+        try { if (typeof NS.neutralizePageFramesForGuard === "function") NS.neutralizePageFramesForGuard(false); } catch { /* ignore */ }
       }
     } catch { /* ignore */ }
   };
@@ -683,7 +770,7 @@
     const blobArm = `${reason || ""} ${o.message || ""} ${o.title || ""} ${o.guardKind || ""}`;
     const isSoftBrandSpoofArm = o.guardKind === "brand-spoof"
       || /主动探测仿冒|仿冒品牌官网|与标题品牌|仿冒「|域名.*不匹配.*仿冒/i.test(blobArm);
-    // 软件分发门户详情页（中华网软件等）：永不 arm 软品牌仿冒
+    // 软件分发门户详情页（结构识别）：永不 arm 软品牌仿冒
     if (isSoftBrandSpoofArm && !realHardPre
       && typeof NS.pageLooksLikeSoftwareCatalogPortal === "function" && NS.pageLooksLikeSoftwareCatalogPortal()) {
       NS.silverfoxLog("guard-skip", "software-catalog-portal");
@@ -757,6 +844,7 @@
     if (state.downloadGuardInstalled && !o.forceNotify && !o.userAction && o.notify === false) {
       NS.disableAllDownloadIntentControls();
       try { NS.applyDownloadGuardDomLock(true); } catch { /* ignore */ }
+      try { NS.scrubHostileLoadingOverlays(); } catch { /* ignore */ }
       NS.postToHooks({ type: "set-guard", enabled: true });
       return;
     }
@@ -767,6 +855,15 @@
     NS.disableSuspiciousDownloadButtons();
     NS.disableAllDownloadIntentControls();
     try { NS.applyDownloadGuardDomLock(true); } catch { /* ignore */ }
+    try { NS.scrubHostileLoadingOverlays(); } catch { /* ignore */ }
+    // 晚注入的 ld-wrap 全屏加载层：短时反复清
+    [50, 200, 500, 1200, 2500, 5000].forEach((ms) => {
+      setTimeout(() => {
+        try {
+          if (NS.state.downloadGuardInstalled) NS.scrubHostileLoadingOverlays();
+        } catch { /* ignore */ }
+      }, ms);
+    });
     if (guardKind === "brand-spoof") NS.addSignal("已启用仿冒站下载拦截", 10, reason);
     else if (guardKind === "nav-trap") NS.addSignal("已启用异常跳转拦截", 10, reason);
     else NS.addSignal("已启用安装包下载拦截", 12, reason);

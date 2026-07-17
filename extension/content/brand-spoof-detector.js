@@ -1,137 +1,362 @@
 /**
- * 品牌仿冒下载门户检测：标题宣称官网 + 域名与品牌不匹配 + 可疑安装包/下载入口。
- * 硬前提：必须通过「软件下载落地页壳」门控（与下载页检测逻辑绑死），资讯/博客不 arm。
- * 软仿冒（pad/typo/hyphen）须等 ICP 定论后再 toast，避免 todeskai 沪ICP 误报。
+ * 品牌仿冒下载门户检测。
+ * 主门控：域名 ↔ 页面主身份关键词（title/h1/keywords/logo/og）相关度。
+ * 相关且非夹带 → 不仿冒；夹带/拼写/无关 + 下载壳 → 可仿冒。
+ * 硬前提：软件下载落地页壳；软仿冒等 ICP。
  */
 ;(function (NS) {
   "use strict";
 
   /**
-   * 仿冒「中文产品官网首页」快速路径：
-   * - 火绒标题 + 免费下载（+ 可选 download.html）
-   * - 或 huorong-pc / im-todesk 类营销夹带主机 + 下载 CTA
-   * 不依赖完整 corr / 不等 ICP（夹带下载站立即 arm）。
+   * 宣称「技术支持/联系我们/客服」但页上无真实联系方式或加群入口 → 空心支持壳（盗版站常见）。
+   * 正站通常有 mailto / 电话 / QQ 群 / 微信客服 / Telegram 等。
+   */
+  NS.pageLooksLikeHollowSupportContactShell = function () {
+    try {
+      const title = document.title || "";
+      const html = typeof NS.getHtmlSlice === "function"
+        ? NS.getHtmlSlice(28000)
+        : String((document.documentElement && document.documentElement.innerHTML) || "").slice(0, 28000);
+      const navBlob = (() => {
+        try {
+          return Array.from(document.querySelectorAll("nav a, header a, footer a, .nav a, .menu a"))
+            .map((a) => `${a.textContent || ""} ${a.getAttribute("href") || ""}`)
+            .join(" ")
+            .slice(0, 2000);
+        } catch { return ""; }
+      })();
+      const claimBlob = `${title} ${navBlob} ${html.slice(0, 12000)}`;
+      // 宣称支持/联系
+      const claimsSupport = /技术支持|联系我们|联系方式|在线客服|售后服务|帮助中心|客户服务|关于我们|support\.html|contact\.html|\/support|\/contact/i.test(claimBlob)
+        || /技术支持|联系我们|客服|售后|帮助中心/i.test(navBlob);
+      if (!claimsSupport) return false;
+      // 真实联系：邮箱、电话、即时通讯、加群
+      let hasRealContact = false;
+      try {
+        if (document.querySelector('a[href^="mailto:"], a[href^="tel:"], a[href*="mailto:"], a[href*="t.me/"], a[href*="discord."], a[href*="jq.qq.com"]')) {
+          hasRealContact = true;
+        }
+      } catch { /* ignore */ }
+      if (!hasRealContact) {
+        hasRealContact = /mailto:|tel:\s*\+?\d|@[\w.-]+\.[a-z]{2,}|电话\s*[:：]?\s*\d|手机\s*[:：]?\s*1\d{10}|客服热线|服务热线|\d{3,4}[-\s]?\d{7,8}|1[3-9]\d{9}/i.test(html)
+          || /(?:QQ|qq)\s*[:：]?\s*\d{5,12}|QQ\s*群|qq\s*群|加群|群号\s*[:：]?\s*\d{5,}|微信\s*[:：]|微信号|企业微信|公众号|Telegram|Discord|Slack|客服微信/i.test(html)
+          || /support@|contact@|service@|help@|info@/i.test(html);
+      }
+      if (hasRealContact) return false;
+      // 仅有 support.html 导航、正文无联系点 → 空心
+      return true;
+    } catch { return false; }
+  };
+
+  /**
+   * 下载弹层仅网盘扫码（夸克/百度盘）无直链安装包 → 盗版分发壳。
+   */
+  NS.pageLooksLikeNetdiskQrOnlyDownload = function () {
+    try {
+      const title = document.title || "";
+      if (!/下载|download|官方|客户端|软件|工具|测试|安装/i.test(title)
+        && !document.querySelector("a[href*='download'], .download-btn, [onclick*='Download'], #downloadModal")) {
+        return false;
+      }
+      const html = typeof NS.getHtmlSlice === "function"
+        ? NS.getHtmlSlice(20000)
+        : String((document.documentElement && document.documentElement.innerHTML) || "").slice(0, 20000);
+      const netdisk = /夸克|百度网盘|蓝奏云|天翼云盘|阿里云盘|迅雷云盘|扫码.*下载|网盘扫码|长按识别|打开手机扫码/i.test(html);
+      if (!netdisk) return false;
+      // 几乎无同站 exe/zip 直链
+      let pkg = 0;
+      try {
+        if (typeof NS.collectAllPagePackageHrefs === "function") {
+          pkg = (NS.collectAllPagePackageHrefs() || []).length;
+        }
+      } catch { pkg = 0; }
+      if (pkg >= 2) return false;
+      return true;
+    } catch { return false; }
+  };
+
+  /**
+   * 仿冒官网快速路径：
+   * 1) squat 夹带/连字符拆品牌域 + 下载 CTA（crystaldisk-mark）
+   * 2) 域名与主关键词无关 + 官方下载话术 + 下载壳
+   * 3) 官方下载壳 + 空心支持/联系 或 纯网盘扫码分发
    */
   NS.tryArmChineseBrandDownloadHomeSpoof = function () {
     try {
       const state = NS.state;
       if (state.downloadGuardInstalled && state._brandSpoofPortalDetected) return true;
-      // 真备案且非硬套件：仍放过（todeskai 类）
       if (NS.hasValidIcpRecord() && !state._seoCloakKitDetected && !state._desktopForceDlKit) return false;
       if (typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature()) return false;
-      // 第三方软件门户详情（中华网软件等）：不是仿冒产品官网
       if (typeof NS.pageLooksLikeSoftwareCatalogPortal === "function" && NS.pageLooksLikeSoftwareCatalogPortal()) return false;
       if (typeof NS.pageLooksLikeAppMarketOrAppStoreListing === "function" && NS.pageLooksLikeAppMarketOrAppStoreListing()) return false;
-
-      const host = (location.hostname || "").toLowerCase().replace(/^www\./, "");
-      const labelRaw = (host.split(".")[0] || "").toLowerCase();
-      const lab = labelRaw.replace(/-/g, "");
-      const core = typeof NS.inferMarketingPaddedBrandCore === "function"
-        ? (NS.inferMarketingPaddedBrandCore(labelRaw) || "")
-        : "";
-      const isPaddedHost = !!(core && core.length >= 4 && (
-        (typeof NS.hostLabelIsPaddedBrand === "function" && NS.hostLabelIsPaddedBrand(lab, core))
-        || (typeof NS.hostLabelIsPrefixedHyphenBrand === "function" && NS.hostLabelIsPrefixedHyphenBrand(labelRaw, core))
-        || /[-_](pc|app|soft|safe|vip|pro|cn|win|download|client|free|official)$/i.test(labelRaw)
-        || /^(pc|app|get|im|aa|ca|download|soft)[-_]/i.test(labelRaw)
-      ));
-      // 真品牌根域 huorong.com（无夹带后缀）→ 不走此路径
-      const isExactBrandApex = !isPaddedHost && !/[-_]/.test(labelRaw)
-        && /^(huorong|hongrong|qihoo|sogou|baidu|tencent|dingtalk|todesk|sunlogin|oray|kingsoft|rising)$/i.test(lab);
-      if (isExactBrandApex) {
-        NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "home-fast-skip-exact-apex", lab);
+      // Arch/Ubuntu 等发行版 ISO / 海量镜像列表：非银狐 exe 假官网，home-fast 直接跳过
+      if (typeof NS.shouldSkipHeavyPageScan === "function" && NS.shouldSkipHeavyPageScan()) {
+        NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "home-fast-skip-heavy-page");
         return false;
       }
+      if ((typeof NS.pageLooksLikeHighDensityDownloadList === "function" && NS.pageLooksLikeHighDensityDownloadList())
+        || (typeof NS.pageLooksLikeOsDistroIsoDownload === "function" && NS.pageLooksLikeOsDistroIsoDownload())) {
+        NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "home-fast-skip-high-density-or-os-iso");
+        return false;
+      }
+
+      const host = (location.hostname || "").toLowerCase().replace(/^www\./, "");
+      // 多标签关键词能拼成域名（title/logo/nav 的 ToDesk + AI ≡ todeskai）→ 绝不报盗版
+      // 夹带 apex（qq-musics）或营销子域 win. 不得因首标签对齐而跳过
       try {
+        const ap0 = (typeof NS.getRegistrableDomain === "function" ? NS.getRegistrableDomain(host) : host) || host;
+        const apLeft0 = (String(ap0).split(".")[0] || "").toLowerCase();
+        const pad0 = typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
+          && NS.apexLabelLooksLikeMarketingPaddedBrand(apLeft0);
+        if (!pad0 && typeof NS.hostLabelStronglyAlignedWithIdentityKeywords === "function"
+          && NS.hostLabelStronglyAlignedWithIdentityKeywords(apLeft0)) {
+          NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "home-fast-skip-identity-aligned", host);
+          return false;
+        }
+      } catch { /* ignore */ }
+      const rel = typeof NS.evaluateDomainKeywordRelevance === "function"
+        ? NS.evaluateDomainKeywordRelevance(host)
+        : null;
+      // 几乎关联（exact/category）→ 不显示盗版
+      if (rel && rel.related && !rel.squat) {
+        NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "home-fast-skip-almost-related", rel.hostMatch, rel.brandToken);
+        return false;
+      }
+
+      const labelRaw = (host.split(".")[0] || "").toLowerCase();
+      const lab = labelRaw.replace(/-/g, "");
+      // ★ 根源核：整主机解析（pc.v-dingtalk.com.cn → dingtalk），禁止只看首标签 pc
+      const hostCores = typeof NS.collectHostBrandCores === "function"
+        ? NS.collectHostBrandCores(host)
+        : null;
+      const core = (hostCores && hostCores.padCore)
+        || (typeof NS.resolveHostBrandCore === "function" ? (NS.resolveHostBrandCore(host) || "") : "")
+        || (typeof NS.inferMarketingPaddedBrandCore === "function"
+          ? (NS.inferMarketingPaddedBrandCore(labelRaw) || "")
+          : "");
+      const apexLeftRaw = (hostCores && hostCores.apexLeftRaw)
+        || (() => {
+          try {
+            const ap = typeof NS.getRegistrableDomain === "function" ? NS.getRegistrableDomain(host) : host;
+            return (String(ap || "").split(".")[0] || "").toLowerCase();
+          } catch { return labelRaw; }
+        })();
+      // 数字品牌夹带：2345-kantuwangd / 360-xxx（主机以产品数字开头但后缀乱拼）
+      const digitPadHost = /^\d{3,6}[-_][a-z0-9]{3,}/i.test(labelRaw)
+        || /^\d{3,6}[-_][a-z0-9]{3,}/i.test(apexLeftRaw)
+        || (/^\d{3,6}[a-z]{4,}/i.test(lab) && lab.length > 6);
+      // 连字符拆品牌：crystaldisk-mark / to-desk / v-dingtalk
+      const hyphenHost = !!(rel && rel.squat && rel.hostMatch === "hyphen")
+        || ((/-/.test(labelRaw) || /-/.test(apexLeftRaw)) && typeof NS.hostLabelIsHyphenatedBrandMirror === "function"
+          && typeof NS.collectPrimaryBrandKeywords === "function" && (() => {
+            try {
+              const pk = NS.collectPrimaryBrandKeywords();
+              const toks = [...(pk.latin || []), ...(pk.tokens || [])].map((x) => String(x).toLowerCase().replace(/[^a-z0-9]/g, ""));
+              return toks.some((t) => t.length >= 6 && (
+                NS.hostLabelIsHyphenatedBrandMirror(labelRaw, t)
+                || NS.hostLabelIsHyphenatedBrandMirror(apexLeftRaw, t)
+              ));
+            } catch { return false; }
+          })());
+      const apexFlat0 = (apexLeftRaw || "").replace(/[^a-z0-9]/g, "");
+      // 正站产品子域（music.qq.com）不得标 padded
+      const officialProdSub = typeof NS.hostLooksLikeOfficialProductSubdomain === "function"
+        && NS.hostLooksLikeOfficialProductSubdomain(host);
+      // qqmusics / qq-musics / qqyinle：QQ + 音乐拼音/英文仿冒（apex 本身，非 music.qq.com）
+      const qqMusicSquat = !officialProdSub && (
+        /^(?:qq|weixin|wx)(?:music|musics|yinyue|yinle)$/i.test(apexFlat0)
+        || /^qq[-_](?:music|musics|yinyue|yinle)$/i.test(apexLeftRaw || "")
+      );
+      const isPaddedHost = !officialProdSub && (digitPadHost || hyphenHost || qqMusicSquat
+        || !!(hostCores && hostCores.padded)
+        || !!(rel && rel.squat && (rel.hostMatch === "padded" || rel.hostMatch === "hyphen" || rel.hostMatch === "typo"))
+        || !!(typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
+          && NS.apexLabelLooksLikeMarketingPaddedBrand(apexLeftRaw))
+        || !!(core && core.length >= 4 && (
+          (typeof NS.hostLabelIsPaddedBrand === "function" && (
+            NS.hostLabelIsPaddedBrand(lab, core)
+            || NS.hostLabelIsPaddedBrand(apexFlat0, core)
+          ))
+          || (typeof NS.hostLabelIsPrefixedHyphenBrand === "function" && (
+            NS.hostLabelIsPrefixedHyphenBrand(labelRaw, core)
+            || NS.hostLabelIsPrefixedHyphenBrand(apexLeftRaw, core)
+          ))
+          || (typeof NS.hostLabelIsMarketingPrefixedBrandShape === "function"
+            && (NS.hostLabelIsMarketingPrefixedBrandShape(labelRaw, core)
+              || NS.hostLabelIsMarketingPrefixedBrandShape(apexLeftRaw, core)))
+          || /[-_](pc|app|soft|safe|vip|pro|cn|win|download|client|free|official|music|musics)$/i.test(labelRaw)
+          || /[-_](pc|app|soft|safe|vip|pro|cn|win|download|client|free|official|music|musics)$/i.test(apexLeftRaw)
+          || /^(pc|app|get|im|aa|ca|v|ie|win|download|soft|qq)[-_]/i.test(labelRaw)
+          || /^(pc|app|get|im|aa|ca|v|ie|win|download|soft|qq)[-_]/i.test(apexLeftRaw)
+          || (typeof NS.isMarketingHostLabelOnly === "function" && NS.isMarketingHostLabelOnly(labelRaw)
+            && apexLeftRaw && core && apexFlat0.includes(core)
+            && apexFlat0 !== core
+            // music.qq.com：label=music 营销词但 apex=qq 干净 → 不当 padded
+            && !(apexFlat0.length <= 3 && !/^(?:qq|wx).{4,}/i.test(apexFlat0)))
+        )));
+      try {
+        // 干净品牌根产品子域：music.qq.com / y.qq.com / shurufa.sogou.com → 正站跳过
+        // win.qq-musics.com 等夹带 apex 不得跳过
+        if (typeof NS.hostLooksLikeOfficialProductSubdomain === "function"
+          && NS.hostLooksLikeOfficialProductSubdomain(host)) {
+          NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "home-fast-skip-official-product-sub", host);
+          return false;
+        }
         if (typeof NS.hostIsProductSubdomainOfBrandApex === "function" && NS.hostIsProductSubdomainOfBrandApex(host)) {
+          const apL = apexLeftRaw || "";
+          const paddedApex = typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
+            && NS.apexLabelLooksLikeMarketingPaddedBrand(apL);
+          if (!paddedApex) {
+            NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "home-fast-skip-product-subdomain", host);
+            return false;
+          }
+        }
+      } catch { /* ignore */ }
+
+      // ★ 展示名：只取等权综合（resolveSpoofDisplayBrand 滤主机碎片 Iehuorong/Huorongpc）
+      // isPaddedHost / core / StronglyAligned 只决定「拦不拦」，不写 brand 字符串
+      let brand = "";
+      const isDebris = (t) => {
+        try {
+          return typeof NS.isHostShapedCompoundBrandToken === "function"
+            && NS.isHostShapedCompoundBrandToken(t, host);
+        } catch { return false; }
+      };
+      try {
+        if (typeof NS.resolveSpoofDisplayBrand === "function") {
+          brand = NS.resolveSpoofDisplayBrand(host) || "";
+        }
+      } catch { brand = ""; }
+      if (brand && isDebris(brand)) brand = "";
+      if (!brand || brand.length < 2) {
+        try {
+          const pk = typeof NS.collectPrimaryBrandKeywords === "function"
+            ? NS.collectPrimaryBrandKeywords()
+            : null;
+          if (typeof NS.normalizeDisplayBrandName === "function" && pk && pk.display && !isDebris(pk.display)) {
+            brand = NS.normalizeDisplayBrandName(pk.display) || pk.display;
+          } else if (pk && pk.display && !isDebris(pk.display)) {
+            brand = pk.display;
+          }
+          if ((!brand || isDebris(brand)) && pk && pk.cn && pk.cn[0]) {
+            brand = typeof NS.normalizeDisplayBrandName === "function"
+              ? (NS.normalizeDisplayBrandName(pk.cn[0]) || pk.cn[0])
+              : pk.cn[0];
+          }
+          if ((!brand || isDebris(brand)) && pk && pk.latin) {
+            for (let i = 0; i < pk.latin.length; i++) {
+              const lat = pk.latin[i];
+              if (!lat || isDebris(lat)) continue;
+              if (typeof NS.looksLikeAssetGarbageToken === "function" && NS.looksLikeAssetGarbageToken(lat)) continue;
+              brand = typeof NS.formatBrandTokenForDisplay === "function"
+                ? NS.formatBrandTokenForDisplay(lat)
+                : lat;
+              if (brand) break;
+            }
+          }
+          // 夹带核 + 页内中文桥：火绒
+          if ((!brand || isDebris(brand)) && core && core.length >= 4
+            && typeof NS.DOMAIN_LATIN_CN_BRIDGE === "object" && NS.DOMAIN_LATIN_CN_BRIDGE[core]) {
+            const blob = String((pk && pk.blob) || document.title || "");
+            for (const cn of NS.DOMAIN_LATIN_CN_BRIDGE[core]) {
+              if (blob.includes(cn)) { brand = cn; break; }
+            }
+            if (!brand || isDebris(brand)) {
+              brand = typeof NS.formatBrandTokenForDisplay === "function"
+                ? NS.formatBrandTokenForDisplay(core)
+                : core;
+            }
+          }
+        } catch { brand = ""; }
+      }
+      if (brand && isDebris(brand)) brand = "";
+      // 无等权身份时：夹带站仍可 arm，但 toast 用中性文案（勿把 Iehuorong/Reserved 当品牌）
+      if (!brand || brand.length < 2) {
+        if (!isPaddedHost && !hyphenHost && !digitPadHost) return false;
+        brand = "品牌";
+      }
+      if (typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(brand)) return false;
+      if (typeof NS.looksLikeAssetGarbageToken === "function" && NS.looksLikeAssetGarbageToken(brand)) return false;
+      // 夹带域（ca-hongrong）绝不可因「自托管资源」跳过；仅干净主机 + CDN 子域才跳过
+      try {
+        if (!isPaddedHost && !hyphenHost && !digitPadHost
+          && typeof NS.hostLabelMatchesPageResourceApex === "function"
+          && NS.hostLabelMatchesPageResourceApex(host)) {
+          NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "home-fast-skip-resource-apex", host);
           return false;
         }
       } catch { /* ignore */ }
 
-      const title = (document.title || "").trim();
-      let keywords = "";
+      // SEO 套壳模板（ca-aurora-template / ca-Download-CMS）+ 官方下载话术 → 强化为可 arm
+      let seoShell = false;
       try {
-        keywords = document.querySelector('meta[name="keywords"]')?.getAttribute("content") || "";
-        if (!keywords) {
-          for (const el of Array.from(document.querySelectorAll("meta")).slice(0, 40)) {
-            const n = String(el.getAttribute("name") || "").toLowerCase();
-            if (n === "keywords" || n.includes("keyword")) {
-              keywords = el.getAttribute("content") || "";
-              if (keywords) break;
-            }
-          }
-        }
+        const gen = String(document.querySelector('meta[name="generator"]')?.getAttribute("content") || "");
+        const tpl = String(document.querySelector('meta[name="template"]')?.getAttribute("content") || "");
+        seoShell = /ca-?download-?cms|ca-?aurora|seo[_-]?template|aurora-template/i.test(`${gen} ${tpl}`)
+          || /ca-?download-?cms|ca-?aurora|seo[_-]?template/i.test(document.documentElement?.innerHTML?.slice(0, 8000) || "");
       } catch { /* ignore */ }
-      let brand = "";
-      // title / og / description 先于 keywords（SEO 虚词「文章」绝不当展示品牌）
-      if (typeof NS.pickChineseBrandFromPageSurface === "function") {
-        const ogSite = document.querySelector('meta[property="og:site_name"]')?.getAttribute("content") || "";
-        const ogTitle = document.querySelector('meta[property="og:title"]')?.getAttribute("content") || "";
-        const desc = document.querySelector('meta[name="description"]')?.getAttribute("content") || "";
-        brand = NS.pickChineseBrandFromPageSurface(title)
-          || NS.pickChineseBrandFromPageSurface(ogSite)
-          || NS.pickChineseBrandFromPageSurface(ogTitle)
-          || NS.pickChineseBrandFromPageSurface(desc)
-          || NS.pickChineseBrandFromPageSurface(document.querySelector("h1")?.textContent || "")
-          || NS.pickChineseBrandFromPageSurface(keywords)
-          || "";
-      }
-      if ((!brand || brand.length < 2) && typeof NS.pickChineseBrandFromIdentityConsensus === "function") {
-        brand = NS.pickChineseBrandFromIdentityConsensus() || "";
-      }
-      if (!brand || brand.length < 2) {
-        // 扫整段 title 取数字前缀产品；勿用首段纯中文（文章-360… 会误取「文章」）
-        const digit = (title.match(/(\d{2,6}[一-鿿]{2,6})/) || [])[1] || "";
-        if (digit && !(typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(digit))) brand = digit;
-        else {
-          const segs = title.split(/\s*[-–—|:·｜]\s*/).map((p) => p.trim()).filter(Boolean);
-          for (const seg of segs) {
-            const m = (seg.match(/^([一-鿿]{2,6})/) || [])[1] || "";
-            if (!m) continue;
-            if (/^(安全|软件|下载|官方|电脑|系统|工具|安静|纯净|强悍|免费|最新|文章|专题|详情|导读|正文)$/.test(m)) continue;
-            if (typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(m)) continue;
-            brand = m;
-            break;
-          }
-        }
-      }
-      if (brand && typeof NS.trimChineseBrandTrail === "function") brand = NS.trimChineseBrandTrail(brand) || brand;
-      // 弱词（文章）或裁残后仍弱 → 丢弃，勿 arm 仿冒「文章」
-      if (brand && typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(brand)) brand = "";
-      // 夹带域无中文时：用主机核心当拉丁展示（Huorong）
-      if ((!brand || brand.length < 2) && isPaddedHost && core) {
-        brand = typeof NS.formatBrandTokenForDisplay === "function"
-          ? NS.formatBrandTokenForDisplay(core)
-          : (core.charAt(0).toUpperCase() + core.slice(1));
-      }
-      if (!brand || brand.length < 2) return false;
-      if (typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(brand)
-        && !isPaddedHost) return false;
 
-      // 下载意图：CTA 文案 / download 路径 / 路径含 download
+      const title = document.title || "";
+      const kwMeta = document.querySelector('meta[name="keywords"]')?.getAttribute("content") || "";
+      // 官方下载话术（假官网必备）；兼容「| 官方下载」
+      const officialClaim = /官网|官方下载|官方正版|官方网站|官方高速|官方渠道|免费下载|立即下载|客户端下载|下载中心|行业标准工具/i.test(
+        `${title} ${kwMeta}`
+      ) || /官方下载|免费下载|立即下载/i.test(title);
+
       let hub = 0;
       let dlCta = 0;
       try {
-        document.querySelectorAll("a[href], a[data-href], button, .btn-header, .btn-primary, .btn-lg, [class*='download']").forEach((el) => {
+        document.querySelectorAll(
+          "a[href], a[data-href], button, .btn-header, .btn-primary, .btn-lg, .btn-sm, .download-btn, [class*='download'], [onclick*='Download'], [onclick*='download']"
+        ).forEach((el) => {
           const href = (el.getAttribute("href") || el.getAttribute("data-href") || "").trim();
           const text = (el.textContent || "").replace(/\s+/g, " ").trim();
+          const onclick = el.getAttribute("onclick") || "";
           if (/免费下载|立即下载|立即免费下载|官方下载|个人版|企业版|客户端下载|下载中心|获取客户端/i.test(text)) dlCta++;
-          else if (text.length <= 20 && /下载/.test(text)) dlCta++;
+          else if (text.length <= 24 && /下载/.test(text)) dlCta++;
+          if (/openDownloadModal|startDownload|showDownload/i.test(onclick)) dlCta++;
           if (href && /download\.html|(?:^|\/)download(?:\/|\.html?|$)|down\.html|install\.html/i.test(href)) hub++;
           if (href && typeof NS.looksLikeSameOriginLandingPageUrl === "function" && NS.looksLikeSameOriginLandingPageUrl(href)) hub++;
         });
       } catch { /* ignore */ }
-      const pathDl = /download|down|install|client/i.test(location.pathname || "");
-      const titleDl = /下载|官网|官方|客户端|安静|纯净|强悍/i.test(title + keywords);
-      // 夹带域 huorong-pc.cn：中文品牌标题即足够 arm（不强制 download.html / CTA）
-      // 非夹带域：须下载导流（hub 或双 CTA）
-      if (isPaddedHost) {
-        if (!/[一-鿿]{2,}/.test(brand) && dlCta < 1 && !titleDl) return false;
-      } else if (dlCta < 1 || (hub < 1 && dlCta < 2)) {
-        return false;
-      }
 
-      const matchHint = isPaddedHost ? "域名夹带品牌前缀/后缀" : "域名与品牌无关";
+      const hollowSupport = typeof NS.pageLooksLikeHollowSupportContactShell === "function"
+        && NS.pageLooksLikeHollowSupportContactShell();
+      const netdiskQr = typeof NS.pageLooksLikeNetdiskQrOnlyDownload === "function"
+        && NS.pageLooksLikeNetdiskQrOnlyDownload();
+
+      // 用户规则：
+      // A 半真半假（padded/typo/hyphen/partial）→ 盗版
+      // B 不相关 + 官网下载壳 → 盗版
+      // 几乎关联已在上方 return false
+      const domainUnrelated = !!(rel && !rel.related && !rel.squat
+        && (rel.mismatch || rel.hostMatch === "none" || !rel.hostMatch));
+      const pathSquat = isPaddedHost || hyphenHost || !!(rel && rel.squat)
+        || !!(core && core.length >= 4 && /^(?:aa|bb|cc|ca|im|get|pc|app|soft|download|free)[-_]/i.test(labelRaw))
+        || !!(rel && (rel.hostMatch === "partial" || rel.hostMatch === "padded"
+          || rel.hostMatch === "typo" || rel.hostMatch === "hyphen"));
+      const pathUnrelatedOfficial = domainUnrelated && officialClaim && (dlCta >= 1 || hub >= 1);
+      const pathHollowOrNetdisk = officialClaim && (dlCta >= 1 || hub >= 1)
+        && (hollowSupport || netdiskQr)
+        && !!(rel && !rel.related);
+      const pathSeoCnBrand = seoShell && officialClaim && (dlCta >= 1 || hub >= 1)
+        && brand.length >= 2
+        && !!(rel && (!rel.related || rel.squat));
+
+      if (!pathSquat && !pathUnrelatedOfficial && !pathHollowOrNetdisk && !pathSeoCnBrand) return false;
+      // squat：有官方话术或下载 CTA 即可（数字/连字符夹带域名常同时具备）
+      if (pathSquat && !officialClaim && dlCta < 1 && hub < 1) return false;
+      if ((pathUnrelatedOfficial || pathHollowOrNetdisk) && dlCta < 1 && hub < 1) return false;
+
+      const matchHint = pathSquat
+        ? ((rel && rel.hostMatch === "typo") ? "拼写仿冒"
+          : (hyphenHost || (rel && rel.hostMatch === "hyphen")) ? "域名用连字符拆分品牌名"
+          : digitPadHost ? "域名用数字品牌前缀+乱拼后缀" : "域名夹带品牌前缀/后缀")
+        : pathSeoCnBrand
+          ? "SEO套壳模板+品牌官方下载话术"
+          : pathHollowOrNetdisk
+            ? (hollowSupport ? "宣称支持/联系但无真实联系方式" : "仅网盘扫码分发无安装包直链")
+            : "域名与品牌无关";
       state.spoofBrand = brand;
       state._brandSpoofPortalDetected = true;
       const noticeTitle = `已识别仿冒「${brand}」官网`;
@@ -139,7 +364,7 @@
       NS.addSignal(
         "仿冒品牌官网下载站",
         24,
-        `标题/正文品牌「${brand}」与域名 ${location.hostname || host} 不匹配（${matchHint}${isPaddedHost && core ? `，主机核心 ${core}` : ""}）；下载导流门户`
+        `标题/正文品牌「${brand}」与域名 ${location.hostname || host} 不匹配（${matchHint}）；下载导流门户`
       );
       NS.installDownloadGuard(`仿冒品牌官网下载站（仿冒「${brand}」）`, {
         notify: true,
@@ -154,12 +379,12 @@
       state._pendingSoftBrandSpoof = false;
       NS.silverfoxLog && NS.silverfoxLog(
         "brand-spoof", "home-fast-path", brand, host,
-        isPaddedHost ? `padded:${core}` : "none",
+        pathSquat ? `squat:${(rel && rel.hostMatch) || "padded"}` : "unrelated-official",
         "cta=", dlCta, "hub=", hub
       );
       try {
         if (typeof NS.proactivelyProbeDownloadButtons === "function") {
-          Promise.resolve().then(() => NS.proactivelyProbeDownloadButtons()).catch(() => {});
+          Promise.resolve().then(() => NS.proactivelyProbeDownloadButtons({ force: true, reason: "after-home-fast" })).catch(() => {});
         }
       } catch { /* ignore */ }
       return true;
@@ -171,22 +396,94 @@
       const state = NS.state;
       if (NS.pageLooksLikeSearchEngineResultsPage()) return false;
       if (NS.pageLooksLikeThirdPartyBrandProxyOrMirror()) return false;
-      // 应用商店/手机助手详情页（百度手机助手钉钉详情等）：商店分发 App，不是仿冒官网
       if (typeof NS.pageLooksLikeAppMarketOrAppStoreListing === "function" && NS.pageLooksLikeAppMarketOrAppStoreListing()) {
         NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "skip-app-market-listing");
         return false;
       }
-      // 第三方软件下载门户详情（中华网软件 /soft/1109443.html）：分发站不是仿冒官网
       if (typeof NS.pageLooksLikeSoftwareCatalogPortal === "function" && NS.pageLooksLikeSoftwareCatalogPortal()) {
         NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "skip-software-catalog-portal");
         state._pendingSoftBrandSpoof = false;
         return false;
       }
-      // 快速路径：火绒类首页 + download.html 导流（不卡 safe-official / 短域名 corr）
+
+      // 干净品牌根 + CDN 子域资源（cdn-www.huorong.cn）→ 正站；夹带域 qq-musics / ca-hongrong 不走此放行
+      try {
+        const hostChk = (location.hostname || "").toLowerCase().replace(/^www\./, "");
+        const labChk = (hostChk.split(".")[0] || "").toLowerCase();
+        const apexChk = (typeof NS.getRegistrableDomain === "function"
+          ? NS.getRegistrableDomain(hostChk) : hostChk) || hostChk;
+        const apexLeftChk = (apexChk.split(".")[0] || "").toLowerCase();
+        const looksPadHost = /[-_]/.test(labChk) || /[-_]/.test(apexLeftChk)
+          || /^(?:aa|bb|cc|ca|im|get|pc|app|soft|download|free|win|qq)[-_]/i.test(labChk)
+          || /^(?:aa|bb|cc|ca|im|get|pc|app|soft|download|free|win|qq)[-_]/i.test(apexLeftChk)
+          || (typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
+            && NS.apexLabelLooksLikeMarketingPaddedBrand(apexLeftChk))
+          || (typeof NS.inferMarketingPaddedBrandCore === "function"
+            && (NS.inferMarketingPaddedBrandCore(labChk) || NS.inferMarketingPaddedBrandCore(apexLeftChk)))
+          || /^(?:qq|wx)(?:music|musics|yinyue|yinle)$/i.test(apexLeftChk.replace(/[^a-z0-9]/g, ""));
+        if (!looksPadHost && typeof NS.hostLabelMatchesPageResourceApex === "function" && NS.hostLabelMatchesPageResourceApex()) {
+          NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "skip-resource-apex");
+          state._pendingSoftBrandSpoof = false;
+          return false;
+        }
+      } catch { /* ignore */ }
+
+      // 官方产品子域（music.qq.com / y.qq.com）+ 页内品牌 → 正站
+      try {
+        const hostOff = (location.hostname || "").toLowerCase().replace(/^www\./, "");
+        if (typeof NS.hostLooksLikeOfficialProductSubdomain === "function"
+          && NS.hostLooksLikeOfficialProductSubdomain(hostOff)) {
+          NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "skip-official-product-subdomain", hostOff);
+          state._pendingSoftBrandSpoof = false;
+          return false;
+        }
+      } catch { /* ignore */ }
+
+      // 多标签身份（title/logo alt/nav）能拼成域名 → 正站；夹带 apex 上的 win. 不得对齐跳过
+      try {
+        const hostAlign = (location.hostname || "").toLowerCase().replace(/^www\./, "");
+        const labAlign = (hostAlign.split(".")[0] || "").toLowerCase();
+        const apexAlign = (typeof NS.getRegistrableDomain === "function"
+          ? NS.getRegistrableDomain(hostAlign) : hostAlign) || hostAlign;
+        const apexLeftAlign = (apexAlign.split(".")[0] || "").toLowerCase();
+        const padAlign = typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
+          && NS.apexLabelLooksLikeMarketingPaddedBrand(apexLeftAlign);
+        if (!padAlign && typeof NS.hostLabelStronglyAlignedWithIdentityKeywords === "function"
+          && (NS.hostLabelStronglyAlignedWithIdentityKeywords(labAlign)
+            || NS.hostLabelStronglyAlignedWithIdentityKeywords(apexLeftAlign))) {
+          NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "skip-identity-keyword-aligned", labAlign);
+          state._pendingSoftBrandSpoof = false;
+          return false;
+        }
+      } catch { /* ignore */ }
+
+      // ═══ 主门控：域名 ↔ 主身份关键词相关度 ═══
+      const domainRel = typeof NS.evaluateDomainKeywordRelevance === "function"
+        ? NS.evaluateDomainKeywordRelevance()
+        : null;
+      // 域名与关键词一致（正站）→ 永不仿冒
+      if (domainRel && domainRel.related && !domainRel.squat) {
+        NS.silverfoxLog && NS.silverfoxLog(
+          "brand-spoof", "skip-domain-keyword-related",
+          domainRel.hostMatch, domainRel.brandToken || domainRel.brand
+        );
+        state._pendingSoftBrandSpoof = false;
+        return false;
+      }
+
+      // 快速路径：squat 或「无关 + 官方下载」
       if (typeof NS.tryArmChineseBrandDownloadHomeSpoof === "function" && NS.tryArmChineseBrandDownloadHomeSpoof()) {
         return true;
       }
-      // 与下载页检测绑死：非软件下载落地页壳 → 永不仿冒 arm（含资讯博客）
+
+      // 发行版 ISO 镜像页（Arch/Ubuntu…）在落地壳判定前跳过，避免 ISO 列表被当 exe 假官网
+      if (typeof NS.pageLooksLikeOsDistroIsoDownload === "function" && NS.pageLooksLikeOsDistroIsoDownload()) {
+        NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "skip-os-distro-iso");
+        state._pendingSoftBrandSpoof = false;
+        return false;
+      }
+
+      // 非软件下载落地页壳 → 不 arm
       const landingShell = typeof NS.evaluateSoftwareDownloadLandingShell === "function"
         ? NS.evaluateSoftwareDownloadLandingShell()
         : null;
@@ -195,39 +492,10 @@
         state._pendingSoftBrandSpoof = false;
         return false;
       }
-      // Linux 发行版 ISO/镜像下载页（archlinux.org.cn 等）：非银狐 exe 仿冒壳
-      if (typeof NS.pageLooksLikeOsDistroIsoDownload === "function" && NS.pageLooksLikeOsDistroIsoDownload()) {
-        NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "skip-os-distro-iso");
-        return false;
-      }
-      // MCAPKS 类高密度版本归档站：非「官网仿冒壳」，跳过以免 querySelectorAll + 包扫描卡死
       if (typeof NS.pageLooksLikeHighVolumePackageArchive === "function" && NS.pageLooksLikeHighVolumePackageArchive()) {
         NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "skip-high-volume-archive");
         return false;
       }
-      // 禁止用 hostRoot.includes(brand) 早退：im-todesk / todeskai 含 todesk 会被误判成「同站」直接放弃
-      try {
-        const lab0 = (location.hostname || "").toLowerCase().replace(/^www\./, "").split(".")[0] || "";
-        const labFlat = lab0.replace(/-/g, "");
-        const claim = `${document.title || ""} ${typeof NS.collectHeadingText === "function" ? NS.collectHeadingText(600) : ""}`;
-        const titleToks = NS.extractLatinBrandTokens(claim);
-        // 仅文档/社区子域 + 主机根与标题品牌 exact 同名时跳过
-        if (/^(wiki|docs?|help|manual|handbook|bbs|forum|forums|community|git|code|pkg|packages|aur)$/i.test(lab0)) {
-          const hostRoot = NS.brandRootKeyFromHost(location.hostname);
-          if (hostRoot.length >= 4 && titleToks.some((t) => t === hostRoot)) return false;
-        }
-        // 主机标签本身等于某标题品牌且非夹带/拼写仿冒 → 真官网形态
-        if (labFlat.length >= 4 && titleToks.some((t) => t === labFlat)) {
-          const squat = titleToks.some((t) => t.length >= 4 && (
-            NS.hostLabelIsPaddedBrand(labFlat, t)
-            || NS.hostLabelIsBrandTypo(labFlat, t)
-            || (typeof NS.hostLabelIsPrefixedHyphenBrand === "function" && NS.hostLabelIsPrefixedHyphenBrand(lab0, t))
-            || NS.hostLabelIsHyphenatedBrandMirror(lab0, t)
-          ));
-          if (!squat) return false;
-        }
-      } catch { /* ignore */ }
-      // 自家品牌 apex 产品子域（shurufa.sogou.com）：非仿冒
       try {
         if (typeof NS.hostIsProductSubdomainOfBrandApex === "function" && NS.hostIsProductSubdomainOfBrandApex()) {
           NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "skip-product-subdomain-of-apex");
@@ -235,7 +503,8 @@
           return false;
         }
       } catch { /* ignore */ }
-      // 有效 ICP / 超成熟 WHOIS：永不走仿冒 toast（搜狗/百度等）
+
+      // 有效 ICP / 超成熟：不 toast 软仿冒（假站通常无备案）
       if (NS.hasValidIcpRecord() || (typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature())
         || NS.looksLikeUltraMatureWhoisDomain() || NS.looksLikeUltraMatureIcpDomain()) {
         state._pendingSoftBrandSpoof = false;
@@ -246,393 +515,168 @@
         } catch { /* ignore */ }
         return false;
       }
-      if (NS.hasValidIcpRecord() && !state._seoCloakKitDetected && !state._fakeSpaDetected && !state._desktopForceDlKit && !state._fakeBrandShellDetected && !state._remoteGarbleDlDetected) {
-        state._pendingSoftBrandSpoof = false;
-        return false;
-      }
-      if (NS.looksLikeUltraMatureWhoisDomain() || NS.looksLikeUltraMatureIcpDomain()) return false;
-      if (NS.looksLikeLongLivedWhoisDomain()) {
-        try {
-          const lab = (location.hostname || "").toLowerCase().replace(/^www\./, "").split(".")[0] || "";
-          const labFlat = lab.replace(/-/g, "");
-          const claim = `${document.title || ""} ${typeof NS.collectHeadingText === "function" ? NS.collectHeadingText(800) : ""}`.toLowerCase();
-          // 仅主机标签完整出现在标题且无夹带形态时跳过（im-todesk 不会整段出现在标题）
-          if (lab.length >= 4 && claim.includes(lab) && !claim.includes(lab.replace(/-/g, " "))) {
-            const toks = NS.extractLatinBrandTokens(claim);
-            const squat = toks.some((t) => t.length >= 4 && (
-              NS.hostLabelIsPaddedBrand(labFlat, t)
-              || (typeof NS.hostLabelIsPrefixedHyphenBrand === "function" && NS.hostLabelIsPrefixedHyphenBrand(lab, t))
-            ));
-            if (!squat) return false;
-          }
-        } catch { /* ignore */ }
-      }
-      const titleHostCorrEarly = NS.evaluateTitleHostBrandCorrelation();
-      const isPadSquat = titleHostCorrEarly.hostMatch === "padded" || titleHostCorrEarly.hostMatch === "typo" || titleHostCorrEarly.hostMatch === "hyphen";
-      // 下载落地壳 + 品牌/域名错配时，勿被 safe-official 误伤（仿冒火绒长文首页）
-      const shellMismatchBypass = !!(landingShell && landingShell.ok && landingShell.hasHub
-        && (titleHostCorrEarly.mismatch || titleHostCorrEarly.hostMatch === "none" || titleHostCorrEarly.hostMatch === "partial")
-        && (titleHostCorrEarly.displayBrand || titleHostCorrEarly.brandToken));
-      if (!isPadSquat && !shellMismatchBypass
-        && (NS.looksLikeMatureOfficialPortal() || NS.shouldNeverArmProtection() || NS.looksLikeSafeOfficialContext())) {
-        return false;
-      }
-      // 软夹带/拼写有硬套件或安装包证据时不因 ICP 直接放弃（仍可由下方 hardKit 路径 arm）
-      if (isPadSquat && NS.hasValidIcpRecord() && !state._seoCloakKitDetected && !state._fakeSpaDetected && !state._desktopForceDlKit && !state._fakeBrandShellDetected) return false;
-      // exact 但实际是 padded/hyphen 的误标：若主机为 im-todesk 类，不要当 exact 跳过
-      if (titleHostCorrEarly.rigorousMatch || titleHostCorrEarly.hostMatch === "exact") {
-        try {
-          const lab0 = (location.hostname || "").toLowerCase().replace(/^www\./, "").split(".")[0] || "";
-          const br = titleHostCorrEarly.brandToken || "";
-          if (br && (NS.hostLabelIsPaddedBrand(lab0.replace(/-/g, ""), br)
-            || (typeof NS.hostLabelIsPrefixedHyphenBrand === "function" && NS.hostLabelIsPrefixedHyphenBrand(lab0, br))
-            || NS.hostLabelIsBrandTypo(lab0.replace(/-/g, ""), br))) {
-            titleHostCorrEarly.rigorousMatch = false;
-            titleHostCorrEarly.hostMatch = NS.hostLabelIsBrandTypo(lab0.replace(/-/g, ""), br) ? "typo" : "padded";
-            titleHostCorrEarly.mismatch = true;
-          } else {
-            return false;
-          }
-        } catch { return false; }
-      }
-      if (titleHostCorrEarly.brandToken && /^(lists?|issues?|code|files?|docs?|help|about|blog|news|pull|requests?|settings?|explore|topics?|stars?|forks?|actions?|security|projects?|wiki|people|teams?|marketplace|sponsors?|notifications?|collections?|templates?|template|examples?|getting|started|quickstart|guides?|tutorial|reference|api|sdk|cli|apps?|web|mobile|desktop|community|learn|changelog|status|careers|contact|terms|license|readme|aurora|generator|schema|inter|website)$/i.test(titleHostCorrEarly.brandToken)) {
-        // CMS/泛词：尝试换成中文展示名或主机推断核心，而不是直接放弃检测
-        const labFix0 = (location.hostname || "").toLowerCase().replace(/^www\./, "").split(".")[0] || "";
-        const cnFix = (typeof NS.pickBrandDisplayName === "function"
-          ? NS.pickBrandDisplayName({ title: document.title || "", displayBrand: titleHostCorrEarly.displayBrand, brandToken: "" })
-          : "") || titleHostCorrEarly.displayBrand || "";
-        const coreFix = typeof NS.inferMarketingPaddedBrandCore === "function" ? (NS.inferMarketingPaddedBrandCore(labFix0) || "") : "";
-        if (cnFix && /[一-鿿]/.test(cnFix)) {
-          titleHostCorrEarly.displayBrand = cnFix;
-          titleHostCorrEarly.brandToken = coreFix || cnFix;
-          titleHostCorrEarly.mismatch = true;
-          if (coreFix && (NS.hostLabelIsPaddedBrand(labFix0.replace(/-/g, ""), coreFix) || (typeof NS.hostLabelIsPrefixedHyphenBrand === "function" && NS.hostLabelIsPrefixedHyphenBrand(labFix0, coreFix)))) {
-            titleHostCorrEarly.hostMatch = "padded";
-          } else if (titleHostCorrEarly.hostMatch === "exact" || !titleHostCorrEarly.hostMatch) {
-            titleHostCorrEarly.hostMatch = "none";
-          }
-        } else if (coreFix) {
-          titleHostCorrEarly.brandToken = coreFix;
-          titleHostCorrEarly.hostMatch = "padded";
-          titleHostCorrEarly.mismatch = true;
-        } else {
+
+      // 用 domainRel 构造错配状态（不再依赖 partial 误放行）
+      const hasBrandKw = !!(domainRel && (domainRel.brand || domainRel.brandToken
+        || (domainRel.keywords && domainRel.keywords.length)));
+      const domainMismatch = !!(domainRel && !domainRel.related && hasBrandKw
+        && (domainRel.mismatch || domainRel.squat || domainRel.hostMatch === "none"
+          || domainRel.hostMatch === "padded" || domainRel.hostMatch === "typo"
+          || domainRel.hostMatch === "hyphen" || domainRel.hostMatch === "partial"));
+
+      if (!domainMismatch) {
+        // 再跑完整 corr 兜底
+        const corr = typeof NS.evaluateTitleHostBrandCorrelation === "function"
+          ? NS.evaluateTitleHostBrandCorrelation()
+          : null;
+        if (!corr || !corr.mismatch) {
+          state._pendingSoftBrandSpoof = false;
           return false;
         }
       }
-      if (titleHostCorrEarly.brandToken && NS.BRAND_TOKEN_STOP_RE.test(String(titleHostCorrEarly.brandToken).toLowerCase()) && !/[一-鿿]/.test(titleHostCorrEarly.brandToken)) {
-        const labFix = (location.hostname || "").toLowerCase().replace(/^www\./, "").split(".")[0] || "";
-        const fixed = NS.pickBrandTokenForHost(NS.extractLatinBrandTokens(`${document.title || ""} ${typeof NS.collectHeadingText === "function" ? NS.collectHeadingText(800) : ""}`), labFix)
-          || (typeof NS.inferMarketingPaddedBrandCore === "function" ? NS.inferMarketingPaddedBrandCore(labFix) : "")
-          || "";
-        const cnFix2 = typeof NS.pickBrandDisplayName === "function"
-          ? NS.pickBrandDisplayName({ title: document.title || "", displayBrand: titleHostCorrEarly.displayBrand, brandToken: fixed })
-          : (titleHostCorrEarly.displayBrand || "");
-        if (!fixed && !cnFix2) return false;
-        titleHostCorrEarly.brandToken = fixed || cnFix2;
-        titleHostCorrEarly.displayBrand = cnFix2 || titleHostCorrEarly.displayBrand || fixed;
-        titleHostCorrEarly.brandHits = Math.max(titleHostCorrEarly.brandHits || 0, 10);
-        if (fixed && NS.hostLabelIsBrandTypo(labFix.replace(/-/g, ""), fixed)) titleHostCorrEarly.hostMatch = "typo";
-        else if (fixed && typeof NS.hostLabelIsPrefixedHyphenBrand === "function" && NS.hostLabelIsPrefixedHyphenBrand(labFix, fixed)) titleHostCorrEarly.hostMatch = "padded";
-        else if (fixed && NS.hostLabelIsPaddedBrand(labFix.replace(/-/g, ""), fixed)) titleHostCorrEarly.hostMatch = "padded";
-        else if (/[一-鿿]/.test(cnFix2 || "")) titleHostCorrEarly.hostMatch = titleHostCorrEarly.hostMatch === "exact" ? "none" : (titleHostCorrEarly.hostMatch || "none");
-        titleHostCorrEarly.mismatch = titleHostCorrEarly.hostMatch === "typo" || titleHostCorrEarly.hostMatch === "padded" || titleHostCorrEarly.hostMatch === "hyphen" || titleHostCorrEarly.hostMatch === "none";
+
+      let titleHostCorr = {
+        mismatch: true,
+        hostMatch: (domainRel && domainRel.hostMatch) || "none",
+        brandToken: (domainRel && (domainRel.brandToken || domainRel.brand)) || "",
+        displayBrand: (domainRel && domainRel.brand) || "",
+        brandHits: 8,
+        rigorousMatch: false
+      };
+      if (domainRel && domainRel.squat) {
+        titleHostCorr.hostMatch = domainRel.hostMatch || "padded";
+      }
+      if (domainRel && !domainRel.related && !domainRel.squat) {
+        titleHostCorr.hostMatch = "none";
       }
 
-      const claimedCtx = NS.getClaimedBrandContext();
+      // 下载壳 + 官方话术
+      const claimedCtx = typeof NS.getClaimedBrandContext === "function" ? NS.getClaimedBrandContext() : {};
       const { brandSource, claimsOfficial, tokens } = claimedCtx;
       const productBrand = claimedCtx.productBrand || null;
-      // 话术与落地壳绑死：落地壳 pitch 为主；claimsOfficial 仅在有壳证据时加持
-      // CTA「免费下载」+ download.html 导流：landingShell.softPitch/ok 已覆盖仿冒火绒首页
+      const titleBlob = `${document.title || ""} ${brandSource || ""}`;
       const officialPitch = !!(landingShell.pitch || landingShell.softPitch
-        || ((claimsOfficial || NS.pageClaimsOfficialDownload() || NS.pageClaimsBrandDownloadLanding()
-          || /官方下载|全平台官方|官方客户端|客户端下载|官方网站|客户端完全免费|开始使用|远程桌面|电脑版官网|免费下载_官方|官方桌面|下载中心|全平台客户端|官方安全|免费下载|立即免费下载/i.test(brandSource)
-          || /下载中心|全平台|客户端下载|免费下载/i.test(document.title || ""))
-          && (landingShell.shellScore >= 2 || landingShell.hardShell || landingShell.ctaCount >= 1 || landingShell.pkgCount >= 1 || landingShell.hasHub)));
-      if (!officialPitch && tokens.size === 0 && !landingShell.ok) return false;
-      // 无下载壳 pitch/硬壳时，即使有 brand token 也不走仿冒（防内容页）
-      if (!landingShell.ok) return false;
-      if (!officialPitch && !landingShell.hardShell && landingShell.pkgCount < 1 && !(landingShell.hasHub && landingShell.ctaCount >= 1)) return false;
-
-      const titleHostCorr = titleHostCorrEarly;
-      if (titleHostCorr.hostMatch === "serp") return false;
-      if ((titleHostCorr.rigorousMatch || titleHostCorr.hostMatch === "exact") && titleHostCorr.hostMatch !== "padded" && titleHostCorr.hostMatch !== "typo" && titleHostCorr.hostMatch !== "hyphen") return false;
-
-      const offsitePkgs = NS.findSuspiciousOffsitePackagesInPage();
-      const hasBrandMismatchPkg = offsitePkgs.some((p) => NS.packageMismatchesPageBrand(p) || NS.looksLikeHiddenPackagePath(p));
-
-      if (!titleHostCorr.mismatch && !hasBrandMismatchPkg && titleHostCorr.hostMatch !== "hyphen" && titleHostCorr.hostMatch !== "padded" && titleHostCorr.hostMatch !== "typo") {
-        if (NS.looksLikeSelfConsistentOfficialSite()) return false;
-        if (NS.looksLikeOfficialBrandDownloadPage()) return false;
+        || claimsOfficial
+        || (typeof NS.pageClaimsOfficialDownload === "function" && NS.pageClaimsOfficialDownload())
+        || (typeof NS.pageClaimsBrandDownloadLanding === "function" && NS.pageClaimsBrandDownloadLanding())
+        || /官网|官方下载|官方正版|官方网站|官方高速|免费下载|立即下载|下载中心|客户端下载/i.test(titleBlob));
+      if (!officialPitch && landingShell.ctaCount < 1 && landingShell.pkgCount < 1 && !landingShell.hasHub) {
+        return false;
       }
+      // 有下载壳 + 域名错配 +（官方话术或明确下载 CTA）
+      if (!officialPitch && landingShell.ctaCount < 1) return false;
 
-      const spoofHost = NS.hostLooksLikeBrandMarketingSpoof() || titleHostCorr.mismatch || titleHostCorr.hostMatch === "padded" || titleHostCorr.hostMatch === "typo" || titleHostCorr.hostMatch === "hyphen"
-        || titleHostCorr.hostMatch === "none" || titleHostCorr.hostMatch === "partial";
-      const downloadCtAs = Array.from(document.querySelectorAll(
-        "a[href], a[data-href], a[data-url], button, [role='button'], [onclick], .btn-p, .btn-g, .nav-cta, .btn-header, .btn-download, .download-btn, a.download-btn, a.btn-primary, a.btn-lg"
-      )).filter((el) => {
-        const href = NS.getElementDownloadHref(el) || el.getAttribute("href") || "";
-        const text = (el.textContent || "").replace(/\s+/g, " ").trim();
-        const cls = String(el.className || "");
-        return NS.DOWNLOAD_TEXT.test(text) || /立即下载|免费下载|立即免费下载|立即使用|前往\s*App\s*Store|Windows\s*版|查看其他平台|下载中心|个人版/i.test(text)
-          || /download\.php|download\.html|\/download/i.test(href) || NS.isPackageFileUrl(href) || /^download/i.test((href.split("/").pop() || ""))
-          || /startDownload\s*\(|openDownloadModal/i.test(el.getAttribute("onclick") || "")
-          || ((/download-btn|btn-download|btn-header|btn-primary|btn-lg/i.test(cls)) && text.length > 0 && text.length < 40 && /下载|免费|官方|客户端/i.test(text));
-      });
-
-      const htmlSliceEarly = NS.getHtmlSlice(80000);
-      const cloudDriveQrOnly = /夸克|百度网盘|扫码.*下载|二维码/i.test(htmlSliceEarly) && /modal|qr-grid|qr-item|openDownloadModal/i.test(htmlSliceEarly) && NS.countTransparentProductPackages(htmlSliceEarly) === 0;
-
-      const hasBareDownloadPhp = downloadCtAs.some((el) => {
-        try {
-          const h = NS.getElementDownloadHref(el) || el.getAttribute("href") || "";
-          if (!h) return false;
-          const u = new URL(h, location.href);
-          const base = (u.pathname.split("/").pop() || "").toLowerCase();
-          return /^(?:download|down|getdown)\.(?:php|asp|aspx)$/i.test(base);
-        } catch { return false; }
-      });
-
-      const htmlSlice = htmlSliceEarly;
-      const seoTemplate = /seo[_-]?templates?/i.test(htmlSlice);
-      const hasDownloadHub = downloadCtAs.some((el) => { const h = (el.getAttribute("href") || "").toLowerCase(); return /download\.html|\/download\/?$|download\.php/i.test(h); }) || /download\.html/i.test(location.pathname)
-        || !!landingShell.hasHub;
-
-      const hostSquat = titleHostCorr.hostMatch === "typo" || titleHostCorr.hostMatch === "padded" || titleHostCorr.hostMatch === "hyphen";
-      const hostUnrelated = titleHostCorr.hostMatch === "none" || titleHostCorr.hostMatch === "partial";
-      // titleBrandSpoof 必须带下载壳证据（CTA/包/hub/硬壳），禁止「仅品牌词 + 无关域名」
-      // brandToken 可能为空而 displayBrand=火绒（纯中文标题）
-      const brandIdForSpoof = titleHostCorr.brandToken || titleHostCorr.displayBrand
-        || (productBrand && (productBrand.cnBrand || productBrand.displayBrand)) || "";
-      const shellEvidence = landingShell.hardShell || landingShell.shellScore >= 2 || downloadCtAs.length >= 1
-        || hasBrandMismatchPkg || offsitePkgs.length >= 1 || hasBareDownloadPhp || cloudDriveQrOnly || hasDownloadHub
-        || (landingShell.hasHub && landingShell.ctaCount >= 1);
-      const identityMismatch = !!(titleHostCorr.mismatch || hostUnrelated || hostSquat);
-      const titleBrandSpoof = identityMismatch && officialPitch && !!brandIdForSpoof && shellEvidence
-        && (hostSquat || hasBrandMismatchPkg || offsitePkgs.length >= 1 || hasBareDownloadPhp || cloudDriveQrOnly
-          || (hostUnrelated && (hasDownloadHub || downloadCtAs.length >= 1 || landingShell.ctaCount >= 1 || landingShell.hasHub)));
-
-      if (!spoofHost && !seoTemplate && !titleBrandSpoof && !hasBrandMismatchPkg) {
-        if (!(officialPitch && offsitePkgs.length >= 1 && downloadCtAs.length >= 1 && landingShell.ok)) return false;
-      } else if (!(offsitePkgs.length >= 1 || hasBareDownloadPhp || downloadCtAs.length >= 1 || hasDownloadHub || titleBrandSpoof || hasBrandMismatchPkg || cloudDriveQrOnly || landingShell.hardShell)) {
-        // 旧路径：hostSquat + officialPitch 无下载壳也可 arm → 已废除，必须落地壳
+      // soft padded 等 ICP
+      const isSoftPadded = titleHostCorr.hostMatch === "padded"
+        && !state._seoCloakKitDetected && !state._fakeSpaDetected && !state._desktopForceDlKit;
+      if (isSoftPadded && typeof NS.icpSettledForSoftBrandSpoof === "function" && !NS.hasValidIcpRecord()) {
+        if (!NS.icpSettledForSoftBrandSpoof()) {
+          state._pendingSoftBrandSpoof = true;
+          return false;
+        }
+      }
+      if (NS.hasValidIcpRecord() && isSoftPadded && !state._seoCloakKitDetected && !state._fakeSpaDetected) {
+        state._pendingSoftBrandSpoof = false;
         return false;
       }
 
-      if (!officialPitch && offsitePkgs.length === 0 && !titleBrandSpoof && !hasBrandMismatchPkg && !landingShell.hardShell) return false;
-      // 最终绑定：仍须落地壳 ok（双保险）
-      if (!landingShell.ok) return false;
-
-      // 外链下载中转 / 同站品牌错配包 / 多平台共用假包 = 硬证据，不必等 ICP
-      let offsiteDlCtas = 0;
-      let opaqueHopDl = 0;
-      const pagePkgHrefs = [];
-      for (const el of downloadCtAs) {
+      // ★ 展示品牌：只读等权（与 home-fast 一致）。拒绝 Iehuorong/Huorongpc 主机碎片
+      let brandDisp = "";
+      const debrisHost = (t) => {
         try {
-          const h = NS.getElementDownloadHref(el) || el.getAttribute("href") || "";
-          if (!h || h === "#" || /^javascript:/i.test(h)) continue;
-          const u = new URL(h, location.href);
-          const pageH = (location.hostname || "").toLowerCase().replace(/^www\./, "");
-          const linkH = (u.hostname || "").toLowerCase().replace(/^www\./, "");
-          if (NS.isPackageFileUrl(h) || NS.isPackageFileUrl(u.href)) pagePkgHrefs.push(u.href);
-          if (!linkH || linkH === pageH) continue;
-          offsiteDlCtas++;
-          if (typeof NS.looksLikeOpaqueDownloadHopUrl === "function" && NS.looksLikeOpaqueDownloadHopUrl(h)) opaqueHopDl++;
-          else if (/[?&](?:url|u|target|to|redir|redirect|link|go)=/i.test(u.search || "") || /\/(?:go|jump|redirect|r|link)\b/i.test(u.pathname || "")) opaqueHopDl++;
-        } catch { /* ignore */ }
-      }
-      const hardOffsiteDl = officialPitch && (opaqueHopDl >= 1 || offsiteDlCtas >= 3);
-      // 多平台按钮共用同一 zip（tokowin_pc64.zip 当 Windows/Mac/Linux/…）
-      const uniqPkgBases = new Set(pagePkgHrefs.map((p) => {
-        try { return NS.getFilenameFromUrl(p).toLowerCase(); } catch { return ""; }
-      }).filter(Boolean));
-      const multiPlatformSameFakePkg = officialPitch && downloadCtAs.length >= 3 && pagePkgHrefs.length >= 3 && uniqPkgBases.size === 1;
-      // 多平台「立即下载」但 href=# / 无真实包链（钉钉下载壳）
-      let hreflessDl = 0;
-      for (const el of downloadCtAs) {
-        try {
-          const h = (NS.getElementDownloadHref(el) || el.getAttribute("href") || "").trim();
-          if (!h || h === "#" || /^javascript:/i.test(h)) hreflessDl++;
-        } catch { /* ignore */ }
-      }
-      const multiPlatformHreflessShell = officialPitch && hreflessDl >= 4
-        && /Windows|macOS|Mac|Linux|Android|iOS|鸿蒙/i.test(htmlSliceEarly || "");
-      // 页面任意安装包与标题品牌不一致（同站也算，不只 offsite）
-      let anyBrandMismatchPkg = hasBrandMismatchPkg;
-      if (!anyBrandMismatchPkg && officialPitch) {
-        for (const p of pagePkgHrefs) {
-          if (NS.packageMismatchesPageBrand(p) || NS.looksLikeBrandNearMissPackageName(NS.getFilenameFromUrl(p))) {
-            anyBrandMismatchPkg = true;
-            if (!offsitePkgs.includes(p)) offsitePkgs.push(p);
-            break;
-          }
+          return typeof NS.isHostShapedCompoundBrandToken === "function"
+            && NS.isHostShapedCompoundBrandToken(t, location.hostname);
+        } catch { return false; }
+      };
+      try {
+        if (typeof NS.resolveSpoofDisplayBrand === "function") {
+          brandDisp = NS.resolveSpoofDisplayBrand(location.hostname) || "";
         }
-      }
-
-      // 首页 download.html 导流门户：算硬壳证据，避免 huorong-pc 卡在「padded 等 ICP」
-      const homeHubPortal = !!(landingShell.hasHub && (landingShell.ctaCount >= 1 || downloadCtAs.length >= 1));
-      const hardKitEvidence = seoTemplate || anyBrandMismatchPkg || hardOffsiteDl || multiPlatformSameFakePkg || multiPlatformHreflessShell
-        || homeHubPortal
-        || offsitePkgs.some((p) => NS.isPackageFileUrl(p) && (NS.isSuspiciousDownloadFilename(NS.getFilenameFromUrl(p)) || NS.looksLikeObjectStoragePackageUrl(p) || NS.looksLikeHighRiskBlobPackageUrl(p)));
-      // 仅「padded 软夹带 + 无下载门户壳」等 ICP（todeskai 沪ICP 误报）
-      // 有首页下载导流 / 硬壳 → 立刻 arm（huorong-pc.cn 仿冒下载站）
-      const softOnlyIdentity = (hostSquat || titleBrandSpoof) && !hardKitEvidence;
-      const mustWaitIcpForSoft = softOnlyIdentity && titleHostCorr.hostMatch === "padded" && !homeHubPortal;
-      if (mustWaitIcpForSoft && !NS.hasValidIcpRecord() && !NS.icpSettledForSoftBrandSpoof()) { state._pendingSoftBrandSpoof = true; return false; }
-      if (mustWaitIcpForSoft && !NS.hasValidIcpRecord() && state._icpQueryFailed && !state._icpQuerySettled) { state._pendingSoftBrandSpoof = true; return false; }
-
-      let brandPick = titleHostCorr.brandToken || brandIdForSpoof || "";
-      if (!brandPick || (NS.BRAND_TOKEN_STOP_RE.test(String(brandPick).toLowerCase()) && !/[一-鿿]/.test(brandPick))) {
-        const labDisp = (location.hostname || "").toLowerCase().replace(/^www\./, "").split(".")[0] || "";
-        brandPick = NS.pickBrandTokenForHost([...tokens].filter((t) => /^[a-z]{3,}$/i.test(t) && !NS.BRAND_TOKEN_STOP_RE.test(t)), labDisp)
-          || (typeof NS.inferMarketingPaddedBrandCore === "function" ? NS.inferMarketingPaddedBrandCore(labDisp) : "")
-          || [...tokens].find((t) => /^[a-z]{4,}$/i.test(t) && !NS.BRAND_TOKEN_STOP_RE.test(t))
-          || [...tokens].find((t) => /[一-鿿]{2,}/.test(t))
-          || brandIdForSpoof
-          || "";
-      }
-      // 展示名：title + h1–h6 + description + keywords + footer 共识（钉钉，非「钉钉双」）
-      const surfaceDisp = (typeof NS.pickChineseBrandFromIdentityConsensus === "function"
-        ? NS.pickChineseBrandFromIdentityConsensus()
-        : "")
-        || (typeof NS.pickChineseBrandFromPageSurface === "function"
-          ? (() => {
-            let schemaNm = "";
-            try {
-              for (const sc of Array.from(document.querySelectorAll('script[type="application/ld+json"]')).slice(0, 6)) {
-                try {
-                  const j = JSON.parse(sc.textContent || "");
-                  const nodes = Array.isArray(j) ? j : (j && j["@graph"] ? j["@graph"] : [j]);
-                  for (const node of nodes) {
-                    if (node && /SoftwareApplication|Organization|Product/i.test(String(node["@type"] || "")) && node.name) {
-                      schemaNm = String(node.name).trim(); break;
-                    }
-                  }
-                  if (schemaNm) break;
-                } catch { /* ignore */ }
-              }
-            } catch { /* ignore */ }
-            let kwMeta = document.querySelector('meta[name="keywords"]')?.getAttribute("content") || "";
-            if (!kwMeta) {
-              try {
-                for (const el of Array.from(document.querySelectorAll("meta")).slice(0, 40)) {
-                  const n = String(el.getAttribute("name") || "").toLowerCase();
-                  if (n === "keywords" || n.includes("keyword")) {
-                    kwMeta = el.getAttribute("content") || "";
-                    if (kwMeta) break;
-                  }
-                }
-              } catch { /* ignore */ }
+      } catch { brandDisp = ""; }
+      if (brandDisp && debrisHost(brandDisp)) brandDisp = "";
+      try {
+        if (!brandDisp) {
+          const pkD = typeof NS.collectPrimaryBrandKeywords === "function"
+            ? NS.collectPrimaryBrandKeywords()
+            : null;
+          brandDisp = (pkD && pkD.display) || "";
+          if (brandDisp && debrisHost(brandDisp)) brandDisp = "";
+          if (brandDisp && typeof NS.normalizeDisplayBrandName === "function") {
+            brandDisp = NS.normalizeDisplayBrandName(brandDisp) || brandDisp;
+          }
+          if (brandDisp && debrisHost(brandDisp)) brandDisp = "";
+          if (brandDisp && typeof NS.looksLikeAssetGarbageToken === "function" && NS.looksLikeAssetGarbageToken(brandDisp)) {
+            brandDisp = (pkD && pkD.cn && pkD.cn[0]) || (productBrand && productBrand.cnBrand) || "";
+          }
+          if ((!brandDisp || debrisHost(brandDisp)) && pkD && pkD.cn && pkD.cn[0]) brandDisp = pkD.cn[0];
+        }
+      } catch { /* keep brandDisp */ }
+      // domainRel.brand 仅当已在等权 cn/latin 列表中才补（避免 bestTok=Reserved/Iehuorong 进 UI）
+      if ((!brandDisp || debrisHost(brandDisp)) && domainRel && domainRel.brand
+        && !debrisHost(domainRel.brand)
+        && !(typeof NS.looksLikeAssetGarbageToken === "function" && NS.looksLikeAssetGarbageToken(domainRel.brand))) {
+        try {
+          const b0 = typeof NS.normalizeDisplayBrandName === "function"
+            ? (NS.normalizeDisplayBrandName(domainRel.brand) || domainRel.brand)
+            : domainRel.brand;
+          const pk2 = typeof NS.collectPrimaryBrandKeywords === "function"
+            ? NS.collectPrimaryBrandKeywords()
+            : null;
+          if (b0 && pk2 && !debrisHost(b0)) {
+            if (pk2.cn && pk2.cn.some((x) => String(x) === b0 || String(x).includes(b0) || b0.includes(String(x)))) {
+              brandDisp = b0;
+            } else {
+              const low = String(b0).toLowerCase().replace(/[^a-z0-9]/g, "");
+              if (low && !debrisHost(low) && pk2.latin && pk2.latin.some((x) => String(x).toLowerCase() === low)) brandDisp = b0;
             }
-            // title/og 先于 keywords（keywords 常为 SEO「文章」）
-            return NS.pickChineseBrandFromPageSurface(schemaNm)
-              || NS.pickChineseBrandFromPageSurface(document.title || "")
-              || NS.pickChineseBrandFromPageSurface(document.querySelector('meta[property="og:site_name"]')?.getAttribute("content") || "")
-              || NS.pickChineseBrandFromPageSurface(document.querySelector('meta[property="og:title"]')?.getAttribute("content") || "")
-              || NS.pickChineseBrandFromPageSurface(document.querySelector("h1")?.textContent || "")
-              || NS.pickChineseBrandFromPageSurface(document.querySelector('meta[name="description"]')?.getAttribute("content") || "")
-              || NS.pickChineseBrandFromPageSurface(kwMeta)
-              || NS.pickChineseBrandFromPageSurface(brandSource || "");
-          })()
-          : "");
-      let brandDisp = surfaceDisp
-        || brandIdForSpoof
-        || (productBrand && productBrand.displayBrand)
-        || (titleHostCorr.displayBrand && /[一-鿿]/.test(titleHostCorr.displayBrand) ? titleHostCorr.displayBrand : "")
-        || (typeof NS.pickBrandDisplayName === "function"
-          ? NS.pickBrandDisplayName({
-            title: document.title || "",
-            identity: brandSource,
-            displayBrand: titleHostCorr.displayBrand,
-            brandToken: brandPick
-          })
-          : "")
-        || [...tokens].filter((t) => /[一-鿿]{2,}/.test(t) && !(typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(t)))
-          .sort((a, b) => b.length - a.length)[0]
-        || (brandPick && !NS.BRAND_TOKEN_STOP_RE.test(String(brandPick).toLowerCase()) ? NS.formatBrandTokenForDisplay(brandPick) : "")
-        || "";
-      // 钉钉应用/钉钉双平台 → 钉钉；数字前缀产品（360安全卫士）由 trim 内部保留本体
+          }
+        } catch { /* ignore */ }
+      }
+      if (brandDisp && debrisHost(brandDisp)) brandDisp = "";
+      if (brandDisp && typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(brandDisp)) {
+        brandDisp = (productBrand && productBrand.cnBrand) || "";
+      }
       if (brandDisp && /[一-鿿]/.test(brandDisp) && typeof NS.trimChineseBrandTrail === "function") {
         brandDisp = NS.trimChineseBrandTrail(brandDisp) || brandDisp;
       }
-      // 最终兜底：若仍是弱词，再扫 title 数字产品
-      if (brandDisp && typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(brandDisp)) {
-        const dig = ((document.title || "").match(/(\d{2,6}[一-鿿]{2,6})/) || [])[1] || "";
-        brandDisp = (dig && !NS.isWeakChineseBrandToken(dig)) ? dig : "";
-      }
-      if (surfaceDisp && !(typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(surfaceDisp))) {
-        // 共识名优先；勿用更长营销残片覆盖
-        if (!brandDisp || brandDisp === surfaceDisp
-          || surfaceDisp.length <= brandDisp.length
-          || brandDisp.startsWith(surfaceDisp)) {
-          brandDisp = surfaceDisp;
-        }
-      }
-      if (brandDisp && typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(brandDisp)) {
-        const primary = typeof NS.pickPrimaryTitleBrandToken === "function"
-          ? NS.pickPrimaryTitleBrandToken(document.title || "", (location.hostname || "").split(".")[0] || "")
-          : "";
-        brandDisp = surfaceDisp
-          || (primary && primary.length >= 4 ? NS.formatBrandTokenForDisplay(primary) : "")
-          || (productBrand && productBrand.latinToken ? NS.formatBrandTokenForDisplay(productBrand.latinToken) : "")
-          || "";
-      }
-      if (!brandDisp || NS.BRAND_TOKEN_STOP_RE.test(String(brandDisp).toLowerCase())) {
-        // 仍无可用展示名则不写 spoofBrand，避免「仿冒 Template」
+      if (!brandDisp || (NS.BRAND_TOKEN_STOP_RE && NS.BRAND_TOKEN_STOP_RE.test(String(brandDisp).toLowerCase()))) {
         state.spoofBrand = state.spoofBrand || "";
       } else {
         state.spoofBrand = brandDisp;
       }
 
-      const showBrand = (brandDisp && !NS.BRAND_TOKEN_STOP_RE.test(String(brandDisp).toLowerCase())) ? brandDisp : "";
-      const reasons = [];
-      if (titleHostCorr.mismatch && (titleHostCorr.brandToken || showBrand)) {
-        const matchHint = titleHostCorr.hostMatch === "typo" ? "拼写仿冒" : titleHostCorr.hostMatch === "padded" ? "域名夹带品牌前缀/后缀" : titleHostCorr.hostMatch === "hyphen" ? "域名用连字符拆分品牌名" : titleHostCorr.hostMatch === "none" ? "域名与品牌无关" : "关联不严谨";
-        reasons.push(`标题/正文品牌「${showBrand || titleHostCorr.brandToken}」出现约 ${titleHostCorr.brandHits || 1} 次，与域名 ${location.hostname} 不匹配（${matchHint}）`);
+      const showBrand = (brandDisp && !(NS.BRAND_TOKEN_STOP_RE && NS.BRAND_TOKEN_STOP_RE.test(String(brandDisp).toLowerCase())))
+        ? brandDisp
+        : "";
+      if (!showBrand && !titleHostCorr.brandToken) {
+        state._pendingSoftBrandSpoof = false;
+        return false;
       }
-      if (cloudDriveQrOnly && hostSquat) reasons.push("下载仅引导网盘/扫码，无透明官方安装包直链");
-      if (spoofHost || seoTemplate) { if (!titleHostCorr.mismatch) reasons.push("域名呈品牌拼写仿冒/营销站特征"); }
-      if (offsitePkgs.length) {
-        const sample = offsitePkgs[0];
-        const label = NS.formatPackageLabel(sample);
-        if (NS.packageMismatchesPageBrand(sample)) reasons.push(`安装包文件名与页面品牌不一致: ${label}`);
-        else if (NS.looksLikeHiddenPackagePath(sample)) reasons.push(`隐蔽路径安装包: ${label}`);
-        else reasons.push(`异常安装包: ${label}`);
-      }
-      if (hasBareDownloadPhp) reasons.push("下载入口指向 download.php 中转");
-      if (hardOffsiteDl) reasons.push("下载按钮指向站外中转/跳转链（非官方直链安装包）");
-      if (multiPlatformHreflessShell) reasons.push("多平台下载按钮无真实安装包链接（href 为空/#）");
-      const signalDetail = reasons.join("；") || (showBrand ? `页面宣称「${showBrand}」官网下载，但域名 ${location.hostname} 与品牌不一致` : "页面宣称官网下载，但域名与品牌/分发链异常");
 
-      // padded 软仿冒 + 有效 ICP → 撤销；typo/硬证据不因 ICP 放过
-      if (NS.hasValidIcpRecord() && !state._seoCloakKitDetected && !state._fakeSpaDetected && !hardKitEvidence
+      const matchHint = titleHostCorr.hostMatch === "typo" ? "拼写仿冒"
+        : titleHostCorr.hostMatch === "padded" ? "域名夹带品牌前缀/后缀"
+          : titleHostCorr.hostMatch === "hyphen" ? "域名用连字符拆分品牌名"
+            : titleHostCorr.hostMatch === "none" ? "域名与品牌无关"
+              : "关联不严谨";
+      const signalDetail = `标题/正文品牌「${showBrand || titleHostCorr.brandToken}」与域名 ${location.hostname} 不匹配（${matchHint}）`;
+
+      if (NS.hasValidIcpRecord() && !state._seoCloakKitDetected && !state._fakeSpaDetected
         && titleHostCorr.hostMatch === "padded") {
         state._pendingSoftBrandSpoof = false;
         return false;
       }
 
       NS.addSignal("仿冒品牌官网下载站", 24, signalDetail);
-      for (const p of offsitePkgs.slice(0, 5)) { if (p && NS.isPackageFileUrl(p) && !state.protectedTargets.includes(p)) state.protectedTargets.push(p); }
-      // 外链中转也纳入 protectedTargets，便于 MAIN 拦截
-      try {
-        for (const el of downloadCtAs.slice(0, 8)) {
-          const h = NS.getElementDownloadHref(el) || el.getAttribute("href") || "";
-          if (!h || !/^https?:/i.test(h)) continue;
-          try {
-            const u = new URL(h, location.href);
-            if (u.hostname.replace(/^www\./, "") !== (location.hostname || "").replace(/^www\./, "") && !state.protectedTargets.includes(u.href)) {
-              state.protectedTargets.push(u.href);
-            }
-          } catch { /* ignore */ }
-        }
-      } catch { /* ignore */ }
-      const pkgHref = offsitePkgs.find((p) => NS.isPackageFileUrl(p)) || state.protectedTargets.find((p) => /^https?:/i.test(p)) || "";
+      state._brandSpoofPortalDetected = true;
       const noticeTitle = showBrand ? `已识别仿冒「${showBrand}」官网` : "已识别仿冒品牌官网";
-      const noticeMsg = showBrand ? `域名 ${location.hostname} 与标题品牌「${showBrand}」不匹配，疑似仿冒官网下载站` : `域名 ${location.hostname} 与页面宣称品牌不匹配，疑似仿冒官网下载站`;
-      // padded 且无门户壳才软等 ICP；首页导流 / typo / none / 硬证据 → lockHard
-      const lockHardNow = !!hardKitEvidence || titleHostCorr.hostMatch !== "padded" || homeHubPortal;
+      const noticeMsg = showBrand
+        ? `域名 ${location.hostname} 与标题品牌「${showBrand}」不匹配，疑似仿冒官网下载站`
+        : `域名 ${location.hostname} 与页面宣称品牌不匹配，疑似仿冒官网下载站`;
+      const lockHardNow = titleHostCorr.hostMatch !== "padded"
+        || !!(landingShell && (landingShell.hardShell || landingShell.hasHub));
       NS.installDownloadGuard(showBrand ? `仿冒品牌官网下载站（仿冒「${showBrand}」）` : "仿冒品牌官网下载站", {
         notify: true,
-        href: pkgHref,
+        href: "",
         message: noticeMsg,
         title: noticeTitle,
         guardKind: "brand-spoof",
@@ -641,170 +685,56 @@
       });
       NS.disableAllDownloadIntentControls();
       state._pendingSoftBrandSpoof = false;
-      // 主路径命中后也主动 fetch 下载落地
       try {
         if (typeof NS.proactivelyProbeDownloadButtons === "function") {
-          Promise.resolve().then(() => NS.proactivelyProbeDownloadButtons()).catch(() => {});
+          Promise.resolve().then(() => NS.proactivelyProbeDownloadButtons({ force: true, reason: "after-brand-spoof" })).catch(() => {});
         }
       } catch { /* ignore */ }
       return true;
     } catch { return false; }
   };
 
-  /**
-   * 收集需主动探测的下载按钮目标（无需用户点击）。
-   * landing: 同域 HTML 落地页（download.html 等）→ fetch 源码分析
-   * probe: 中转/外链/无扩展名下载口 → HEAD/行为探测
-   */
-  NS.collectProactiveDownloadTargets = function () {
-    const landing = [];
-    const probe = [];
-    const seenL = new Set();
-    const seenP = new Set();
-    const pushL = (href, el) => {
-      try {
-        const abs = new URL(href, location.href).href;
-        if (seenL.has(abs)) return;
-        seenL.add(abs);
-        landing.push({ href: abs, el });
-      } catch { /* ignore */ }
-    };
-    const pushP = (href, el) => {
-      try {
-        const abs = new URL(href, location.href).href;
-        if (seenP.has(abs) || seenL.has(abs)) return;
-        seenP.add(abs);
-        probe.push({ href: abs, el });
-      } catch { /* ignore */ }
-    };
-    try {
-      const nodes = document.querySelectorAll(
-        "a[href], a[data-href], a[data-url], button, [role='button'], .download-btn, .btn-download, .btn-header, a.btn-primary, a.btn-lg, a.btn-header, [class*='download'], [class*='platform'], [class*='cta']"
-      );
-      const lim = Math.min(nodes.length, 120);
-      for (let i = 0; i < lim; i++) {
-        const el = nodes[i];
-        const href = (typeof NS.getElementDownloadHref === "function" ? NS.getElementDownloadHref(el) : "")
-          || el.getAttribute("href") || el.getAttribute("data-href") || el.getAttribute("data-url") || "";
-        if (!href || /^(javascript:|#|data:|blob:|mailto:|tel:)/i.test(href.trim())) continue;
-        const text = (el.textContent || "").replace(/\s+/g, " ").trim();
-        const cls = String(el.className || "");
-        const intent = (NS.DOWNLOAD_TEXT && NS.DOWNLOAD_TEXT.test(text))
-          || /立即下载|免费下载|官方下载|客户端下载|下载中心|前往下载|立即使用|个人版|企业版|Windows|macOS|Android|iOS|安装包/i.test(text)
-          || /download|btn-download|platform|btn-header|btn-primary|btn-lg/i.test(cls);
-        const sameOriginLand = typeof NS.looksLikeSameOriginLandingPageUrl === "function" && NS.looksLikeSameOriginLandingPageUrl(href);
-        // 路径像 download.html 即使文案弱也收集（首页「个人版下载」）
-        const pathLand = /download\.html|(?:^|\/)(?:download|down|install|setup|client|soft)(?:\/|\.html?|$)/i.test(href);
-        if (!intent && !sameOriginLand && !pathLand
-          && !(typeof NS.needsDownloadBehaviorProbe === "function" && NS.needsDownloadBehaviorProbe(href, el))) continue;
-        if (NS.isPackageFileUrl(href)) continue; // 包链已由同步扫描处理
-        if (sameOriginLand || pathLand) pushL(href, el);
-        else if (typeof NS.needsDownloadBehaviorProbe === "function" && NS.needsDownloadBehaviorProbe(href, el)) pushP(href, el);
-        else if (intent) {
-          try {
-            const u = new URL(href, location.href);
-            if (u.origin !== location.origin || /\.(?:php|asp|aspx)$/i.test(u.pathname)) pushP(href, el);
-            else if (/\.(?:html?)$/i.test(u.pathname) && /down|install|client|soft|get/i.test(u.pathname)) pushL(href, el);
-          } catch { /* ignore */ }
-        }
-      }
-    } catch { /* ignore */ }
-    return { landing: landing.slice(0, 8), probe: probe.slice(0, 5) };
-  };
-
   /** 父页品牌 vs 域名错配（主动 fetch 落地页时联动仿冒） */
   NS.getParentPageBrandSpoofContext = function () {
     try {
-      // 软件门户 / 应用商店：标题产品名与域名本就不一致，不是仿冒
       if (typeof NS.pageLooksLikeSoftwareCatalogPortal === "function" && NS.pageLooksLikeSoftwareCatalogPortal()) {
         return { mismatch: false, brand: "", hostMatch: "portal", brandToken: "" };
       }
       if (typeof NS.pageLooksLikeAppMarketOrAppStoreListing === "function" && NS.pageLooksLikeAppMarketOrAppStoreListing()) {
         return { mismatch: false, brand: "", hostMatch: "market", brandToken: "" };
       }
-      // 有效 ICP / 超成熟 WHOIS：父页不因「中文品牌≠拉丁主机」联动主动探测仿冒
-      if (NS.hasValidIcpRecord() || (typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature())) {
-        const corrTrusted = typeof NS.evaluateTitleHostBrandCorrelation === "function"
-          ? NS.evaluateTitleHostBrandCorrelation()
-          : null;
-        // 仅 padded/typo 营销夹带仍可标 mismatch；soft.china.com 等 none 不联动
-        const keep = corrTrusted && (corrTrusted.hostMatch === "padded" || corrTrusted.hostMatch === "typo" || corrTrusted.hostMatch === "hyphen");
-        if (!keep) {
+      // 主门控
+      if (typeof NS.evaluateDomainKeywordRelevance === "function") {
+        const rel = NS.evaluateDomainKeywordRelevance();
+        if (rel.related && !rel.squat) {
+          return { mismatch: false, brand: rel.brand || "", hostMatch: rel.hostMatch || "exact", brandToken: rel.brandToken || "" };
+        }
+        if (NS.hasValidIcpRecord() || (typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature())) {
+          if (!rel.squat) {
+            return { mismatch: false, brand: rel.brand || "", hostMatch: "trusted", brandToken: rel.brandToken || "" };
+          }
+        }
+        if (rel.squat) {
+          return { mismatch: true, brand: rel.brand || "", hostMatch: rel.hostMatch || "padded", brandToken: rel.brandToken || "" };
+        }
+        // 无关 / mismatch 标记：有主关键词品牌即联动
+        if (rel.mismatch || (rel.hostMatch === "none" && (rel.brand || (rel.keywords && rel.keywords.length)))) {
           return {
-            mismatch: false,
-            brand: (corrTrusted && (corrTrusted.displayBrand || corrTrusted.brandToken)) || "",
-            hostMatch: (corrTrusted && corrTrusted.hostMatch) || "trusted",
-            brandToken: (corrTrusted && corrTrusted.brandToken) || ""
+            mismatch: true,
+            brand: rel.brand || "",
+            hostMatch: rel.hostMatch || "none",
+            brandToken: rel.brandToken || rel.brand || ""
           };
         }
+        return { mismatch: false, brand: rel.brand || "", hostMatch: rel.hostMatch || "none", brandToken: rel.brandToken || "" };
       }
-      const corr = typeof NS.evaluateTitleHostBrandCorrelation === "function"
-        ? NS.evaluateTitleHostBrandCorrelation()
-        : null;
-      if (corr && (corr.hostMatch === "exact" || corr.rigorousMatch)) {
-        return { mismatch: false, brand: corr.displayBrand || corr.brandToken || "", hostMatch: corr.hostMatch || "exact" };
-      }
-      let brand = (corr && (corr.displayBrand || corr.brandToken)) || "";
-      if (!brand && typeof NS.pickChineseBrandFromIdentityConsensus === "function") {
-        brand = NS.pickChineseBrandFromIdentityConsensus() || "";
-      }
-      if (!brand && typeof NS.pickChineseBrandFromPageSurface === "function") {
-        let kw = "";
-        try {
-          kw = document.querySelector('meta[name="keywords"]')?.getAttribute("content") || "";
-          if (!kw) {
-            for (const el of Array.from(document.querySelectorAll("meta")).slice(0, 40)) {
-              const n = String(el.getAttribute("name") || "").toLowerCase();
-              if (n === "keywords" || n.includes("keyword")) {
-                kw = el.getAttribute("content") || "";
-                if (kw) break;
-              }
-            }
-          }
-        } catch { /* ignore */ }
-        brand = NS.pickChineseBrandFromPageSurface(document.title || "")
-          || NS.pickChineseBrandFromPageSurface(kw)
-          || NS.pickChineseBrandFromPageSurface(document.querySelector("h1")?.textContent || "")
-          || "";
-      }
-      // 中文产品 + 拉丁域名无关：即使 corr.mismatch 未置位也视为错配（仿冒火绒首页）
-      // 但排除门户频道子域 soft./download.（中华网软件）
-      let mismatch = !!(corr && (corr.mismatch
-        || corr.hostMatch === "none"
-        || corr.hostMatch === "partial"
-        || corr.hostMatch === "padded"
-        || corr.hostMatch === "typo"
-        || corr.hostMatch === "hyphen"));
-      if (!mismatch && brand && /[一-鿿]{2,}/.test(brand)) {
-        try {
-          const lab = (location.hostname || "").toLowerCase().replace(/^www\./, "").split(".")[0] || "";
-          const labFlat = lab.replace(/-/g, "");
-          // soft/game/download 等门户频道标签：不当「域名与品牌无关」
-          if (/^(soft|game|app|down|download|file|news|blog|bbs|video|music|shop|store)$/i.test(labFlat)) {
-            mismatch = false;
-          } else {
-            // 主机不含拼音品牌痕迹且非 product-category 域 → 错配
-            const pinyinHint = /huorong|qihoo|360|tencent|baidu|sogou|kingsoft|rising|kaspersky|norton|avast|avg|mcafee|bitdefender|eset|malwarebytes/i.test(labFlat);
-            if (labFlat.length >= 3 && !pinyinHint
-              && !(typeof NS.hostLabelIsBrandProductCategoryDomain === "function"
-                && NS.hostLabelIsBrandProductCategoryDomain(lab, brand))) {
-              mismatch = true;
-            }
-          }
-        } catch { /* ignore */ }
-      }
-      return {
-        mismatch: !!(mismatch && brand),
-        brand: brand || "",
-        hostMatch: (corr && corr.hostMatch) || "none",
-        brandToken: (corr && corr.brandToken) || brand || ""
-      };
+      return { mismatch: false, brand: "", hostMatch: "" };
     } catch {
       return { mismatch: false, brand: "", hostMatch: "" };
     }
   };
 
-  /** 从落地页 HTML 抽取安装包 URL（绝对 + 相对） */
+  /** 从落地页 HTML 抽取安装包 URL */
   NS.extractPackageUrlsFromHtml = function (source, baseHref) {
     const out = [];
     const seen = new Set();
@@ -839,30 +769,17 @@
     return out;
   };
 
-  /**
-   * 分析落地页 HTML：远程下发壳 / 静态安装包 / 与父页联动的仿冒下载门户。
-   * opts: { baseHref, parentBrandMismatch, parentBrand }
-   */
   NS.analyzeFetchedDownloadLandingHtml = function (source, chain, opts) {
     const o = opts || {};
     if (!source || source.length < 80) return { hit: false, packages: [] };
-    // Linux 发行版 ISO/镜像列表页：磁力、校验和、.iso —— 非银狐 exe 壳
     const osIsoLanding = /\.iso(?:\?|"|'|\s|>|\/|#|$)/i.test(source)
       && (/(?:sha256sums|b2sums|magnet:\?xt=urn:btih:|\.torrent\b|bittorrent|pgp\s*签名|gpg\s*--verify)/i.test(source)
         || /(?:mirror\.|mirrors\.|镜像站|\/iso\/\d{4})/i.test(source));
     if (osIsoLanding) {
       return {
-        hit: false,
-        remoteSetupFetchPattern: false,
-        autoDownloadDispatchPattern: false,
-        remoteDownloadUrlPattern: false,
-        suspiciousLandingPage: false,
-        brandSpoofLanding: false,
-        staticPackageLanding: false,
-        usesRemoteJsWithAttr: false,
-        redirectCount: 0,
-        osIsoLanding: true,
-        packages: []
+        hit: false, remoteSetupFetchPattern: false, autoDownloadDispatchPattern: false,
+        remoteDownloadUrlPattern: false, suspiciousLandingPage: false, brandSpoofLanding: false,
+        staticPackageLanding: false, usesRemoteJsWithAttr: false, redirectCount: 0, osIsoLanding: true, packages: []
       };
     }
     const baseHref = o.baseHref || location.href;
@@ -871,7 +788,6 @@
       : [];
     const remoteSetupFetchPattern = /fetch\s*\(\s*[^)]*\.(?:txt|json|php)/i.test(source)
       || /(?:const|let|var)\s+\w*(?:REMOTE_)?(?:SETUP|CONFIG|VERSION|PACKAGE)_?URL\s*=/i.test(source)
-      || /(?:const|let|var)\s+\w+_URL\s*=\s*["'`][^"'`\n]+\.(?:txt|json|php)/i.test(source)
       || /download_uri|initDownloadLinks|getDownloadUrl|fetchDownloadLink/i.test(source);
     const autoDownloadDispatchPattern = /createElement\(["']a["']\)|\.click\(\)|triggerDownload|location\.href\s*=|location\.assign|window\.open\s*\(/i.test(source);
     const remoteDownloadUrlPattern = packages.length >= 1
@@ -884,26 +800,25 @@
       /(?:oss|cos|s3|cdn|blob|object|qiniucdn|aliyuncs)/i.test(source)
       || /https?:\/\/[a-z0-9]{8,}\.[a-z]{2,}\//i.test(source)
     );
-    // 禁止「下载文案 + 任意统计/广告脚本」误伤正规下载站（Arch/发行版/镜像列表）
     const suspiciousLandingPage = landingDownloadKeywords >= 5
-      && (remoteSetupFetchPattern
-        || usesRemoteJsWithAttr
+      && (remoteSetupFetchPattern || usesRemoteJsWithAttr
         || (remoteDownloadUrlPattern && autoDownloadDispatchPattern)
         || (ossOrRandomPkg && autoDownloadDispatchPattern))
       && /下载|download|install|setup|客户端/i.test(source);
 
-    // 父页品牌/域名错配（仿冒火绒首页）→ 落地页有包或下载门户文案即命中
     const parentMismatch = !!o.parentBrandMismatch;
     const parentBrand = String(o.parentBrand || "");
     const brandHintInLanding = parentBrand
       ? (source.includes(parentBrand) || (parentBrand.length >= 2 && new RegExp(parentBrand.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i").test(source)))
-      : /火绒|huorong|钉钉|dingtalk|todesk|向日葵/i.test(source);
+      : false;
+    // 父页品牌/域名错配时：落地页只要有下载话术或包，即算仿冒落地（勿等用户点进 download.html）
     const brandSpoofLanding = parentMismatch && (
       packages.length >= 1
-      || (landingDownloadKeywords >= 2 && /免费下载|立即下载|官方下载|客户端|个人版|安装包|立即免费/i.test(source))
-      || (landingDownloadKeywords >= 1 && brandHintInLanding && /下载|客户端|安装/i.test(source))
+      || landingDownloadKeywords >= 2
+      || (landingDownloadKeywords >= 1 && brandHintInLanding)
       || remoteSetupFetchPattern
-      || (remoteDownloadUrlPattern && landingDownloadKeywords >= 1)
+      || remoteDownloadUrlPattern
+      || /免费下载|立即下载|官方下载|安装包|\.exe|\.zip|download/i.test(source)
     );
     let staticPackageLanding = packages.length >= 1 && landingDownloadKeywords >= 3
       && /免费下载|立即下载|官方下载|客户端|安装包|个人版/i.test(source);
@@ -911,8 +826,7 @@
       const allClearProduct = packages.every((p) => {
         try {
           const fn = typeof NS.getFilenameFromUrl === "function" ? NS.getFilenameFromUrl(p) : "";
-          return typeof NS.looksLikeStrongProductInstallerName === "function" && NS.looksLikeStrongProductInstallerName(fn)
-            && typeof NS.packageFilenameSharesPageBrand === "function" && NS.packageFilenameSharesPageBrand(fn);
+          return typeof NS.looksLikeStrongProductInstallerName === "function" && NS.looksLikeStrongProductInstallerName(fn);
         } catch { return false; }
       });
       if (allClearProduct) staticPackageLanding = false;
@@ -942,68 +856,185 @@
     };
   };
 
-  /**
-   * 当前页是否有「应主动 fetch」的下载按钮地址（同域 download.html / 中转等）。
-   * 首页导流场景：即使页面像内容站（_perfBenign）也必须探测。
-   */
   NS.pageHasProactiveDownloadButtonTargets = function () {
     try {
+      // 海量镜像/ISO / 天气资讯门户：禁止因附属 APK/广告拖住 analysisComplete
+      if (typeof NS.shouldSkipHeavyPageScan === "function" && NS.shouldSkipHeavyPageScan()) return false;
+      if (typeof NS.pageLooksLikeContentInfoPortal === "function" && NS.pageLooksLikeContentInfoPortal()) return false;
+      if (typeof NS.pageLooksLikeHeavyContentSpa === "function" && NS.pageLooksLikeHeavyContentSpa()
+        && typeof NS.isBenignContentPage === "function" && NS.isBenignContentPage()) return false;
+      if ((typeof NS.pageLooksLikeHighDensityDownloadList === "function" && NS.pageLooksLikeHighDensityDownloadList())
+        || (typeof NS.pageLooksLikeOsDistroIsoDownload === "function" && NS.pageLooksLikeOsDistroIsoDownload())) {
+        return false;
+      }
       if (typeof NS.collectProactiveDownloadTargets === "function") {
         const t = NS.collectProactiveDownloadTargets();
         if (t && ((t.landing && t.landing.length > 0) || (t.probe && t.probe.length > 0))) return true;
       }
-      // 快速 DOM 启发：免费下载 → download.html
+      // 仅窄选择器；勿用 a[href*='/download']（Arch 导航/镜像会全中）
       if (document.querySelector(
-        "a[href*='download.html'], a[href*='/download'], a[href*='Download'], "
-        + "a.btn-header[href], a.download-btn[href], a.btn-download[href], "
-        + "a.btn-primary[href*='down'], a.btn-lg[href*='down']"
+        "a[href*='download.html'], a.download-btn[href], a.btn-download[href], "
+        + "a.btn-header[href], a.btn-primary[href*='down'], a.btn-lg[href*='down'], "
+        + "#mainDownloadBtn[href], a.download-uri[href]"
       )) return true;
       return false;
     } catch { return false; }
   };
 
+  NS.collectProactiveDownloadTargets = function () {
+    const landing = [];
+    const probe = [];
+    const seenL = new Set();
+    const seenP = new Set();
+    // 海量下载列表：直接空结果，禁止 querySelectorAll("a[href]")
+    try {
+      if (typeof NS.shouldSkipHeavyPageScan === "function" && NS.shouldSkipHeavyPageScan()) {
+        return { landing: [], probe: [] };
+      }
+      if ((typeof NS.pageLooksLikeHighDensityDownloadList === "function" && NS.pageLooksLikeHighDensityDownloadList())
+        || (typeof NS.pageLooksLikeOsDistroIsoDownload === "function" && NS.pageLooksLikeOsDistroIsoDownload())) {
+        return { landing: [], probe: [] };
+      }
+    } catch { /* ignore */ }
+    const pushL = (href, el) => {
+      try {
+        const abs = new URL(href, location.href).href;
+        if (seenL.has(abs)) return;
+        seenL.add(abs);
+        landing.push({ href: abs, el });
+      } catch { /* ignore */ }
+    };
+    const pushP = (href, el) => {
+      try {
+        const abs = new URL(href, location.href).href;
+        if (seenP.has(abs) || seenL.has(abs)) return;
+        seenP.add(abs);
+        probe.push({ href: abs, el });
+      } catch { /* ignore */ }
+    };
+    try {
+      // 禁止裸 a[href]：大页上构建 NodeList 本身就会卡死主线程
+      const nodes = document.querySelectorAll(
+        "a[href*='download.html'], a[data-href*='download'], a.download-btn, a.btn-download, "
+        + ".download-btn a, .btn-download, .btn-header, a.btn-primary, a.btn-lg, a.btn-header, "
+        + "#mainDownloadBtn, a.download-uri, [class*='btn-download'], [class*='download-btn'], "
+        + "button[class*='download'], a[href*='down.html'], a[href*='install.html']"
+      );
+      const lim = Math.min(nodes.length, 48);
+      for (let i = 0; i < lim; i++) {
+        const el = nodes[i];
+        const href = (typeof NS.getElementDownloadHref === "function" ? NS.getElementDownloadHref(el) : "")
+          || el.getAttribute("href") || el.getAttribute("data-href") || el.getAttribute("data-url") || "";
+        if (!href || /^(javascript:|#|data:|blob:|mailto:|tel:)/i.test(href.trim())) continue;
+        const text = (el.textContent || "").replace(/\s+/g, " ").trim();
+        const cls = String(el.className || "");
+        const intent = (NS.DOWNLOAD_TEXT && NS.DOWNLOAD_TEXT.test(text))
+          || /立即下载|免费下载|官方下载|客户端下载|下载中心|前往下载|立即使用|个人版|企业版|Windows|macOS|Android|iOS|安装包/i.test(text)
+          || /download|btn-download|platform|btn-header|btn-primary|btn-lg/i.test(cls);
+        // download.html / down.html 等：无论文案强弱都收（首页「免费下载」）
+        const pathLand = /(?:^|[/?#&=])download\.html|(?:^|\/)(?:download|down|install|setup)(?:\/|\.html?|$)/i.test(href)
+          || /download\.html|down\.html|install\.html/i.test(href);
+        const sameOriginLand = typeof NS.looksLikeSameOriginLandingPageUrl === "function" && NS.looksLikeSameOriginLandingPageUrl(href);
+        if (!intent && !sameOriginLand && !pathLand
+          && !(typeof NS.needsDownloadBehaviorProbe === "function" && NS.needsDownloadBehaviorProbe(href, el))) continue;
+        if (NS.isPackageFileUrl && NS.isPackageFileUrl(href)) continue;
+        if (pathLand || sameOriginLand) pushL(href, el);
+        else if (typeof NS.needsDownloadBehaviorProbe === "function" && NS.needsDownloadBehaviorProbe(href, el)) pushP(href, el);
+        else if (intent) {
+          try {
+            const u = new URL(href, location.href);
+            if (u.origin !== location.origin || /\.(?:php|asp|aspx)$/i.test(u.pathname)) pushP(href, el);
+            else if (/\.(?:html?)$/i.test(u.pathname) && /down|install|client|soft|get|download/i.test(u.pathname + u.href)) pushL(href, el);
+            else if (/download/i.test(href)) pushL(href, el);
+          } catch { /* ignore */ }
+        }
+      }
+    } catch { /* ignore */ }
+    return { landing: landing.slice(0, 10), probe: probe.slice(0, 6) };
+  };
+
   /**
-   * 主动 fetch/探测下载按钮目标（无需用户点击）。
-   * 首页「免费下载→download.html」须在此检出仿冒落地/安装包，勿等用户点进下载页。
+   * 主动 fetch 下载按钮目标（download.html 等），无需用户点击。
+   * opts.force：扫尾强制再跑（即使首页已 arm brand-spoof / 有 ICP 也要拉落地页包链）
    */
-  NS.proactivelyProbeDownloadButtons = async function () {
+  NS.proactivelyProbeDownloadButtons = async function (opts) {
+    const o = opts || {};
     const state = NS.state;
     try {
-      if (state.downloadGuardInstalled || state._proactiveProbeBusy) return false;
-      // 可信门户/发行版等仍跳过；内容站 _perfBenign 不挡下载按钮主动 fetch
-      if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) return false;
-      // 有效 ICP / 超成熟：禁止主动探测把软件门户 arm 成仿冒（soft.china.com）
-      if ((NS.hasValidIcpRecord() || (typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature()))
-        && !(typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat())) {
-        NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "skip-trusted-icp-or-ultra");
+      if (state._proactiveProbeBusy) {
+        NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "busy-skip");
         return false;
       }
-      if (typeof NS.pageLooksLikeSoftwareCatalogPortal === "function" && NS.pageLooksLikeSoftwareCatalogPortal()) {
-        NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "skip-software-catalog");
+      // 已 hard 锁且非 force：可跳过；force 仍要 fetch 落地页装包 URL
+      if (state.downloadGuardInstalled && !o.force && state._brandSpoofPortalDetected) {
+        NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "guard-already-on-skip");
         return false;
       }
-      if (typeof NS.pageLooksLikeAppMarketOrAppStoreListing === "function" && NS.pageLooksLikeAppMarketOrAppStoreListing()) return false;
+      if (typeof NS.shouldSkipHeavyPageScan === "function" && NS.shouldSkipHeavyPageScan()) {
+        NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "skip-heavy-page");
+        return false;
+      }
       if (typeof NS.pageLooksLikeHighVolumePackageArchive === "function" && NS.pageLooksLikeHighVolumePackageArchive()) return false;
+      if (typeof NS.pageLooksLikeHighDensityDownloadList === "function" && NS.pageLooksLikeHighDensityDownloadList()) return false;
       if (typeof NS.pageLooksLikeOsDistroIsoDownload === "function" && NS.pageLooksLikeOsDistroIsoDownload()) return false;
       if (NS.pageLooksLikeSearchEngineResultsPage && NS.pageLooksLikeSearchEngineResultsPage()) return false;
+
+      const { landing, probe } = NS.collectProactiveDownloadTargets();
+      const hasTargets = (landing && landing.length > 0) || (probe && probe.length > 0);
+      if (!hasTargets) {
+        NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "no-targets");
+        return false;
+      }
+
+      // 域名与关键词 related 且非 squat：不 arm 仿冒，但仍可 fetch 看是否有异常包（force 时）
+      let domainRelatedSafe = false;
+      try {
+        if (typeof NS.evaluateDomainKeywordRelevance === "function") {
+          const rel = NS.evaluateDomainKeywordRelevance();
+          domainRelatedSafe = !!(rel && rel.related && !rel.squat);
+        }
+      } catch { /* ignore */ }
+
+      // 可信门户：仅无 force 且有明确 download.html 目标时仍 fetch（不因 ICP 整段禁用）
+      const trustedSoft = (NS.shouldNeverArmProtection && NS.shouldNeverArmProtection())
+        || (NS.looksLikeMatureOfficialPortal && NS.looksLikeMatureOfficialPortal())
+        || (NS.hasValidIcpRecord && NS.hasValidIcpRecord())
+        || (typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature());
+      if (trustedSoft && domainRelatedSafe && !o.force) {
+        NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "skip-trusted-related");
+        return false;
+      }
+
       const now = Date.now();
-      // 有明确下载按钮目标时缩短节流，避免首页首扫被 4s 冷却挡掉二次补探测
-      const hasTargetsEarly = typeof NS.pageHasProactiveDownloadButtonTargets === "function"
-        && NS.pageHasProactiveDownloadButtonTargets();
-      const coolMs = hasTargetsEarly ? 1800 : 4000;
-      if (state._proactiveProbeAt && now - state._proactiveProbeAt < coolMs) return false;
+      const coolMs = o.force ? 800 : (hasTargets ? 1500 : 4000);
+      if (!o.force && state._proactiveProbeAt && now - state._proactiveProbeAt < coolMs) {
+        NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "cooldown");
+        return false;
+      }
       state._proactiveProbeAt = now;
       state._proactiveProbeBusy = true;
 
-      const { landing, probe } = NS.collectProactiveDownloadTargets();
-      if (!landing.length && !probe.length) return false;
       const parentCtx = typeof NS.getParentPageBrandSpoofContext === "function"
         ? NS.getParentPageBrandSpoofContext()
         : { mismatch: false, brand: "" };
+      // 再补一轮 domainRel mismatch（父页中文品牌 + 无关域名）
+      let parentMismatch = !!parentCtx.mismatch;
+      let parentBrand = parentCtx.brand || state.spoofBrand || "";
+      try {
+        if (typeof NS.evaluateDomainKeywordRelevance === "function") {
+          const rel2 = NS.evaluateDomainKeywordRelevance();
+          if (rel2 && !rel2.related && (rel2.mismatch || rel2.hostMatch === "none") && (rel2.brand || rel2.brandToken)) {
+            parentMismatch = true;
+            parentBrand = parentBrand || rel2.brand || rel2.brandToken || "";
+          }
+        }
+      } catch { /* ignore */ }
+
       NS.silverfoxLog && NS.silverfoxLog(
         "proactive-probe", "start",
         "landing=", landing.length, "probe=", probe.length,
-        "parentMismatch=", !!parentCtx.mismatch, "brand=", parentCtx.brand || ""
+        "parentMismatch=", parentMismatch, "brand=", parentBrand || "",
+        "reason=", o.reason || ""
       );
 
       let armed = false;
@@ -1016,66 +1047,90 @@
             absPath = (u.pathname || "/").replace(/\/+$/, "") || "/";
             if (u.origin === location.origin && absPath === curPath) return null;
           } catch { /* ignore */ }
+          if (typeof NS.fetchWithRedirectChain !== "function") {
+            NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "no-fetch-api");
+            return null;
+          }
+          NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "fetch", href);
           const { chain, finalText: source } = await NS.fetchWithRedirectChain(href, 4);
-          if (!source || source.length < 80) return null;
+          if (!source || source.length < 40) {
+            NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "fetch-empty", href, "len=", (source && source.length) || 0);
+            return null;
+          }
           const analysis = NS.analyzeFetchedDownloadLandingHtml(source || "", chain, {
             baseHref: href,
-            parentBrandMismatch: !!parentCtx.mismatch,
-            parentBrand: parentCtx.brand || ""
+            parentBrandMismatch: parentMismatch,
+            parentBrand: parentBrand || ""
           });
-          if (!analysis.hit) return null;
+          // 父页品牌错配 + 落地页有下载话术 → 即使无包也视为仿冒落地
+          if (parentMismatch && !analysis.hit) {
+            const dlKw = (source.match(/下载|download|安装|客户端|免费|官方/gi) || []).length;
+            if (dlKw >= 2 || /download|安装包|\.exe|\.zip|免费下载|官方下载/i.test(source)) {
+              analysis.hit = true;
+              analysis.brandSpoofLanding = true;
+            }
+          }
+          if (!analysis.hit) {
+            NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "fetch-no-hit", href, "len=", source.length);
+            // 仍收集包 URL 供后续保护
+            const pkgs0 = analysis.packages || [];
+            for (const p of pkgs0.slice(0, 8)) {
+              if (p && state.protectedTargets && !state.protectedTargets.includes(p)) state.protectedTargets.push(p);
+            }
+            return null;
+          }
           const pkgs = analysis.packages || [];
           try {
             for (const p of pkgs.slice(0, 8)) {
               if (p && !state.protectedTargets.includes(p)) state.protectedTargets.push(p);
             }
-            if (!pkgs.length) {
-              const pkgRe = /https?:\/\/[^\s"'<>\\]+?\.(?:zip|exe|apk|msi|dmg|rar|7z)(?:\?[^\s"'<>\\]*)?/gi;
-              let m; let n = 0;
-              while ((m = pkgRe.exec(source)) !== null && n < 6) {
-                n++;
-                if (!state.protectedTargets.includes(m[0])) state.protectedTargets.push(m[0]);
-              }
-            }
           } catch { /* ignore */ }
           return { href, el, analysis, packages: pkgs };
-        } catch { return null; }
+        } catch (e) {
+          NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "fetch-err", href, e && e.message);
+          return null;
+        }
       }));
       const landHit = landResults.find(Boolean);
       if (landHit) {
-        const isBrand = !!(landHit.analysis.brandSpoofLanding || parentCtx.mismatch || state.spoofBrand || state._brandSpoofPortalDetected);
-        if (isBrand && parentCtx.brand && !state.spoofBrand) {
-          try { state.spoofBrand = parentCtx.brand; } catch { /* ignore */ }
+        const isBrand = !!(landHit.analysis.brandSpoofLanding || parentMismatch);
+        // 可信 + 域名相关：不 arm 仿冒
+        if (isBrand && domainRelatedSafe && trustedSoft) {
+          NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "hit-but-trusted-related");
+        } else {
+          if (isBrand && parentBrand && !state.spoofBrand) {
+            try { state.spoofBrand = parentBrand; } catch { /* ignore */ }
+          }
+          const showBrand = state.spoofBrand || parentBrand || "";
+          const reason = landHit.analysis.brandSpoofLanding || parentMismatch
+            ? `主动探测：首页下载入口指向仿冒落地页（${showBrand || "品牌"} 与域名不匹配）`
+            : landHit.analysis.staticPackageLanding
+              ? "主动探测：下载按钮指向的落地页含安装包分发"
+              : "主动探测：下载按钮指向的落地页含远程配置/动态下发安装包链路";
+          NS.addSignal(
+            (landHit.analysis.brandSpoofLanding || parentMismatch) ? "主动探测仿冒下载落地" : "同域下载落地页远程链",
+            (landHit.analysis.brandSpoofLanding || parentMismatch) ? 22 : 16,
+            `${reason} → ${landHit.href}`
+          );
+          if (landHit.el) try { NS.disableOneSuspiciousElement(landHit.el, landHit.href); } catch { /* ignore */ }
+          const pkgHref = (landHit.packages && landHit.packages[0])
+            || (state.protectedTargets || []).find((t) => /\.(?:exe|zip|msi|apk|dmg)/i.test(String(t)))
+            || landHit.href;
+          NS.installDownloadGuard(reason, {
+            notify: true,
+            href: pkgHref,
+            message: showBrand && isBrand
+              ? `域名 ${location.hostname} 与标题品牌「${showBrand}」不匹配，疑似仿冒官网下载站`
+              : (pkgHref !== landHit.href ? String(pkgHref) : landHit.href),
+            forceNotify: true,
+            title: showBrand && isBrand ? `已识别仿冒「${showBrand}」官网` : "已拦截可疑下载落地页",
+            guardKind: isBrand ? "brand-spoof" : "package",
+            lockHard: true
+          });
+          NS.disableAllDownloadIntentControls();
+          try { state._brandSpoofPortalDetected = state._brandSpoofPortalDetected || isBrand; } catch { /* ignore */ }
+          armed = true;
         }
-        const showBrand = state.spoofBrand || parentCtx.brand || "";
-        const reason = landHit.analysis.brandSpoofLanding
-          ? `主动探测：首页下载入口指向仿冒落地页（${showBrand || "品牌"} 与域名不匹配）`
-          : landHit.analysis.staticPackageLanding
-            ? "主动探测：下载按钮指向的落地页含安装包分发"
-            : "主动探测：下载按钮指向的落地页含远程配置/动态下发安装包链路";
-        NS.addSignal(
-          landHit.analysis.brandSpoofLanding ? "主动探测仿冒下载落地" : "同域下载落地页远程链",
-          landHit.analysis.brandSpoofLanding ? 22 : 16,
-          `${reason} → ${landHit.href}`
-        );
-        if (landHit.el) try { NS.disableOneSuspiciousElement(landHit.el, landHit.href); } catch { /* ignore */ }
-        const pkgHref = (landHit.packages && landHit.packages[0])
-          || state.protectedTargets.find((t) => /\.(?:exe|zip|msi|apk|dmg)/i.test(String(t)))
-          || landHit.href;
-        NS.installDownloadGuard(reason, {
-          notify: true,
-          href: pkgHref,
-          message: showBrand
-            ? `域名 ${location.hostname} 与标题品牌「${showBrand}」不匹配，疑似仿冒官网下载站`
-            : (pkgHref !== landHit.href ? pkgHref : landHit.href),
-          forceNotify: true,
-          title: showBrand ? `已识别仿冒「${showBrand}」官网` : "已拦截可疑下载落地页",
-          guardKind: isBrand ? "brand-spoof" : "package",
-          lockHard: true
-        });
-        NS.disableAllDownloadIntentControls();
-        try { state._brandSpoofPortalDetected = state._brandSpoofPortalDetected || isBrand; } catch { /* ignore */ }
-        armed = true;
       }
 
       if (!armed || !state.downloadGuardInstalled) {
@@ -1096,15 +1151,17 @@
       }
 
       if (armed) try { NS.emitRiskReport(true); } catch { /* ignore */ }
+      NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "done", "armed=", armed);
       return armed;
-    } catch { return false; }
-    finally {
+    } catch (e) {
+      NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "err", e && e.message);
+      return false;
+    } finally {
       try { state._proactiveProbeBusy = false; } catch { /* ignore */ }
     }
   };
 
-  /** @deprecated 兼容旧调用名 → 主动探测 */
   NS.detectLinkedLandingPageSources = async function () {
-    return NS.proactivelyProbeDownloadButtons();
+    return NS.proactivelyProbeDownloadButtons({ force: true, reason: "compat-linked" });
   };
 })(window.SilverfoxContent ??= {});

@@ -487,10 +487,17 @@
       NS.addSignal("远程下发乱码安装包", 22, pkg ? `官网下载页远程拉取安装包，文件名/主机异常: ${label}` : "官网下载页通过脚本远程下发安装包（乱码文件名或高熵下载域名）");
       if (squat === "padded" || squat === "typo" || squat === "hyphen") {
         const lab0 = (location.hostname || "").toLowerCase().replace(/^www\./, "").split(".")[0] || "";
-        const brandTok = NS.pickBrandTokenForHost(NS.extractLatinBrandTokens(title), lab0) || NS.extractLatinBrandTokens(title)[0] || "";
-        if (brandTok) state.spoofBrand = NS.formatBrandTokenForDisplay(brandTok);
+        let brandTok = "";
+        try {
+          if (typeof NS.resolveSpoofDisplayBrand === "function") brandTok = NS.resolveSpoofDisplayBrand(location.hostname) || "";
+        } catch { /* ignore */ }
+        if (!brandTok) {
+          brandTok = NS.pickBrandTokenForHost(NS.extractLatinBrandTokens(title), lab0) || NS.extractLatinBrandTokens(title)[0] || "";
+          if (brandTok) brandTok = NS.formatBrandTokenForDisplay(brandTok);
+        }
+        if (brandTok) state.spoofBrand = brandTok;
         const shapeHint = squat === "hyphen" ? "域名用连字符拆分品牌名" : "域名夹带品牌前缀/后缀";
-        NS.addSignal("仿冒品牌官网下载站", 24, brandTok ? `标题/正文品牌「${NS.formatBrandTokenForDisplay(brandTok)}」与域名 ${location.hostname} 不匹配（${shapeHint}）` : `域名 ${location.hostname} 呈品牌营销站形态，且远程下发异常安装包`);
+        NS.addSignal("仿冒品牌官网下载站", 24, brandTok ? `标题/正文品牌「${brandTok}」与域名 ${location.hostname} 不匹配（${shapeHint}）` : `域名 ${location.hostname} 呈品牌营销站形态，且远程下发异常安装包`);
       }
       NS.installDownloadGuard(pkg ? `远程乱码安装包: ${label}` : "远程下发乱码安装包", { notify: true, href: pkg || "", message: pkg ? `远程安装包异常: ${label}` : "官网下载页远程下发乱码安装包", title: state.spoofBrand ? `已识别仿冒「${state.spoofBrand}」官网` : "已拦截远程异常安装包", forceNotify: true, guardKind: state.spoofBrand ? "brand-spoof" : "package", lockHard: true });
       NS.postToHooks({ type: "set-guard", enabled: true });

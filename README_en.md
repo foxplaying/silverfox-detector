@@ -9,7 +9,7 @@ English | [简体中文](./README.md)
 Behavioral web threat detector - a Chrome extension that flags suspicious download landing pages via DOM heuristics and MAIN-world behavioral hooks.
 
 [![Manifest](https://img.shields.io/badge/manifest-v3-blue)](https://developer.chrome.com/docs/extensions/mv3/intro/)
-[![Version](https://img.shields.io/badge/version-0.1.0-green)](./extension/manifest.json)
+[![Version](https://img.shields.io/badge/version-0.1.1-green)](./extension/manifest.json)
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey)](./LICENSE)
 
 </div>
@@ -167,7 +167,6 @@ Filter the page DevTools console by `[silverfox]` to see scan gates, detector HI
 - **MAIN-world hooks install at `document_start`.** Chrome injects MAIN scripts before page JS, so `Location.prototype` is patched before any cloaking redirect fires.
 - **Soft brand-spoof waits for ICP.** Padded/typo hosts (e.g. `todeskai.com` + 沪ICP) defer the toast until ICP settles, avoiding permanent false-positive UX.
 - **DNR is short-burst only.** SERP-blocking session rules auto-expire (3-15s) and never auto-renew, so intentional search after leaving a phish page is never `ERR_BLOCKED_BY_CLIENT`.
-- **Strong product installers always pass.** `Brand_official_setup_2.6.3.0.exe` and Android reverse-domain APKs are exempt from every block path, even on object-storage hosts.
 
 ## Project layout conventions
 
