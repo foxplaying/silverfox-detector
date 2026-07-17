@@ -63,6 +63,20 @@
         document.querySelectorAll("a, button, [role='button']").forEach((el) => {
           if (DownloadUi.isDownloadIntentText(el)) DownloadUi.greyOut(el);
         });
+        // 同源 iframe 内下载 CTA（跨源依赖 all_frames + 顶层 set-guard 广播）
+        try {
+          document.querySelectorAll("iframe").forEach((frame) => {
+            try {
+              const doc = frame.contentDocument;
+              if (!doc) return;
+              doc.querySelectorAll("a, button, [role='button']").forEach((el) => {
+                try {
+                  if (DownloadUi.isDownloadIntentText(el)) DownloadUi.greyOut(el);
+                } catch { /* ignore */ }
+              });
+            } catch { /* cross-origin */ }
+          });
+        } catch { /* ignore */ }
       } catch { /* ignore */ }
     }
   }

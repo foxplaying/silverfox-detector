@@ -66,6 +66,11 @@
     _htmlCache: "", _htmlCacheAt: 0, _htmlCacheMax: 0,
     _dlBtnCache: null, _dlBtnCacheAt: 0,
     _serpCache: null, _serpCacheAt: 0, _serpCacheUrl: "",
+    _highDensityDl: null, _highDensityDlAt: 0,
+    _osDistroIso: null, _osDistroIsoAt: 0,
+    _highVolArchive: null, _highVolArchiveAt: 0,
+    _skipHeavy: null, _skipHeavyAt: 0,
+    _primaryKw: null, _primaryKwAt: 0, _primaryKwUrl: "",
     probeCache: new Map(),
     pageToastLastAt: new Map(),
     sentNoticeKeys: new Set(),
@@ -118,7 +123,13 @@
   };
 
   NS.markAnalysisComplete = function (reason) {
+    try { if (typeof NS.isTopFrame === "function" && !NS.isTopFrame()) return; } catch { /* ignore */ }
     NS.silverfoxLog("analysis-complete", reason || "", "score=", NS.state.score, "guard=", !!NS.state.downloadGuardInstalled);
+    try {
+      const hostKey = String(location.hostname || "").toLowerCase().replace(/^www\./, "");
+      NS.state._stickyComplete = true;
+      NS.state._stickyCompleteHost = hostKey;
+    } catch { /* ignore */ }
     if (NS.state._analysisDone) { NS.emitRiskReport(true); return; }
     NS.state._analysisDone = true;
     NS.state._analysisDoneAt = Date.now();
@@ -131,6 +142,11 @@
     c._htmlCache = ""; c._htmlCacheAt = 0; c._htmlCacheMax = 0;
     c._dlBtnCache = null; c._dlBtnCacheAt = 0;
     c._serpCache = null; c._serpCacheAt = 0; c._serpCacheUrl = "";
+    c._highDensityDl = null; c._highDensityDlAt = 0;
+    c._osDistroIso = null; c._osDistroIsoAt = 0;
+    c._highVolArchive = null; c._highVolArchiveAt = 0;
+    c._skipHeavy = null; c._skipHeavyAt = 0;
+    c._primaryKw = null; c._primaryKwAt = 0; c._primaryKwUrl = "";
   };
 
   NS.scheduleIdle = function (fn, timeoutMs = 1200) {
@@ -143,8 +159,120 @@
     setTimeout(() => { try { fn(); } catch { /* ignore */ } }, Math.min(timeoutMs, 400));
   };
 
+  /** 是否顶层浏览上下文（iframe 内为 false） */
+  NS.isTopFrame = function () {
+    try { return window === window.top; } catch { return true; }
+  };
+
+  /**
+   * 向本 frame 的 MAIN page-hooks 发指令；set-guard 时同步广播到子 frame，
+   * 否则 iframe 内下载按钮不受顶层盗版拦截影响。
+   */
   NS.postToHooks = function (payload) {
     try { window.postMessage({ source: CONTENT_SOURCE, ...payload }, "*"); } catch { /* ignore */ }
+    // 顶层 arm/disarm 时向所有子 frame 传播（跨源只能 postMessage，同源再由 content 灰按钮）
+    try {
+      if (payload && payload.type === "set-guard" && NS.isTopFrame()) {
+        const msg = { source: CONTENT_SOURCE, type: "set-guard", enabled: !!payload.enabled, fromTop: true };
+        const blast = (win) => {
+          try { win.postMessage(msg, "*"); } catch { /* ignore */ }
+        };
+        try {
+          for (let i = 0; i < window.frames.length; i++) blast(window.frames[i]);
+        } catch { /* ignore */ }
+        try {
+          document.querySelectorAll("iframe").forEach((f) => {
+            try { if (f.contentWindow) blast(f.contentWindow); } catch { /* ignore */ }
+          });
+        } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
+  };
+
+  /**
+   * 顶层 arm 后处理页面内 iframe/embed：
+   * - 仅 pointer-events 不够：晚加载的跨源下载壳仍会完整渲染，用户可点
+   * - 掏空 src → about:blank、加 sandbox、挡交互；同源再灰内部按钮
+   * - 由 installParentGuardInheritance 定时补锁，防 SPA 重插框架
+   */
+  NS.neutralizePageFramesForGuard = function (on) {
+    try {
+      if (!NS.isTopFrame()) return;
+      document.querySelectorAll("iframe, embed, object").forEach((el) => {
+        try {
+          const tag = (el.tagName || "").toUpperCase();
+          if (on) {
+            if (!el.dataset.silverfoxFramePrevPe) {
+              el.dataset.silverfoxFramePrevPe = el.style.pointerEvents || "";
+            }
+            el.style.setProperty("pointer-events", "none", "important");
+            el.style.setProperty("visibility", "hidden", "important");
+            el.setAttribute("data-silverfox-frame-locked", "1");
+            // 保存并掏空导航目标（防晚加载下载落地页）
+            try {
+              const curSrc = el.getAttribute("src") || el.src || "";
+              if (curSrc && !/^about:blank$/i.test(curSrc) && !el.dataset.silverfoxFrameOrigSrc) {
+                el.dataset.silverfoxFrameOrigSrc = curSrc;
+              }
+              if (tag === "IFRAME" || tag === "EMBED") {
+                try { el.removeAttribute("src"); } catch { /* ignore */ }
+                try { el.src = "about:blank"; } catch { /* ignore */ }
+                try { el.setAttribute("src", "about:blank"); } catch { /* ignore */ }
+              }
+              if (tag === "OBJECT") {
+                try {
+                  if (!el.dataset.silverfoxFrameOrigData && el.getAttribute("data")) {
+                    el.dataset.silverfoxFrameOrigData = el.getAttribute("data");
+                  }
+                  el.removeAttribute("data");
+                } catch { /* ignore */ }
+              }
+              // 最严沙箱：无下载、无顶层导航、无表单
+              try {
+                if (tag === "IFRAME") {
+                  el.setAttribute("sandbox", "");
+                  el.removeAttribute("allow");
+                  el.removeAttribute("allowfullscreen");
+                }
+              } catch { /* ignore */ }
+            } catch { /* ignore */ }
+            // 同源：灰内部下载控件
+            try {
+              const doc = el.contentDocument;
+              if (doc) {
+                doc.querySelectorAll("a, button, [role='button']").forEach((node) => {
+                  try {
+                    const t = (node.textContent || "").replace(/\s+/g, " ").trim();
+                    const href = (node.getAttribute && (node.getAttribute("href") || node.getAttribute("data-href"))) || "";
+                    if (/下载|download|安装|客户端|免费获取/i.test(t + " " + href)
+                      || /\.(?:exe|zip|msi|apk|dmg)(?:\?|$)/i.test(href)
+                      || true) {
+                      // 同源 frame 内一律挡可点控件（盗版下载壳）
+                      node.style.setProperty("pointer-events", "none", "important");
+                      node.style.setProperty("opacity", "0.45", "important");
+                      node.setAttribute("data-silverfox-greyed", "1");
+                      if (node.tagName === "A") {
+                        if (!node.dataset.silverfoxOrigHref && node.getAttribute("href")) {
+                          node.dataset.silverfoxOrigHref = node.getAttribute("href");
+                        }
+                        try { node.setAttribute("href", "javascript:void(0)"); } catch { /* ignore */ }
+                      }
+                    }
+                  } catch { /* ignore */ }
+                });
+              }
+            } catch { /* cross-origin — 已 about:blank */ }
+          } else if (el.getAttribute("data-silverfox-frame-locked") === "1") {
+            el.style.pointerEvents = el.dataset.silverfoxFramePrevPe || "";
+            el.style.visibility = "";
+            el.removeAttribute("data-silverfox-frame-locked");
+            delete el.dataset.silverfoxFramePrevPe;
+            // 一般不自动恢复 src（防立刻再下）；仅清标记
+            try { el.removeAttribute("sandbox"); } catch { /* ignore */ }
+          }
+        } catch { /* ignore */ }
+      });
+    } catch { /* ignore */ }
   };
 
   NS.addSignal = function (name, weight, reason) {

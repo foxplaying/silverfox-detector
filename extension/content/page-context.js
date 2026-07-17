@@ -246,14 +246,14 @@
           const text = (el.textContent || "").replace(/\s+/g, " ").trim();
           if (text.length > 80) continue;
           const cls = String(el.className || "");
-          const isCta = dlText.test(text)
+          let isCta = dlText.test(text)
             || /立即下载|免费下载|立即免费下载|立即使用|前往\s*App\s*Store|Windows\s*版|查看其他平台|下载中心|获取客户端|个人版下载/i.test(text)
             || /download\.php|download\.html|\/download/i.test(href)
             || (typeof NS.isPackageFileUrl === "function" && NS.isPackageFileUrl(href))
-            || /startDownload\s*\(|openDownloadModal/i.test(el.getAttribute("onclick") || "")
-            // btn-header / btn-primary 是仿冒首页典型 CTA（勿只认 download-btn）
-            || (/download-btn|btn-download|platform-btn|btn-header|btn-primary|btn-lg/i.test(cls)
-              && text.length >= 1 && text.length < 40 && /下载|免费|官方|客户端|个人版/i.test(text));
+            || /startDownload\s*\(|openDownloadModal|showDownloadModal/i.test(el.getAttribute("onclick") || "")
+            // btn-header / btn-primary / btn-sm 是仿冒首页典型 CTA（勿只认 download-btn）
+            || (/download-btn|btn-download|platform-btn|btn-header|btn-primary|btn-lg|btn-sm/i.test(cls)
+              && text.length >= 1 && text.length < 48 && /下载|免费|官方|客户端|个人版/i.test(text));
           if (!isCta) continue;
           ctaCount++;
           if (!href || href === "#" || /^javascript:/i.test(href)) hrefless++;
@@ -274,6 +274,13 @@
             }
           }
           if (/Windows|macOS|\bMac\b|Linux|Android|iOS|鸿蒙|Win(?:dows)?\s*\d/i.test(text)) platformHint++;
+        }
+      } catch { /* ignore */ }
+      // 网盘扫码弹层也算 hub 下载壳
+      try {
+        if (document.getElementById("downloadModal") || document.querySelector(".modal-overlay [class*='qr'], .qr-grid, .qr-item")) {
+          hasHub = true;
+          if (ctaCount < 1) ctaCount = 1;
         }
       } catch { /* ignore */ }
 
@@ -429,9 +436,8 @@
   };
 
   /**
-   * 第三方软件下载门户 / 软件库详情页（中华网软件、华军、太平洋下载等形态）。
-   * 标题常为「360安全卫士…下载 - 中华网软件」——是门户分发，不是仿冒 360 官网。
-   * 纯结构/文案启发，非域名白名单。
+   * 第三方软件下载门户详情页（结构启发，无站点名白名单）。
+   * 路径 /soft/数字、频道子域 soft.、多软件列表 DOM 等。
    */
   NS.pageLooksLikeSoftwareCatalogPortal = function () {
     try {
@@ -439,52 +445,43 @@
       const path = (location.pathname || "").toLowerCase();
       const host = (location.hostname || "").toLowerCase().replace(/^www\./, "");
       const hostLabel = (host.split(".")[0] || "");
-      const desc = String(document.querySelector('meta[name="description"]')?.getAttribute("content") || "").trim();
-      const siteName = String(document.querySelector('meta[property="og:site_name"]')?.getAttribute("content") || "").trim();
-      // 真仿冒「XX 官方客户端/电脑版官网」壳：无门户后缀时不放过
-      const pureOfficialShell = /(?:官方客户端|电脑版官网|全平台官方下载|官方正版下载|立即免费下载)/i.test(title)
-        && !/中华网|华军|太平洋|天空下载|下载之家|软件园|电脑之家|驱动人生|ZOL|PConline|yesky|软件频道|软件中心/i.test(title + siteName);
-      if (pureOfficialShell) return false;
-
-      // 标题门户后缀：…下载 - 中华网软件
-      const portalTitleSuffix = /[-–—_|]\s*(?:中华网软件|中华网|华军软件(?:园)?|太平洋(?:电脑网)?下载|天空下载|下载之家|绿色资源网|软件天堂|统一下载|当下软件园|IT之家|电脑之家|ZOL下载|PConline|太平洋下载|yesky|天极下载|驱动人生|软件频道|软件中心)\s*$/i.test(title)
-        || /(?:中华网软件|华军软件园|太平洋电脑网下载|天空下载站)\s*$/i.test(title);
-      // 路径：/soft/1109443.html  /down/  /softdown/
+      // 路径：/soft/1109443.html
       const portalPath = /\/(?:soft|down|softdown|softinfo|software)\/(?:list|detail|\d+)/i.test(path)
         || /\/soft\/\d+\.html?/i.test(path)
         || /\/down\/\d+\.html?/i.test(path);
-      // 频道子域 soft./download.
+      // 频道子域 soft.xxx.com
       const portalHost = /^(?:soft|download|down|app|game)\./i.test(host)
         || /^(?:soft|download|down)$/i.test(hostLabel);
-
-      let body = "";
+      // 标题门户后缀：破折号后短站名，且站名不含「官方」（假官网标题「…｜官方下载」不算门户）
+      const titleParts = title.split(/\s*[-–—_|｜]\s*/).map((p) => p.trim()).filter(Boolean);
+      const titleTail = titleParts.length >= 2 ? titleParts[titleParts.length - 1] : "";
+      const portalTitleSuffix = titleTail.length >= 2 && titleTail.length <= 12
+        && /软件|下载|频道|中心|家园|乐园/i.test(titleTail)
+        && !/官方|官网/i.test(titleTail);
+      // DOM：软件详情栅格 / 多软件列表
+      let portalDom = false;
       try {
-        body = ((document.body && (document.body.innerText || document.body.textContent)) || "").replace(/\s+/g, " ").slice(0, 4000);
-      } catch { body = ""; }
-      const headBlob = `${title} ${siteName} ${desc.slice(0, 200)} ${body.slice(0, 800)}`;
-      // 门户壳：站点名、分类导航、人工检测、最新收录、软件详情栅格
-      const portalChrome = /中华网软件|华军软件|人工检测[，,\s]*安心下载|最新收录|软件分类|相关软件|大家都在下|软件大小|更新时间|版本号|次下载|安全软件|实用工具/i.test(headBlob)
-        || /Copyright\s*(?:&copy;|©)?\s*中华网/i.test(body)
-        || !!document.querySelector(
+        portalDom = !!document.querySelector(
           ".soft-page, .s-soft-art, #baseinfo, .m-soft-detail, .soft-detail, .soft-info, "
           + ".download-info, .soft_info, #soft-info, .app-detail, .softname"
         );
-      let logoPortal = false;
+        if (!portalDom) {
+          const links = document.querySelectorAll("a[href*='/soft/'], a[href*='/down/']");
+          portalDom = links.length >= 6;
+        }
+      } catch { /* ignore */ }
+      // 标题破折号最后一段与 logo 文本重合 → 门户站名
+      let logoMatchSuffix = false;
       try {
         const logoT = String(document.querySelector(".logo, .logo-link, [class*='logo'] a, header a")?.textContent || "").trim();
-        logoPortal = /中华网|华军|软件园|下载站|软件频道|电脑之家/i.test(logoT + siteName);
+        const tail = (title.split(/\s*[-–—_|]\s*/).pop() || "").trim();
+        if (logoT.length >= 2 && tail.length >= 2 && (logoT.includes(tail) || tail.includes(logoT))) logoMatchSuffix = true;
       } catch { /* ignore */ }
 
-      // 标题含产品「官网」字样但整页是门户详情（…官网免费版下载 - 中华网软件）
-      const productOnPortal = portalTitleSuffix
-        && /下载|软件|安全|客户端|电脑版/i.test(title)
-        && (portalChrome || logoPortal || portalPath);
-
-      if (productOnPortal) return true;
-      if (portalTitleSuffix && (portalChrome || logoPortal || portalPath)) return true;
-      if (portalPath && portalChrome && (portalHost || logoPortal || /软件|下载|版本|大小/i.test(title))) return true;
-      if (portalHost && portalPath && portalChrome) return true;
-      if (logoPortal && portalPath && /下载|软件/i.test(title)) return true;
+      if (portalPath && (portalHost || portalDom || portalTitleSuffix)) return true;
+      if (portalHost && portalDom) return true;
+      if (portalTitleSuffix && logoMatchSuffix && portalPath) return true;
+      if (portalTitleSuffix && portalDom) return true;
       return false;
     } catch { return false; }
   };
@@ -500,37 +497,162 @@
       const desc = String(document.querySelector('meta[name="description"]')?.getAttribute("content") || "").trim();
       const path = (location.pathname || "").toLowerCase();
       const head = `${title} ${desc}`.slice(0, 900);
-      // 纯仿冒「XX 官网/官方客户端」壳：无商店品牌话术时不按应用商店放过
+      // 纯仿冒官网壳：无商店结构时不放过
       const pureOfficialShell = /(?:官方客户端|电脑版官网|全平台官方下载|官方正版下载)/i.test(title)
-        && !/手机助手|应用商店|应用市场|应用宝|App\s*Store|Google\s*Play|手机APP下载|软件商店/i.test(head);
+        && !/(?:手机助手|应用商店|应用市场|软件商店|App\s*Store|Play\s*Store|手机APP下载)/i.test(head);
       if (pureOfficialShell) return false;
 
-      // 商店/助手品牌出现在标题或描述
-      const marketBrand = /百度手机助手|手机助手|应用商店|应用市场|软件商店|应用宝|豌豆荚|华为应用市场|小米应用商店|OPPO软件商店|vivo应用商店|酷安|App\s*Store|Google\s*Play|Play\s*Store|Microsoft\s*Store|应用汇|360手机助手|腾讯应用宝/i.test(head);
-      // 标题形态：App + 下载安装 + 市场后缀（钉钉APP免费下载安装2026最新版_手机APP下载_百度手机助手）
-      const titleListing = (
-        /(?:APP|app|应用).{0,16}(?:免费)?下载安装|(?:下载安装)\d{4}最新版|_手机APP下载_|手机APP下载/i.test(title)
-        && /手机助手|应用商店|应用市场|应用宝|App\s*Store|Play|软件商店/i.test(title)
-      ) || /_手机APP下载_/.test(title)
-        || /免费下载安装\d{4}最新版.+手机助手/i.test(title);
-      // 描述：商店为您提供某 App 下载
-      const descListing = /(?:手机助手|应用商店|应用市场|应用宝|软件商店).{0,12}为您提供/i.test(desc)
-        || /为您提供.{0,48}(?:APP|应用|客户端).{0,16}下载/i.test(desc);
-      // URL：应用详情路径
+      // 结构：商店类文案 + 标题形态 / 路径（不维护具体商店名表）
+      const marketShape = /(?:手机助手|应用商店|应用市场|软件商店|App\s*Store|Play\s*Store|应用宝)/i.test(head);
+      const titleListing = /(?:APP|app|应用).{0,16}(?:免费)?下载安装|_手机APP下载_|手机APP下载/i.test(title)
+        || /免费下载安装\d{4}最新版/i.test(title);
+      const descListing = /为您提供.{0,48}(?:APP|应用|客户端).{0,16}下载/i.test(desc);
       const pathListing = /\/(?:appitemp?|appitem|app\/(?:detail|info|view)|soft\/\d|store\/apps|android\/details|detail\/app|package\/|appinfo\/)/i.test(path);
 
       let struct = false;
       try {
         const body = ((document.body && (document.body.innerText || document.body.textContent)) || "").replace(/\s+/g, " ").slice(0, 3500);
-        const marketInBody = /手机助手|应用商店|应用市场|应用宝|相关推荐|大家还在下|安装次数|次安装|应用权限|开发者|隐私权限/i.test(body);
+        const marketInBody = /(?:手机助手|应用商店|应用市场|相关推荐|安装次数|次安装|应用权限|开发者)/i.test(body);
         const appMeta = /版本|大小|更新|下载/.test(body);
         struct = marketInBody && appMeta;
       } catch { /* ignore */ }
 
-      if (titleListing) return true;
-      if (marketBrand && (descListing || pathListing || struct)) return true;
-      if (pathListing && (marketBrand || descListing || /APP|应用|下载安装/i.test(title))) return true;
+      if (titleListing && (marketShape || pathListing || struct)) return true;
+      if (marketShape && (descListing || pathListing || struct)) return true;
+      if (pathListing && (marketShape || descListing || /APP|应用|下载安装/i.test(title))) return true;
       return false;
+    } catch { return false; }
+  };
+
+  /**
+   * 是否应整页跳过重扫/主动探测（廉价门控，可在 document_start 调用）。
+   * 发行版 ISO / 镜像列表 / 海量下载索引 → true。
+   */
+  NS.shouldSkipHeavyPageScan = function () {
+    try {
+      const c = NS.caches || {};
+      const now = Date.now();
+      if (c._skipHeavy != null && now - (c._skipHeavyAt || 0) < 4000) return !!c._skipHeavy;
+      const title = document.title || "";
+      const host = (location.hostname || "").toLowerCase();
+      const path = (location.pathname || "").toLowerCase();
+      // 仿冒 exe 壳不跳过
+      if (/官方客户端|官方正版|电脑版官网|立即免费下载/i.test(title) && /\.exe|客户端/i.test(title)
+        && !/iso|镜像|发行版|Arch\s*Linux|Ubuntu|Debian/i.test(title)) {
+        c._skipHeavy = false; c._skipHeavyAt = now; return false;
+      }
+      // 路径 + 标题/主机：不依赖链接计数（镜像 DOM 未齐时也能 early complete）
+      const distroHost = /archlinux|ubuntu\.com|debian\.org|fedoraproject|centos\.org|rockylinux|almalinux|manjaro|opensuse|linuxmint|kali\.org/i.test(host);
+      const distroTitle = /arch\s*linux|ubuntu|debian|fedora|centos|manjaro|linux\s*mint|kali\s*linux|发行版|安装映像/i.test(title);
+      const dlPath = /\/(?:download|downloads|iso|get|releng)(?:\/|$)/i.test(path);
+      if ((distroHost || distroTitle) && dlPath) {
+        c._skipHeavy = true; c._skipHeavyAt = now; return true;
+      }
+      try {
+        if (document.getElementById("download-mirrors") || document.getElementById("arch-downloads")
+          || document.getElementById("archnavbar") && /archlinux/i.test(host)) {
+          c._skipHeavy = true; c._skipHeavyAt = now; return true;
+        }
+      } catch { /* ignore */ }
+      if (typeof NS.pageLooksLikeHighDensityDownloadList === "function" && NS.pageLooksLikeHighDensityDownloadList()) {
+        c._skipHeavy = true; c._skipHeavyAt = now; return true;
+      }
+      if (typeof NS.pageLooksLikeOsDistroIsoDownload === "function" && NS.pageLooksLikeOsDistroIsoDownload()) {
+        c._skipHeavy = true; c._skipHeavyAt = now; return true;
+      }
+      if (typeof NS.pageLooksLikeHighVolumePackageArchive === "function" && NS.pageLooksLikeHighVolumePackageArchive()) {
+        c._skipHeavy = true; c._skipHeavyAt = now; return true;
+      }
+      c._skipHeavy = false; c._skipHeavyAt = now; return false;
+    } catch { return false; }
+  };
+
+  /**
+   * 海量可点下载资源（镜像站 / ISO 列表 / 多源下载索引）。
+   * 廉价采样 document.links，避免对几百个 a[href] 全量跑品牌/主动探测卡死主线程。
+   * 真·银狐假官网通常只有少量 CTA，不会有 40+ 下载链。
+   */
+  NS.pageLooksLikeHighDensityDownloadList = function () {
+    try {
+      const c = NS.caches || {};
+      const now = Date.now();
+      if (c._highDensityDl != null && now - (c._highDensityDlAt || 0) < 5000) return !!c._highDensityDl;
+      const title = document.title || "";
+      const host = (location.hostname || "").toLowerCase();
+      const path = (location.pathname || "").toLowerCase();
+      // 仿冒「XX 客户端/立即免费下载」壳：即使链多也不按归档放行
+      if (/官方客户端|官方正版|电脑版官网|立即免费下载|立即下载.*\.exe|\.exe.*官方/i.test(title)
+        && !/iso|镜像|发行版|Arch\s*Linux|Ubuntu|Debian|Fedora/i.test(title)) {
+        c._highDensityDl = false; c._highDensityDlAt = now; return false;
+      }
+      // 廉价：镜像容器 / 发行版下载路径（勿等数百条 a 渲染完）
+      try {
+        if (document.getElementById("download-mirrors") || document.getElementById("arch-downloads")) {
+          c._highDensityDl = true; c._highDensityDlAt = now; return true;
+        }
+      } catch { /* ignore */ }
+      if (/archlinux|ubuntu|debian|fedora/i.test(host) && /\/(?:download|iso|releng)/i.test(path)) {
+        c._highDensityDl = true; c._highDensityDlAt = now; return true;
+      }
+
+      let total = 0;
+      let links = null;
+      try {
+        links = document.links;
+        total = links ? links.length : 0;
+      } catch { total = 0; }
+      // 禁止 querySelectorAll("a[href]") 全量计数（大页卡死）；仅用 document.links
+
+      // 极多链接：再采样下载形态
+      let dlShape = 0;
+      let isoShape = 0;
+      let mirrorShape = 0;
+      let external = 0;
+      const sampleN = Math.min(total, 120);
+      try {
+        if (links && links.length) {
+          for (let i = 0; i < sampleN; i++) {
+            let h = "";
+            try { h = String(links[i].getAttribute("href") || links[i].href || "").toLowerCase(); } catch { continue; }
+            if (!h || h === "#" || h.startsWith("javascript:")) continue;
+            if (/\.iso(?:\?|#|$|\/)|\/iso\/\d|archlinux-|ubuntu-\d|debian-\d|\.torrent\b|magnet:\?|sha256sums|b2sums|releng\/|\/mirrors?\//i.test(h)) {
+              dlShape++;
+              if (/\.iso|\/iso\//i.test(h)) isoShape++;
+              if (/mirror|mirrors|iso\//i.test(h)) mirrorShape++;
+            } else if (/download|安装包|客户端|\.exe|\.zip|\.dmg|\.apk|\.msi/i.test(h)) {
+              dlShape++;
+            }
+            if (/^https?:\/\//i.test(h)) {
+              try {
+                if (!h.includes((location.hostname || "").toLowerCase())) external++;
+              } catch { /* ignore */ }
+            }
+          }
+        }
+      } catch { /* ignore */ }
+
+      // 镜像列表容器（Arch #download-mirrors）
+      let mirrorListAnchors = 0;
+      try {
+        mirrorListAnchors = document.querySelectorAll(
+          "#download-mirrors a[href], #download-mirrors li a, .mirrorlist a[href], "
+          + "[id*='mirror'] a[href], [class*='mirror'] a[href], [id*='download-mirror'] a[href]"
+        ).length;
+      } catch { mirrorListAnchors = 0; }
+
+      const hit = (
+        mirrorListAnchors >= 30
+        || (total >= 100 && dlShape >= 20)
+        || (total >= 80 && isoShape >= 10)
+        || (total >= 150 && external >= 50 && dlShape >= 8)
+        || (isoShape >= 15)
+        || (mirrorShape >= 20)
+        || (total >= 200 && dlShape >= 12)
+      );
+
+      c._highDensityDl = !!hit;
+      c._highDensityDlAt = now;
+      return !!hit;
     } catch { return false; }
   };
 
@@ -540,55 +662,101 @@
    */
   NS.pageLooksLikeOsDistroIsoDownload = function () {
     try {
+      const c = NS.caches || {};
+      const now = Date.now();
+      if (c._osDistroIso != null && now - (c._osDistroIsoAt || 0) < 5000) return !!c._osDistroIso;
+
+      // 先走廉价高密度下载列表（Arch 全球镜像页几百条 a）
+      if (typeof NS.pageLooksLikeHighDensityDownloadList === "function" && NS.pageLooksLikeHighDensityDownloadList()) {
+        const t = document.title || "";
+        const host = (location.hostname || "").toLowerCase();
+        if (/arch\s*linux|ubuntu|debian|fedora|centos|manjaro|linux|iso|镜像|发行版/i.test(t)
+          || /archlinux|ubuntu|debian|fedora|centos|manjaro/i.test(host)
+          || document.getElementById("download-mirrors")
+          || document.getElementById("arch-downloads")) {
+          c._osDistroIso = true; c._osDistroIsoAt = now; return true;
+        }
+      }
+
       const title = (document.title || "").trim();
       const host = (location.hostname || "").toLowerCase();
       const path = (location.pathname || "").toLowerCase();
       // 仿冒「XX 客户端官方下载」壳不按发行版放过
-      if (/官方客户端|官方正版|电脑版官网|立即免费下载|\.exe|客户端下载/i.test(title)) return false;
+      if (/官方客户端|官方正版|电脑版官网|立即免费下载|\.exe|客户端下载/i.test(title)) {
+        c._osDistroIso = false; c._osDistroIsoAt = now; return false;
+      }
+      // 限量 HTML，避免超大镜像页整页正则
       const html = typeof NS.getHtmlSlice === "function"
-        ? NS.getHtmlSlice(50000)
-        : String((document.documentElement && document.documentElement.innerHTML) || "").slice(0, 50000);
-      const blob = `${title} ${html.slice(0, 12000)}`;
+        ? NS.getHtmlSlice(24000)
+        : String((document.documentElement && document.documentElement.innerHTML) || "").slice(0, 24000);
+      const blob = `${title} ${html.slice(0, 8000)}`;
       const isoHits = (html.match(/\.iso(?:\?|"|'|\s|>|\/|#|$)/gi) || []).length;
       const magnet = /magnet:\?xt=urn:btih:/i.test(html);
       const torrent = /\.torrent\b|bittorrent|磁力链接|种子文件/i.test(html);
       const checksum = /sha256sums|b2sums|sha256\s*:|blake2b|pgp\s*签名|gpg\s*--verify|校验和/i.test(html);
-      const mirrors = /(?:mirror\.|mirrors\.|镜像站|镜像列表|mirrorlist|geo\.mirror|fastly\.mirror)/i.test(html)
+      const mirrors = /(?:mirror\.|mirrors\.|镜像站|镜像列表|mirrorlist|geo\.mirror|fastly\.mirror|download-mirrors)/i.test(html)
         || (html.match(/\/iso\/\d{4}\.\d{2}/gi) || []).length >= 3;
       const distroName = /arch\s*linux|ubuntu|debian|fedora|centos|rocky\s*linux|alma\s*linux|manjaro|gentoo|open\s*suse|opensuse|linux\s*mint|kali\s*linux|endeavouros|archlinux/i.test(blob);
       const distroHost = /archlinux|ubuntu|debian|fedoraproject|centos|rockylinux|almalinux|manjaro|opensuse|linuxmint|kali|archlinux\.org/i.test(host);
       const distroIsoName = /archlinux-\d{4}\.\d{2}\.\d{2}|ubuntu-\d{2}\.\d{2}(?:\.\d+)?|debian-\d+|Fedora-Workstation|CentOS-Stream/i.test(html);
       const pathDl = /\/(?:download|downloads|iso|get|releng)(?:\/|$)/i.test(path);
+      let hit = false;
       if ((distroName || distroHost || distroIsoName) && (isoHits >= 1 || magnet || torrent)
         && (checksum || mirrors || isoHits >= 2 || (pathDl && (magnet || torrent || isoHits >= 1)))) {
-        return true;
-      }
-      // 大量 ISO 镜像列表（无「官网客户端」话术）
-      if (isoHits >= 2 && (checksum || mirrors) && /linux|iso|发行版|安装映像|installation\s*image/i.test(blob)
+        hit = true;
+      } else if (isoHits >= 2 && (checksum || mirrors) && /linux|iso|发行版|安装映像|installation\s*image/i.test(blob)
         && !/官方客户端|官方正版|立即免费下载/i.test(title)) {
-        return true;
+        hit = true;
       }
-      return false;
+      c._osDistroIso = hit; c._osDistroIsoAt = now;
+      return hit;
     } catch { return false; }
   };
 
   /**
-   * 高密度软件/游戏版本归档站（MCAPKS 类：大表 + 海量 APK/zip）。
+   * 高密度软件/游戏版本归档站（MCAPKS 类：大表 + 海量 APK/zip）或海量镜像下载列表。
    * 主线程易被 MutationObserver 全量复扫卡死，应走轻量路径。
    */
   NS.pageLooksLikeHighVolumePackageArchive = function () {
     try {
+      const c = NS.caches || {};
+      const now = Date.now();
+      if (c._highVolArchive != null && now - (c._highVolArchiveAt || 0) < 5000) return !!c._highVolArchive;
+
+      // 海量可点下载（ISO 镜像 / 多源列表）→ 按高密度归档处理，整页跳过重扫
+      if (typeof NS.pageLooksLikeHighDensityDownloadList === "function" && NS.pageLooksLikeHighDensityDownloadList()) {
+        c._highVolArchive = true; c._highVolArchiveAt = now; return true;
+      }
+      if (typeof NS.pageLooksLikeOsDistroIsoDownload === "function" && NS.pageLooksLikeOsDistroIsoDownload()) {
+        c._highVolArchive = true; c._highVolArchiveAt = now; return true;
+      }
+
       const title = document.title || "";
-      // 仿冒「官网/官方下载」壳不按归档站放过
-      if (/官网|官方下载|官方正版|官方网站|官方客户端|电脑版官网/i.test(title)) return false;
+      // 仿冒「官网/官方下载」壳不按归档站放过（发行版 title 含「下载」仍可放行）
+      if (/官网|官方下载|官方正版|官方网站|官方客户端|电脑版官网/i.test(title)
+        && !/iso|镜像|发行版|Arch\s*Linux|Ubuntu|Debian/i.test(title)) {
+        c._highVolArchive = false; c._highVolArchiveAt = now; return false;
+      }
       let pkgAnchors = 0;
       try {
-        pkgAnchors = document.querySelectorAll(
-          'a[href*=".apk" i], a[href*=".zip" i], a[href*=".exe" i], a[href*=".dmg" i], a[href*=".msi" i], a[href*=".xapk" i]'
-        ).length;
+        // 限量：querySelectorAll 全量在超大页上仍贵，优先用 links 采样
+        const links = document.links;
+        const n = links ? Math.min(links.length, 200) : 0;
+        if (n) {
+          for (let i = 0; i < n; i++) {
+            const h = String(links[i].getAttribute("href") || "").toLowerCase();
+            if (/\.(?:apk|zip|exe|dmg|msi|xapk)(?:\?|#|$)/i.test(h)) {
+              pkgAnchors++;
+              if (pkgAnchors >= 40) break;
+            }
+          }
+        } else {
+          pkgAnchors = document.querySelectorAll(
+            'a[href*=".apk"], a[href*=".zip"], a[href*=".exe"], a[href*=".dmg"], a[href*=".msi"]'
+          ).length;
+        }
       } catch {
         try {
-          // 部分浏览器不支持 attr i 标志
           pkgAnchors = document.querySelectorAll('a[href*=".apk"], a[href*=".zip"], a[href*=".exe"], a[href*=".dmg"], a[href*=".msi"]').length;
         } catch { pkgAnchors = 0; }
       }
@@ -596,12 +764,14 @@
         try { return document.querySelectorAll("table tbody tr, table#table-version tr, #table-version tbody tr, .version-list .version-item").length; } catch { return 0; }
       })();
       const headHint = `${title} ${document.querySelector("h1,h5,.navbar-brand")?.textContent || ""}`.slice(0, 200);
-      const archiveTitle = /版本|全版本|资源|合集|国际版|安卓|apk|archive|下载站|资源网|安装包列表/i.test(headHint);
-      if (pkgAnchors >= 40) return true;
-      if (pkgAnchors >= 15 && archiveTitle) return true;
-      if (tableRows >= 25 && archiveTitle) return true;
-      if (tableRows >= 40 && /下载|版本|version/i.test(headHint)) return true;
-      return false;
+      const archiveTitle = /版本|全版本|资源|合集|国际版|安卓|apk|archive|下载站|资源网|安装包列表|镜像|iso/i.test(headHint);
+      let hit = false;
+      if (pkgAnchors >= 40) hit = true;
+      else if (pkgAnchors >= 15 && archiveTitle) hit = true;
+      else if (tableRows >= 25 && archiveTitle) hit = true;
+      else if (tableRows >= 40 && /下载|版本|version/i.test(headHint)) hit = true;
+      c._highVolArchive = hit; c._highVolArchiveAt = now;
+      return hit;
     } catch { return false; }
   };
 
@@ -610,6 +780,11 @@
     if (state.downloadGuardInstalled || state.remoteDownloadDispatchDetected) return false;
     if (state._fakeSpaDetected || state._brandSpoofPortalDetected || state._seoCloakKitDetected) return false;
     if (NS.pageLooksLikeSearchEngineResultsPage()) { state._perfBenign = true; state._perfBenignAt = Date.now(); return true; }
+    // 天气/资讯内容门户（可有附属 APK 广告）→ benign
+    if (typeof NS.pageLooksLikeContentInfoPortal === "function" && NS.pageLooksLikeContentInfoPortal()) {
+      state._perfBenign = true; state._perfBenignAt = Date.now();
+      return true;
+    }
     // 大型内容 SPA 结构（无仿冒下载话术）→ benign，供 soft-nav 保持 light
     if (typeof NS.pageLooksLikeHeavyContentSpa === "function" && NS.pageLooksLikeHeavyContentSpa()) {
       state._perfBenign = true; state._perfBenignAt = Date.now();
@@ -617,8 +792,10 @@
     }
     if (NS.looksLikeUltraMatureIcpDomain() || state._intelLightMode) { state._perfBenign = true; state._perfBenignAt = Date.now(); return true; }
     if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) { state._perfBenign = true; state._perfBenignAt = Date.now(); return true; }
-    // 高密度归档站：不走「有包链就非 benign」逻辑，避免无限重扫
-    if (typeof NS.pageLooksLikeHighVolumePackageArchive === "function" && NS.pageLooksLikeHighVolumePackageArchive()) {
+    // 高密度归档 / 海量镜像下载：不走「有包链就非 benign」逻辑，避免无限重扫
+    if ((typeof NS.pageLooksLikeHighDensityDownloadList === "function" && NS.pageLooksLikeHighDensityDownloadList())
+      || (typeof NS.pageLooksLikeOsDistroIsoDownload === "function" && NS.pageLooksLikeOsDistroIsoDownload())
+      || (typeof NS.pageLooksLikeHighVolumePackageArchive === "function" && NS.pageLooksLikeHighVolumePackageArchive())) {
       state._perfBenign = true; state._perfBenignAt = Date.now();
       return true;
     }
@@ -659,8 +836,10 @@
       });
     } catch { /* ignore */ }
     if (hreflessDl >= 1 && /官网|官方下载/i.test(title)) return false;
-    if (packageLinkCount >= 1 || opaqueHopCount >= 1) return false;
-    if (downloadBtns >= 3 && /官网|官方下载|立即下载|杀毒|客户端|远程/i.test(title)) return false;
+    // 内容门户上的附属 APK/推广下载不取消 benign（天气 APP 二维码等）
+    const contentPortal = typeof NS.pageLooksLikeContentInfoPortal === "function" && NS.pageLooksLikeContentInfoPortal();
+    if (!contentPortal && (packageLinkCount >= 1 || opaqueHopCount >= 1)) return false;
+    if (downloadBtns >= 3 && /官网|官方下载|立即下载|杀毒|客户端|远程/i.test(title) && !contentPortal) return false;
     if (downloadBtns >= 6 && ctx.visibleTextLength < 2500) return false;
     const structureNodes = document.querySelectorAll('main, article, nav, [role="main"], [role="navigation"], [role="feed"], header, footer').length;
     const hasRichStructure = structureNodes >= 2 || ctx.visibleLinks > 40;

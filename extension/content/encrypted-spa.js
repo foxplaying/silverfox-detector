@@ -69,7 +69,17 @@
             return;
           }
           NS.invalidateHtmlCache();
-          if (state._analysisDone && !state.downloadGuardInstalled) state._analysisDone = false;
+          // 有效 ICP / 同主机已完成分析：禁止把 complete 打回 false（DOM/CSS 晚到会卡 popup）
+          try {
+            const icpOk = typeof NS.hasValidIcpRecord === "function" && NS.hasValidIcpRecord();
+            const sticky = !!(state._stickyComplete && state._stickyCompleteHost
+              && state._stickyCompleteHost === String(location.hostname || "").toLowerCase().replace(/^www\./, ""));
+            if (state._analysisDone && !state.downloadGuardInstalled && !icpOk && !sticky) {
+              state._analysisDone = false;
+            }
+          } catch {
+            if (state._analysisDone && !state.downloadGuardInstalled) state._analysisDone = false;
+          }
           if (NS.runDetector("FakeOfficialDownloadSpa#late", NS.detectFakeOfficialDownloadSpa)) {
             state._fakeSpaDetected = true;
             state._pendingEncryptedSpa = false;

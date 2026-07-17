@@ -79,8 +79,9 @@
     }
 
     /**
-     * 大型内容应用壳：节点/链接密集且无仿冒下载话术 → light + 还原原型。
-     * 避免 GitHub 类 SPA 上 setAttribute wrap 拖死主线程。
+     * 大型内容应用壳 / 多平台正品下载目录 → light + 还原原型。
+     * 避免 GitHub/firefox.com 等站上 appendChild wrap 出现在 CSP 控制台堆栈
+     * （upgrade-insecure-requests in report-only 等页面自身警告被误归因到扩展）。
      */
     _installBenignSpaLightPromote() {
       const policy = this.policy;
@@ -92,16 +93,26 @@
           const alreadyLight = !!(policy.officialSafe || policy.lightPage);
           const heavy = typeof PageContext.pageLooksLikeHeavyContentAppShell === "function"
             && PageContext.pageLooksLikeHeavyContentAppShell();
-          if (!alreadyLight && !heavy) return;
-          if (heavy) policy.lightPage = true;
+          const catalog = typeof PageContext.pageLooksLikeMultiPlatformProductDownloadCatalog === "function"
+            && PageContext.pageLooksLikeMultiPlatformProductDownloadCatalog();
+          if (!alreadyLight && !heavy && !catalog) return;
+          if (heavy || catalog) policy.lightPage = true;
           try { DomGuard.restoreNativeDomProtos(restoreList); } catch { /* ignore */ }
           done = true;
         } catch { /* ignore */ }
       };
       try {
-        [0, 50, 150, 400, 1000, 2500].forEach((ms) => { setTimeout(promote, ms); });
+        // 更密的早期采样：CSP meta/script 常在首屏 insert，需尽快拆 wrap
+        [0, 16, 50, 100, 200, 400, 800, 1500, 3000].forEach((ms) => { setTimeout(promote, ms); });
+        try {
+          if (typeof requestAnimationFrame === "function") {
+            requestAnimationFrame(() => { try { promote(); } catch { /* ignore */ } });
+          }
+        } catch { /* ignore */ }
         if (document.readyState === "loading") {
           document.addEventListener("DOMContentLoaded", promote, { once: true });
+        } else {
+          promote();
         }
         document.addEventListener("readystatechange", () => {
           if (document.readyState === "interactive" || document.readyState === "complete") promote();
@@ -358,11 +369,51 @@
 
     _installContentBridge() {
       const policy = this.policy;
+      const applySetGuard = (enabled) => {
+        if (policy.officialSafe && enabled) {
+          policy.guardEnabled = false;
+          try { if (window.__silverfoxNavApi && typeof window.__silverfoxNavApi.setGuard === "function") window.__silverfoxNavApi.setGuard(false); } catch { /* ignore */ }
+          DownloadUi.restoreAllDownloadButtonsInPage();
+          return;
+        }
+        policy.guardEnabled = !!enabled;
+        try { if (window.__silverfoxNavApi && typeof window.__silverfoxNavApi.setGuard === "function") window.__silverfoxNavApi.setGuard(policy.guardEnabled); } catch { /* ignore */ }
+        policy.syncNavBoot();
+        if (policy.guardEnabled) {
+          DownloadUi.disableAllDownloadButtonsInPage();
+          try { DomGuard.scrubHostileLoadingOverlaysMain(); } catch { /* ignore */ }
+          try { DomGuard.scrubDesktopForceDownloadDom(); } catch { /* ignore */ }
+          [50, 200, 500, 1200, 3000].forEach((ms) => setTimeout(() => {
+            DownloadUi.disableAllDownloadButtonsInPage();
+            try { DomGuard.scrubHostileLoadingOverlaysMain(); } catch { /* ignore */ }
+          }, ms));
+          try {
+            if (!window.__silverfoxGuardMo && typeof MutationObserver !== "undefined") {
+              window.__silverfoxGuardMo = new MutationObserver(() => {
+                if (!policy.guardEnabled) return;
+                DownloadUi.disableAllDownloadButtonsInPage();
+                try { DomGuard.scrubHostileLoadingOverlaysMain(); } catch { /* ignore */ }
+              });
+              window.__silverfoxGuardMo.observe(document.documentElement || document.body, { childList: true, subtree: true });
+              // 持续观察更久：加载遮罩常在 几秒后才插入
+              setTimeout(() => { try { if (window.__silverfoxGuardMo) { window.__silverfoxGuardMo.disconnect(); window.__silverfoxGuardMo = null; } } catch { /* ignore */ } }, 60000);
+            }
+          } catch { /* ignore */ }
+        } else {
+          try { if (window.__silverfoxGuardMo) { window.__silverfoxGuardMo.disconnect(); window.__silverfoxGuardMo = null; } } catch { /* ignore */ }
+          DownloadUi.restoreAllDownloadButtonsInPage();
+          [50, 200, 600].forEach((ms) => setTimeout(DownloadUi.restoreAllDownloadButtonsInPage, ms));
+        }
+      };
       window.addEventListener("message", (event) => {
-        if (event.source !== window) return;
         const data = event.data;
         if (!data || data.source !== CONTENT_SOURCE) return;
+        // 本 frame 的 content 脚本，或顶层下发的 fromTop 广播（iframe 内下载拦截）
+        const fromSelf = event.source === window;
+        const fromTop = !!(data.fromTop && event.source && event.source !== window);
+        if (!fromSelf && !fromTop) return;
         if (data.type === "set-official-safe" || data.type === "set-light-page") {
+          if (!fromSelf) return; // 仅本 frame content 可改 light/safe
           if (data.type === "set-official-safe") policy.officialSafe = !!data.enabled;
           if (data.type === "set-light-page" && data.enabled) policy.lightPage = true;
           if (policy.officialSafe) {
@@ -376,33 +427,7 @@
           return;
         }
         if (data.type === "set-guard") {
-          if (policy.officialSafe && data.enabled) {
-            policy.guardEnabled = false;
-            try { if (window.__silverfoxNavApi && typeof window.__silverfoxNavApi.setGuard === "function") window.__silverfoxNavApi.setGuard(false); } catch { /* ignore */ }
-            DownloadUi.restoreAllDownloadButtonsInPage();
-            return;
-          }
-          policy.guardEnabled = !!data.enabled;
-          try { if (window.__silverfoxNavApi && typeof window.__silverfoxNavApi.setGuard === "function") window.__silverfoxNavApi.setGuard(policy.guardEnabled); } catch { /* ignore */ }
-          policy.syncNavBoot();
-          if (policy.guardEnabled) {
-            DownloadUi.disableAllDownloadButtonsInPage();
-            [50, 200, 500, 1200, 3000].forEach((ms) => setTimeout(DownloadUi.disableAllDownloadButtonsInPage, ms));
-            try {
-              if (!window.__silverfoxGuardMo && typeof MutationObserver !== "undefined") {
-                window.__silverfoxGuardMo = new MutationObserver(() => {
-                  if (!policy.guardEnabled) return;
-                  DownloadUi.disableAllDownloadButtonsInPage();
-                });
-                window.__silverfoxGuardMo.observe(document.documentElement || document.body, { childList: true, subtree: true });
-                setTimeout(() => { try { if (window.__silverfoxGuardMo) { window.__silverfoxGuardMo.disconnect(); window.__silverfoxGuardMo = null; } } catch { /* ignore */ } }, 15000);
-              }
-            } catch { /* ignore */ }
-          } else {
-            try { if (window.__silverfoxGuardMo) { window.__silverfoxGuardMo.disconnect(); window.__silverfoxGuardMo = null; } } catch { /* ignore */ }
-            DownloadUi.restoreAllDownloadButtonsInPage();
-            [50, 200, 600].forEach((ms) => setTimeout(DownloadUi.restoreAllDownloadButtonsInPage, ms));
-          }
+          applySetGuard(!!data.enabled);
         }
       });
     }

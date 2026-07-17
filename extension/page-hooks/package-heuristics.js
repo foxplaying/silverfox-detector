@@ -182,12 +182,20 @@
       return false;
     }
 
-    /** 内容寻址哈希包名（应用商店 CDN：MD5/SHA stem） */
+    /**
+     * 内容寻址哈希包名（应用商店 / CDN）：
+     * 纯 MD5/SHA；或 资源号_哈希（105065437_ecfe3287…bc97.exe）
+     */
     static isContentAddressedPackageName(fileName) {
       const name = PackageHeuristics.normalizeFileName(fileName);
       if (!name || !PACKAGE_NAME.test(name)) return false;
       const base = name.replace(/\.[^.]+$/, "");
-      return /^[a-f0-9]{16,64}$/i.test(base);
+      if (!base || base.length > 120) return false;
+      if (/^[a-f0-9]{16,64}$/i.test(base)) return true;
+      if (/^\d{4,20}[._-][a-f0-9]{16,64}$/i.test(base)) return true;
+      if (/^[a-f0-9]{16,64}[._-]\d{4,20}$/i.test(base)) return true;
+      if (/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(base)) return true;
+      return false;
     }
 
     static isSuspiciousPackageFilename(fileName) {

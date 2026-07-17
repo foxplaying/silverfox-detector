@@ -85,7 +85,10 @@
             name = String(h || "").split("?")[0].split("/").pop() || "";
           }
           const base = name.replace(/\.[^.]+$/, "");
-          if (/^[a-f0-9]{16,64}$/i.test(base) && !hostileStrong) return false;
+          // 内容寻址：纯 hex / 资源号_哈希（如 105065437_ecfe…bc97.exe）
+          if ((/^[a-f0-9]{16,64}$/i.test(base)
+            || /^\d{4,20}[._-][a-f0-9]{16,64}$/i.test(base)
+            || /^[a-f0-9]{16,64}[._-]\d{4,20}$/i.test(base)) && !hostileStrong) return false;
         } catch { /* ignore */ }
         return true;
       }

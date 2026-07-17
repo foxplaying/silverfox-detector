@@ -8,7 +8,7 @@
   /**
    * 大型内容 SPA 结构启发（无域名白名单）。
    * 用于同站 soft-nav 跳过全量复扫：DOM 巨大 + 无「官网下载」仿冒壳话术。
-   * GitHub / GitLab / 文档站等自然命中；银狐落地页通常节点少且标题含官方下载。
+   * GitHub / GitLab / 文档站 / 天气门户等自然命中；银狐落地页通常节点少且标题含官方下载。
    */
   NS.pageLooksLikeHeavyContentSpa = function () {
     try {
@@ -17,13 +17,16 @@
         || state._brandSpoofPortalDetected || state._desktopForceDlKit || state._remoteGarbleDlDetected
         || state._fakeBrandShellDetected)) return false;
       const title = String(document.title || "");
-      // 仿冒下载壳话术 → 必须继续扫
-      if (/官网|官方下载|官方正版|官方网站|官方客户端|电脑版官网|立即免费下载|全平台官方/i.test(title)) return false;
+      // 仿冒下载壳话术（软件安装包落地）→ 必须继续扫；天气/资讯标题里的「查询」不算
+      if (/官方客户端|官方正版|电脑版官网|立即免费下载|全平台官方/i.test(title)) return false;
+      if (/(?:软件|杀毒|远程|连接|桌面)[^。]{0,8}(?:官网|官方下载)/i.test(title)
+        || /(?:官网|官方下载)[^。]{0,8}(?:软件|杀毒|远程|客户端|安装包)/i.test(title)) return false;
       let nodes = 0; let links = 0; let scripts = 0;
       try { nodes = document.getElementsByTagName("*").length; } catch { nodes = 0; }
       try { links = document.links ? document.links.length : document.querySelectorAll("a[href]").length; } catch { links = 0; }
       try { scripts = document.scripts ? document.scripts.length : 0; } catch { scripts = 0; }
-      // 大型应用壳：节点/链接/脚本密度高
+      // 大型应用壳：节点/链接/脚本密度高（天气/资讯门户）
+      if (nodes >= 900 && links >= 25 && scripts >= 8) return true;
       if (nodes >= 1200 && links >= 30) return true;
       if (nodes >= 800 && links >= 40 && scripts >= 6) return true;
       if (nodes >= 2000) return true;
@@ -32,15 +35,54 @@
   };
 
   /**
+   * 资讯/天气/内容门户（非软件下载落地）：应 light + 立即 complete。
+   * 例：tianqi.2345.com 广州天气预报——有附属 APK/广告，但不是银狐 exe 壳。
+   */
+  NS.pageLooksLikeContentInfoPortal = function () {
+    try {
+      const state = NS.state;
+      if (state && (state.downloadGuardInstalled || state._seoCloakKitDetected || state._fakeSpaDetected
+        || state._brandSpoofPortalDetected || state._desktopForceDlKit || state._remoteGarbleDlDetected)) return false;
+      const title = String(document.title || "");
+      const kw = String(document.querySelector('meta[name="keywords"]')?.getAttribute("content") || "");
+      const desc = String(document.querySelector('meta[name="description"]')?.getAttribute("content") || "");
+      const blob = `${title} ${kw} ${desc}`.slice(0, 800);
+      // 强软件下载落地话术 → 否
+      if (/官方客户端|官方正版|电脑版官网|立即免费下载|远程控制|杀毒软件官网/i.test(blob)) return false;
+      const contentTopic = /天气|预报|新闻|资讯|财经|股票|体育|娱乐|视频|小说|论坛|地图|出行|旅游|美食|健康|教育|汽车|房产|天气查询|空气质量|紫外线|降水|风力|温度/i.test(blob);
+      if (!contentTopic) return false;
+      let nodes = 0; let links = 0; let scripts = 0;
+      try { nodes = document.getElementsByTagName("*").length; } catch { nodes = 0; }
+      try { links = document.links ? document.links.length : 0; } catch { links = 0; }
+      try { scripts = document.scripts ? document.scripts.length : 0; } catch { scripts = 0; }
+      // 有实质内容结构
+      if (nodes >= 400 && links >= 15) return true;
+      if (nodes >= 250 && scripts >= 8 && links >= 10) return true;
+      if (contentTopic && links >= 20 && scripts >= 5) return true;
+      return false;
+    } catch { return false; }
+  };
+
+  /**
    * 同站 soft-nav 是否应保持 light、跳过 reset+全量复扫（纯状态/结构逻辑，非域名名单）。
+   * 用户规则：有有效 ICP 备案的域名只做首次全量分析；SPA/页内变换后除非手动刷新不再复扫。
    */
   NS.shouldKeepLightOnSameHostSoftNav = function () {
     try {
       const state = NS.state;
       if (!state) return false;
-      if (state.downloadGuardInstalled || state._seoCloakKitDetected || state._fakeSpaDetected
-        || state._brandSpoofPortalDetected || state._desktopForceDlKit || state._remoteGarbleDlDetected
-        || state._fakeBrandShellDetected || state._indexNowPhishTemplate) return false;
+      // 真硬套件仍允许在 soft-nav 上复扫
+      if (state._seoCloakKitDetected || state._desktopForceDlKit || state._remoteGarbleDlDetected
+        || state._indexNowPhishTemplate) return false;
+      if (typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat()) return false;
+      // ★ 有效 ICP：同站变换不再全量复扫（含标题带「官网」的备案门户 SPA）
+      if (typeof NS.hasValidIcpRecord === "function" && NS.hasValidIcpRecord()) {
+        // 仿冒/guard 已 arm 时也不清结果反复扫，保持 light 即可
+        return true;
+      }
+      if (state.downloadGuardInstalled || state._fakeSpaDetected
+        || state._brandSpoofPortalDetected || state._fakeBrandShellDetected) return false;
+      // 无 ICP 时：仿冒下载壳标题仍全量扫
       if (/官网|官方下载|官方正版|官方客户端|立即免费下载/i.test(document.title || "")) return false;
       if (state._intelLightMode || state._perfBenign) return true;
       if (state._analysisDone && (state.score || 0) < 12) return true;
