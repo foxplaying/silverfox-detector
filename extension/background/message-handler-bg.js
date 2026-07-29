@@ -120,6 +120,36 @@
     return true;
   }
 
+  function sameReportHost(a, b) {
+    try {
+      const left = new URL(a || "").hostname.toLowerCase().replace(/^www\./, "");
+      const right = new URL(b || "").hostname.toLowerCase().replace(/^www\./, "");
+      return !!(left && right && left === right);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 刷新/重扫刚启动时会先产生 analysisComplete:false 的空白报告。
+   * 同一主机已有完成结论时，保留旧结论直到本轮扫描真正完成，避免 UI 在
+   * 「严重风险 → 低风险 → 严重风险」之间闪动。
+   */
+  NS.mergeThreatRiskReport = function (previous, incoming) {
+    if (!incoming || incoming.analysisComplete !== false) return incoming;
+    if (!previous || previous.analysisComplete !== true || !sameReportHost(previous.url, incoming.url)) return incoming;
+    return {
+      ...incoming,
+      ...previous,
+      url: incoming.url || previous.url,
+      tabId: incoming.tabId ?? previous.tabId ?? null,
+      timestamp: incoming.timestamp || previous.timestamp || Date.now(),
+      analysisComplete: true,
+      icpInfo: incoming.icpInfo || previous.icpInfo || "",
+      whoisInfo: incoming.whoisInfo || previous.whoisInfo || ""
+    };
+  };
+
   /** 注册 chrome.runtime.onMessage 监听。 */
   NS.installMessageHandler = function () {
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -163,60 +193,52 @@
           const tabId = sender.tab?.id ?? null;
           let riskLevel = msg.riskLevel || "low";
           if ((msg.downloadGuardInstalled || msg.packageBlocked) && riskLevel === "low") riskLevel = msg.packageBlocked ? "high" : "medium";
-          let badgeText = ""; let badgeColor = "#2e7d32";
-          if (riskLevel === "high") { badgeText = "!"; badgeColor = "#d93025"; }
-          else if (riskLevel === "medium") { badgeText = "!"; badgeColor = "#f59e0b"; }
-          else if ((msg.score || 0) > 0) { badgeText = "·"; badgeColor = "#f59e0b"; }
-          const cleanReport = !msg.downloadGuardInstalled && !msg.packageBlocked && !(Array.isArray(msg.protectedTargets) && msg.protectedTargets.length > 0) && (riskLevel === "low") && (Number(msg.score) || 0) < 12;
+          const cleanReport = msg.analysisComplete !== false
+            && !msg.downloadGuardInstalled && !msg.packageBlocked
+            && !(Array.isArray(msg.protectedTargets) && msg.protectedTargets.length > 0)
+            && (riskLevel === "low") && (Number(msg.score) || 0) < 12;
           if (tabId != null && cleanReport) {
-            chrome.storage.local.get(["latestNotice"], (r) => { if (r.latestNotice && (r.latestNotice.tabId == null || r.latestNotice.tabId === tabId)) chrome.storage.local.remove(["latestNotice"], () => { void chrome.runtime.lastError; }); });
+            const reportAt = Date.now();
+            chrome.storage.local.get(["latestNotice"], (r) => {
+              if (r.latestNotice
+                && (r.latestNotice.tabId == null || r.latestNotice.tabId === tabId)
+                && (Number(r.latestNotice.timestamp) || 0) <= reportAt) {
+                chrome.storage.local.remove(["latestNotice"], () => { void chrome.runtime.lastError; });
+              }
+            });
           }
           const storeRisk = (stamped) => {
+            const storedLevel = stamped.riskLevel || "low";
+            let badgeText = ""; let badgeColor = "#2e7d32";
+            if (storedLevel === "high") { badgeText = "!"; badgeColor = "#d93025"; }
+            else if (storedLevel === "medium") { badgeText = "!"; badgeColor = "#f59e0b"; }
+            else if ((stamped.score || 0) > 0) { badgeText = "·"; badgeColor = "#f59e0b"; }
             if (tabId != null) {
               NS.safeSetBadge(tabId, badgeText, badgeColor);
-              chrome.storage.local.set({ [`risk_${tabId}`]: stamped }, () => { if (chrome.runtime.lastError) console.warn("background: store risk_tab failed", chrome.runtime.lastError.message); });
-              chrome.storage.local.set({ risk_latest: stamped }, () => { if (chrome.runtime.lastError) console.warn("background: store risk_latest failed", chrome.runtime.lastError.message); });
+              chrome.storage.local.set({ [`risk_${tabId}`]: stamped, risk_latest: stamped }, () => {
+                if (chrome.runtime.lastError) console.warn("background: store risk report failed", chrome.runtime.lastError.message);
+              });
             } else {
               chrome.storage.local.set({ risk_latest: stamped }, () => { if (chrome.runtime.lastError) console.warn("background: store risk_latest failed", chrome.runtime.lastError.message); });
             }
           };
-          const stamped = { ...msg, url: msg.url || sender.tab?.url || "", tabId, riskLevel };
+          const stamped = { ...msg, url: msg.url || sender.tab?.url || "", tabId, riskLevel, timestamp: Number(msg.timestamp) || Date.now() };
           // 同主机：incomplete 合并进已 complete，禁止盖成「正在分析」
           if (tabId != null && msg.analysisComplete === false) {
+            NS._riskReportSeqByTab ??= new Map();
+            const seq = (NS._riskReportSeqByTab.get(tabId) || 0) + 1;
+            NS._riskReportSeqByTab.set(tabId, seq);
             chrome.storage.local.get([`risk_${tabId}`], (r) => {
-              try {
-                const prev = r && r[`risk_${tabId}`];
-                if (prev && (prev.analysisComplete === true || typeof prev.score === "number")) {
-                  let sameHost = false;
-                  try {
-                    const a = new URL(prev.url || "").hostname.replace(/^www\./, "");
-                    const b = new URL(stamped.url || "").hostname.replace(/^www\./, "");
-                    sameHost = !!(a && b && a === b);
-                  } catch { sameHost = false; }
-                  if (sameHost) {
-                    storeRisk({
-                      ...prev,
-                      ...stamped,
-                      url: stamped.url || prev.url,
-                      tabId,
-                      analysisComplete: true,
-                      score: typeof stamped.score === "number" ? stamped.score : prev.score,
-                      riskLevel: stamped.riskLevel || prev.riskLevel,
-                      icpInfo: stamped.icpInfo || prev.icpInfo,
-                      whoisInfo: stamped.whoisInfo || prev.whoisInfo,
-                      details: (Array.isArray(stamped.details) && stamped.details.length) ? stamped.details : prev.details
-                    });
-                    return;
-                  }
-                }
-              } catch { /* fall through */ }
-              // 无 prev 时：有 score 也标 complete，避免只剩「正在分析」
-              if (typeof stamped.score === "number" && stamped.riskLevel) {
-                stamped.analysisComplete = true;
-              }
-              storeRisk(stamped);
+              // 较新的报告已经到达时，丢弃这个异步回调，避免旧中间态反向覆盖。
+              if (NS._riskReportSeqByTab.get(tabId) !== seq) return;
+              const prev = r && r[`risk_${tabId}`];
+              storeRisk(NS.mergeThreatRiskReport(prev, stamped));
             });
           } else {
+            if (tabId != null) {
+              NS._riskReportSeqByTab ??= new Map();
+              NS._riskReportSeqByTab.set(tabId, (NS._riskReportSeqByTab.get(tabId) || 0) + 1);
+            }
             storeRisk(stamped);
           }
         } catch (e) { console.warn("background: error handling threat-risk", e && e.message ? e.message : e); }
@@ -275,7 +297,7 @@
           NS.safeSetBadge(tabId, "!", "#d93025");
           NS.withExistingTab(tabId, () => { try { chrome.action.setTitle({ tabId, title: `${title}: ${message}` }, () => { void chrome.runtime.lastError; }); } catch { /* ignore */ } });
         }
-        chrome.storage.local.set({ latestNotice: { title, message, tabId, url: sender.tab?.url || msg.url || "", timestamp: Date.now() } });
+        chrome.storage.local.set({ latestNotice: { title, message, tabId, url: sender.tab?.url || msg.url || "", timestamp: Date.now(), guardKind: msg.guardKind || (isIdentityNotice ? "identity" : "package") } });
         // 仿冒/跳转身份类：始终 force，避免 40min 冷却吞掉右下角系统通知
         const forceNotice = !!msg.force || isIdentityNotice;
         NS.showBlockedNotification(title, message, tabId, forceNotice).then((ok) => { try { sendResponse({ success: !!ok }); } catch { /* ignore */ } }).catch(() => { try { sendResponse({ success: false }); } catch { /* ignore */ } });

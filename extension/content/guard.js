@@ -73,7 +73,7 @@
     const userAction = !!opts.userAction || !!opts.forceNotify;
     const isIdentityNotice = opts.guardKind === "brand-spoof" || opts.guardKind === "nav-trap" || /仿冒|官网|域名|跳转|搜索引擎/i.test(`${title} ${message}`);
     try {
-      if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) return;
+      if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) return false;
       if (!isIdentityNotice) {
         const fn = href ? NS.getFilenameFromUrl(href) : "";
         const msgFn = NS.normalizeFileName(String(message || "").split(/[\s/\\]/).pop() || "");
@@ -81,7 +81,7 @@
           if (!name || !PACKAGE_NAME.test(name)) return false;
           return NS.isClearProductOrAndroidPackage(name) || NS.looksLikeStrongProductInstallerName(name) || NS.isBenignShortInstallerName(name) || (NS.looksLikeProductPackageName(name) && !NS.looksLikeOversimplifiedBrandInstallerName(name));
         };
-        if (isClearProductFile(fn) || isClearProductFile(msgFn)) return;
+        if (isClearProductFile(fn) || isClearProductFile(msgFn)) return false;
       }
     } catch { /* fall through */ }
     const c = NS.caches;
@@ -120,6 +120,130 @@
       }
     }
     if (opts.toast !== false) NS.showPageToast(title, message, { force: userAction || !!opts.forceNotify || isIdentityNotice });
+    if (opts.guardKind === "brand-spoof") {
+      state._brandSpoofNoticeSent = true;
+      state._brandSpoofNoticeKey = `${title}::${message}`;
+    }
+    return true;
+  };
+
+  /**
+   * 用完整身份字段纠正早期写入 spoofBrand 的临时候选。
+   * 排名依据仍是 collectPrimaryBrandKeywords 的集体票；这里只比较候选证据强度，
+   * 不从正文、资源文件或主机旁路重新发明品牌。
+   */
+  NS.reconcileActiveSpoofBrand = function ({ force = false } = {}) {
+    try {
+      const state = NS.state;
+      const current = String(state.spoofBrand || "").trim();
+      const active = !!(state._brandSpoofPortalDetected || current
+        || (state.details || []).some((d) => /仿冒品牌官网/i.test(d.name || "")));
+      if (!active || typeof NS.collectPrimaryBrandKeywords !== "function") return current;
+      const ready = typeof document === "undefined"
+        || document.readyState !== "loading"
+        || !!state._analysisDone;
+      if (!ready && !force) return current;
+
+      const now = Date.now();
+      if (!force && now - Number(state._spoofBrandReconciledAt || 0) < 750) return current;
+      state._spoofBrandReconciledAt = now;
+      // document_start 可能缓存未完成 DOM；最终身份校正必须重新采样。
+      if (NS.caches) {
+        NS.caches._primaryKw = null;
+        NS.caches._primaryKwAt = 0;
+        NS.caches._primaryKwUrl = "";
+      }
+      const pk = NS.collectPrimaryBrandKeywords();
+      let candidate = String((pk && pk.display) || "").trim();
+      if (candidate && typeof NS.normalizeDisplayBrandName === "function") {
+        candidate = NS.normalizeDisplayBrandName(candidate) || candidate;
+      }
+      if (!candidate) return current;
+      if (typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(candidate)) return current;
+      if (typeof NS.looksLikeAssetGarbageToken === "function" && NS.looksLikeAssetGarbageToken(candidate)) return current;
+
+      const keyOf = (raw) => String(raw || "").toLowerCase().replace(/[^a-z0-9一-鿿]/gi, "");
+      const findEvidence = (raw) => {
+        const key = keyOf(raw);
+        if (!key || !pk || !pk.scores) return { sources: [], votes: 0 };
+        for (const [name, info] of Object.entries(pk.scores)) {
+          if (keyOf(name) !== key) continue;
+          return {
+            sources: Array.isArray(info && info.sources) ? info.sources : [],
+            votes: Number((info && (info.votes || info.score)) || 0)
+          };
+        }
+        return { sources: [], votes: 0 };
+      };
+      const rankEvidence = (ev) => {
+        const primary = (ev.sources || []).filter((s) => /^(?:title|h1|ogTitle|twitterTitle|ogSite|schema|domain)$/.test(s)).length;
+        return { primary, rank: primary * 100 + (ev.votes || ev.sources.length) * 10 };
+      };
+      const candidateEvidence = findEvidence(candidate);
+      const candidateRank = rankEvidence(candidateEvidence);
+      // 至少一个主身份字段，或三个独立字段共识；辅助副标不能单独纠正品牌。
+      if (candidateRank.primary < 1 && candidateEvidence.sources.length < 3) return current;
+      const currentRank = rankEvidence(findEvidence(current));
+      if (current && keyOf(current) === keyOf(candidate)) return current;
+      if (current && currentRank.rank >= candidateRank.rank) return current;
+
+      state.spoofBrand = candidate;
+      state._brandSpoofNoticeSent = false;
+      state._brandSpoofNoticeKey = "";
+      try {
+        (state.details || []).forEach((d) => {
+          if (!d || !/仿冒品牌官网/i.test(d.name || "") || !d.reason || !current) return;
+          d.reason = String(d.reason).split(`「${current}」`).join(`「${candidate}」`);
+        });
+      } catch { /* ignore */ }
+      return candidate;
+    } catch {
+      return String((NS.state && NS.state.spoofBrand) || "").trim();
+    }
+  };
+
+  /**
+   * 报告已确认品牌仿冒时补发一次品牌通知。
+   * 防止“信号已入报告，但 guard 先被其他身份规则占用”导致 Popup 有结论、页面不弹。
+   */
+  NS.ensureBrandSpoofNotice = function (trustedPortal = false) {
+    try {
+      const state = NS.state;
+      const active = !trustedPortal && !!(state._brandSpoofPortalDetected || state.spoofBrand
+        || (state.details || []).some((d) => /仿冒品牌官网/i.test(d.name || "")));
+      if (!active) return false;
+      const brand = String(NS.reconcileActiveSpoofBrand() || state.spoofBrand || "").trim();
+      if (!brand) return false;
+      const title = `已识别仿冒「${brand}」官网`;
+      const message = `页面标题/正文品牌「${brand}」与当前域名不匹配，疑似仿冒官网。`;
+      const key = `${title}::${message}`;
+      if (state._brandSpoofNoticeSent && state._brandSpoofNoticeKey === key) return false;
+      return NS.showGuardOverlay("", {
+        title,
+        message,
+        toast: true,
+        forceNotify: true,
+        guardKind: "brand-spoof"
+      }) === true;
+    } catch {
+      return false;
+    }
+  };
+
+  NS.resolveReportRiskLevel = function ({
+    trustedPortal = false,
+    remoteDownloadDispatchDetected = false,
+    hasPackageThreat = false,
+    downloadGuardInstalled = false,
+    score = 0,
+    signalCount = 0
+  } = {}) {
+    if (!trustedPortal && (remoteDownloadDispatchDetected || (hasPackageThreat && score >= 24))) return "high";
+    // 高分组合必须先于「≥12 分即中度」判断，否则 40 分永远只能落到 medium。
+    if (score >= 40 && signalCount >= 3) return "high";
+    if (!trustedPortal && (hasPackageThreat || downloadGuardInstalled || (score >= 12 && signalCount >= 2))) return "medium";
+    if (score >= 18 && signalCount >= 2) return "medium";
+    return "low";
   };
 
   NS.emitRiskReport = function (force = false) {
@@ -156,14 +280,18 @@
     const trustedPortal = (typeof NS.shouldNeverArmProtection === "function" && NS.shouldNeverArmProtection())
       || (typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature())
       || NS.hasValidIcpRecord();
+    try { NS.ensureBrandSpoofNotice(trustedPortal); } catch { /* ignore */ }
     const packageBlockedLive = !trustedPortal && !!(state.downloadGuardInstalled || state.remoteDownloadDispatchDetected);
     const hasPackageThreat = packageBlockedLive
       || (!trustedPortal && threatDetails.some((d) => /安装包|下载拦截|仿冒|可疑下载|远程配置|PHP 下载/i.test(d.name || "")));
-    let riskLevel = "low";
-    if (!trustedPortal && (state.remoteDownloadDispatchDetected || (hasPackageThreat && state.score >= 24))) riskLevel = "high";
-    else if (!trustedPortal && (hasPackageThreat || state.downloadGuardInstalled || (state.score >= 12 && signalCount >= 2))) riskLevel = "medium";
-    else if (state.score >= 40 && signalCount >= 3) riskLevel = "high";
-    else if (state.score >= 18 && signalCount >= 2) riskLevel = "medium";
+    const riskLevel = NS.resolveReportRiskLevel({
+      trustedPortal,
+      remoteDownloadDispatchDetected: !!state.remoteDownloadDispatchDetected,
+      hasPackageThreat,
+      downloadGuardInstalled: !!state.downloadGuardInstalled,
+      score: state.score,
+      signalCount
+    });
     let score = Math.min(100, state.score);
     if (!trustedPortal && state.downloadGuardInstalled && score < 16) score = Math.max(score, 16);
     if (!trustedPortal && state.remoteDownloadDispatchDetected && score < 28) score = Math.max(score, 28);
@@ -346,6 +474,7 @@
         || state._desktopForceDlKit
         || state._remoteGarbleDlDetected
         || state._indexNowPhishTemplate
+        || state._unverifiedIcpIdentityThreat
         || state._multiPlatformSerpTrap
         || state._fakeSpaDetected
         || state._fakeBrandShellDetected
@@ -546,6 +675,8 @@
     state.downloadGuardInstalled = false;
     state._earlyShellArmed = false;
     state.protectionNoticeSent = false;
+    state._brandSpoofNoticeSent = false;
+    state._brandSpoofNoticeKey = "";
     state.remoteDownloadDispatchDetected = false;
     state.protectedTargets = [];
     state._guardRedisableArmed = false;
@@ -763,6 +894,20 @@
   NS.installDownloadGuard = function (reason = "检测到可疑安装包下载，已启用文件拦截保护", opts = {}) {
     const state = NS.state;
     const o = opts || {};
+    if (o.guardKind === "brand-spoof") {
+      try {
+        const correctedBrand = String(NS.reconcileActiveSpoofBrand({ force: true }) || "").trim();
+        if (correctedBrand) {
+          o.title = `已识别仿冒「${correctedBrand}」官网`;
+          if (!o.message || /页面标题|品牌.*不匹配|疑似仿冒官网/i.test(String(o.message))) {
+            o.message = `页面标题/正文品牌「${correctedBrand}」与当前域名不匹配，疑似仿冒官网。`;
+          }
+          if (/仿冒品牌官网|仿冒「/i.test(String(reason))) {
+            reason = `仿冒品牌官网下载站（仿冒「${correctedBrand}」）`;
+          }
+        }
+      } catch { /* ignore */ }
+    }
     NS.silverfoxLog("guard-arm?", "reason=", String(reason || "").slice(0, 120), "kind=", o.guardKind || "package", "title=", o.title || "");
     // 先按 ICP/WHOIS 成熟度拦软 arm（勿先 noteHard 把软原因写硬）
     const realHardPre = typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat();
@@ -864,7 +1009,9 @@
         } catch { /* ignore */ }
       }, ms);
     });
-    if (guardKind === "brand-spoof") NS.addSignal("已启用仿冒站下载拦截", 10, reason);
+    // 身份异常拦截是处置动作，不再作为额外证据写入列表或重复加分。
+    if (guardKind === "site-identity") { /* action only */ }
+    else if (guardKind === "brand-spoof") NS.addSignal("已启用仿冒站下载拦截", 10, reason);
     else if (guardKind === "nav-trap") NS.addSignal("已启用异常跳转拦截", 10, reason);
     else NS.addSignal("已启用安装包下载拦截", 12, reason);
     const shouldNotify = o.notify !== false && (firstTime || o.forceNotify || !state.protectionNoticeSent || guardKind === "brand-spoof" || guardKind === "nav-trap");
@@ -872,7 +1019,11 @@
       state.protectionNoticeSent = true;
       const href = o.href || "";
       const label = o.message || (href && NS.isPackageFileUrl(href) ? NS.formatPackageLabel(href) : "") || reason || "可疑下载行为";
-      const noticeTitle = o.title || (guardKind === "brand-spoof" ? "已识别仿冒品牌官网" : guardKind === "nav-trap" ? "已拦截异常下载跳转" : "已拦截可疑安装包");
+      const noticeTitle = o.title || (guardKind === "brand-spoof"
+        ? "已识别仿冒品牌官网"
+        : guardKind === "site-identity"
+          ? "已拦截身份异常网站下载"
+          : guardKind === "nav-trap" ? "已拦截异常下载跳转" : "已拦截可疑安装包");
       NS.showGuardOverlay(href, { title: noticeTitle, message: label, toast: true, forceNotify: !!o.forceNotify || firstTime || guardKind === "brand-spoof" || guardKind === "nav-trap", userAction: !!o.userAction, guardKind });
     }
     const redisable = () => {

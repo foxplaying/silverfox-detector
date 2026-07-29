@@ -103,6 +103,201 @@
     } catch { return null; }
   };
 
+  // 工信部备案号使用省级行政区简称；固定行政编码集合不是厂商/域名白名单。
+  const ICP_REGION_CHAR_CLASS = "京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼";
+
+  /** 归一页面/API 备案号，消除空格、「号」和大小写差异。 */
+  NS.normalizeIcpLicense = function (raw) {
+    try {
+      const text = String(raw || "")
+        .toUpperCase()
+        .replace(/\s+/g, "")
+        .replace(/号(?=-|$)/g, "");
+      const hit = text.match(new RegExp(`[${ICP_REGION_CHAR_CLASS}]ICP[备證证][A-Z0-9\\-]{5,24}`, "i"));
+      if (!hit) return "";
+      return String(hit[0] || "")
+        .replace(/[證证]/g, "证")
+        .toUpperCase();
+    } catch { return ""; }
+  };
+
+  /** 备案主体号相同即视为一致；网站序号 -1/-2 的差异不算冒用。 */
+  NS.icpLicensesReferToSameRecord = function (a, b) {
+    const left = typeof NS.normalizeIcpLicense === "function" ? NS.normalizeIcpLicense(a) : "";
+    const right = typeof NS.normalizeIcpLicense === "function" ? NS.normalizeIcpLicense(b) : "";
+    if (!left || !right) return false;
+    if (left === right) return true;
+    return left.replace(/-\d+$/g, "") === right.replace(/-\d+$/g, "");
+  };
+
+  /**
+   * 只从页脚/版权/备案链接提取页面自称备案号。
+   * 不扫正文，避免新闻或教程中提到其它备案号造成误报。
+   */
+  NS.extractPageDeclaredIcpLicenses = function () {
+    const out = [];
+    const seen = new Set();
+    const addFromText = (raw) => {
+      const text = String(raw || "");
+      const hits = text.match(new RegExp(
+        `[${ICP_REGION_CHAR_CLASS}]ICP[备證证]\\s*[A-Za-z0-9\\-]{5,24}(?:号)?(?:-\\d+)?`,
+        "gi"
+      )) || [];
+      hits.forEach((hit) => {
+        const normalized = NS.normalizeIcpLicense(hit);
+        if (!normalized || seen.has(normalized)) return;
+        seen.add(normalized);
+        out.push(normalized);
+      });
+    };
+    try {
+      document.querySelectorAll(
+        "footer, .footer, #footer, [class*='footer'], [class*='copyright'], [id*='copyright'], "
+        + "[class*='beian'], [id*='beian'], [class*='icp'], [id*='icp'], "
+        + "a[href*='beian.miit.gov.cn'], a[href*='miit.gov.cn']"
+      ).forEach((el) => {
+        try { addFromText(el.innerText || el.textContent || ""); } catch { /* ignore */ }
+      });
+    } catch { /* ignore */ }
+    // 无结构化页脚时，仅检查 body 尾部的版权/备案行。
+    if (!out.length) {
+      try {
+        const tail = String((document.body && (document.body.innerText || document.body.textContent)) || "").slice(-3000);
+        if (/ICP备案|ICP证|备案号|版权所有|Copyright|©/i.test(tail)) addFromText(tail);
+      } catch { /* ignore */ }
+    }
+    return out;
+  };
+
+  NS.evaluatePageIcpConsistency = function (remoteRecord, remoteMissing, declaredOpt) {
+    const declared = Array.isArray(declaredOpt)
+      ? declaredOpt.map((x) => NS.normalizeIcpLicense(x)).filter(Boolean)
+      : NS.extractPageDeclaredIcpLicenses();
+    const remote = NS.normalizeIcpLicense(remoteRecord);
+    const matches = !!(remote && declared.some((x) => NS.icpLicensesReferToSameRecord(remote, x)));
+    return {
+      remote,
+      declared: [...new Set(declared)],
+      remoteFound: !!remote,
+      remoteMissing: !!remoteMissing && !remote,
+      matches,
+      mismatch: !!(remote && declared.length && !matches),
+      unverifiedClaim: !!(!remote && remoteMissing && declared.length)
+    };
+  };
+
+  NS.UNVERIFIED_PAGE_ICP_CLAIM_WEIGHT = 25;
+
+  /** 记录页面备案一致性；仅“权威源明确未备案 + 页面自称备案”加风险。 */
+  NS.reconcilePageIcpClaim = function (remoteRecord, remoteMissing, declaredOpt) {
+    const check = NS.evaluatePageIcpConsistency(remoteRecord, remoteMissing, declaredOpt);
+    const state = NS.state;
+    state.pageDeclaredIcp = check.declared.join(" / ");
+    state._icpPageMismatch = check.mismatch;
+    state._unverifiedPageIcpClaim = check.unverifiedClaim;
+    if (check.unverifiedClaim && typeof NS.addSignal === "function") {
+      const declaredLabel = check.declared.join(" / ");
+      NS.addSignal(
+        `假冒ICP备案信息：${declaredLabel}`,
+        NS.UNVERIFIED_PAGE_ICP_CLAIM_WEIGHT,
+        `权威备案查询未发现当前域名记录，但页面页脚声明 ${declaredLabel}`
+      );
+    }
+    return check;
+  };
+
+  /**
+   * 不维护品牌名单，直接使用三项独立证据：
+   * 1) 权威备案源明确无记录；2) 页面仍声明备案号；3) WHOIS 注册不足 30 天。
+   */
+  NS.isHighConfidenceUnverifiedIcpThreat = function (check, ageDaysOpt) {
+    const ageDays = ageDaysOpt == null ? NS.getWhoisAgeDays() : Number(ageDaysOpt);
+    return !!(check && check.unverifiedClaim && check.remoteMissing
+      && Number.isFinite(ageDays) && ageDays >= 0 && ageDays < 30);
+  };
+
+  /**
+   * 首轮扫描可能发生在 DOM 尚未补齐品牌字段时，并短暂缓存“无主品牌”。
+   * 假备案确认后清掉该缓存并重算一次；若域名是页面品牌的单字符拼写仿冒，
+   * 直接升级为品牌仿冒拦截，避免仅显示“身份异常”而没有品牌弹窗。
+   */
+  NS.promoteUnverifiedIcpTypoToBrandSpoof = function () {
+    try {
+      const state = NS.state;
+      if (NS.caches) {
+        NS.caches._primaryKw = null;
+        NS.caches._primaryKwAt = 0;
+        NS.caches._primaryKwUrl = "";
+      }
+      if (typeof NS.evaluateDomainKeywordRelevance !== "function") return false;
+      const host = String(location.hostname || "").toLowerCase();
+      const rel = NS.evaluateDomainKeywordRelevance(host);
+      if (!rel || !rel.squat || rel.hostMatch !== "typo") return false;
+      let brand = String(rel.brand || (rel.primary && rel.primary.display) || "").trim();
+      if (brand && typeof NS.normalizeDisplayBrandName === "function") {
+        brand = NS.normalizeDisplayBrandName(brand) || brand;
+      }
+      if (!brand) return false;
+
+      const expected = String(rel.brandToken || "").trim();
+      state.spoofBrand = brand;
+      state._brandSpoofPortalDetected = true;
+      state._pendingSoftBrandSpoof = false;
+      if (typeof NS.addSignal === "function") {
+        NS.addSignal(
+          "仿冒品牌官网下载站",
+          24,
+          `页面品牌「${brand}」对应域名核 ${expected || "与页面品牌一致的拼写"}，当前域名 ${host} 为单字符拼写仿冒`
+        );
+      }
+      if (typeof NS.installDownloadGuard === "function") {
+        NS.installDownloadGuard(`域名 ${host} 疑似拼写仿冒「${brand}」官网`, {
+          notify: true,
+          title: `已识别仿冒「${brand}」官网`,
+          message: `页面标题/正文品牌「${brand}」与当前域名不匹配，疑似仿冒官网。`,
+          guardKind: "brand-spoof",
+          forceNotify: true,
+          lockHard: true
+        });
+      }
+      try {
+        if (typeof NS.ensureBrandSpoofNotice === "function") NS.ensureBrandSpoofNotice(false);
+      } catch { /* ignore */ }
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  NS.enforceUnverifiedPageIcpDownloadBlock = function (check, ageDaysOpt) {
+    const state = NS.state;
+    const highConfidence = NS.isHighConfidenceUnverifiedIcpThreat(check, ageDaysOpt);
+    state._unverifiedIcpIdentityThreat = highConfidence;
+    if (!highConfidence) return false;
+    if (NS.promoteUnverifiedIcpTypoToBrandSpoof()) {
+      try { NS.disableAllDownloadIntentControls(); } catch { /* ignore */ }
+      return true;
+    }
+    if (state.downloadGuardInstalled) {
+      try { NS.disableAllDownloadIntentControls(); } catch { /* ignore */ }
+      return true;
+    }
+    const host = String(location.hostname || "当前域名").toLowerCase();
+    const declared = (check.declared || []).join(" / ") || state.pageDeclaredIcp || "未知备案号";
+    if (typeof NS.installDownloadGuard === "function") {
+      NS.installDownloadGuard("新注册域名冒用ICP备案号，已拦截页面下载入口", {
+        notify: true,
+        title: "已拦截身份异常网站下载",
+        message: `域名 ${host} 未查询到备案记录，但页面声明 ${declared}`,
+        guardKind: "site-identity",
+        forceNotify: true,
+        lockHard: true
+      });
+    }
+    try { if (typeof NS.disableAllDownloadIntentControls === "function") NS.disableAllDownloadIntentControls(); } catch { /* ignore */ }
+    return true;
+  };
+
   NS.hasValidIcpRecord = function () {
     try {
       const s = String(NS.state.icpInfo || "").trim();
@@ -247,6 +442,8 @@
     const hardLocked = typeof NS.hasHardThreatKitLocked === "function" && NS.hasHardThreatKitLocked();
     state._brandSpoofPortalDetected = false;
     state.spoofBrand = "";
+    state._brandSpoofNoticeSent = false;
+    state._brandSpoofNoticeKey = "";
     state._pendingSoftBrandSpoof = false;
     try { NS.dismissPageToast(); } catch { /* ignore */ }
     try {
