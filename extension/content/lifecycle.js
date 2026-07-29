@@ -74,6 +74,8 @@
     state.visibleLinks = 0; state.visibleTextLength = 0; state.visibleElements = 0;
     state.remoteDownloadDispatchDetected = false; state.downloadGuardInstalled = false;
     state.protectedTargets = []; state.protectionNoticeSent = false; state.spoofBrand = "";
+    state._brandSpoofNoticeSent = false; state._brandSpoofNoticeKey = "";
+    state._spoofBrandReconciledAt = 0;
     state.contextCache = null; state.contextCacheAt = 0;
     state._perfBenign = false; state._perfBenignAt = 0;
     state._intelLightMode = false; state._serpLightNotified = false;
@@ -89,6 +91,10 @@
       state.icpInfo = "";
       state.whoisInfo = "";
       state.icpMatchedHost = "";
+      state.pageDeclaredIcp = "";
+      state._icpPageMismatch = false;
+      state._unverifiedPageIcpClaim = false;
+      state._unverifiedIcpIdentityThreat = false;
     }
     state._pageBootAt = Date.now(); state._pendingEncryptedSpa = false; state._encryptedSpaRescanArmed = false;
     state._scanBusy = false; state._lastFastScanAt = 0;
@@ -540,17 +546,32 @@
       const matched = icpCheck.matchedHost || icpCheck.queriedHost || pageHost;
       if (record && !NS.intelHostIsValidAttribution(matched, pageHost)) record = "";
       const missing = !record && (icpCheck.icpMissing || !icpCheck.icpRecord);
+      const pageIcp = typeof NS.reconcilePageIcpClaim === "function"
+        ? NS.reconcilePageIcpClaim(record, missing)
+        : { declared: [], mismatch: false, unverifiedClaim: false };
       state.icpMatchedHost = record ? NS.normalizeDomain(matched || pageHost) : "";
       const tried = Array.isArray(icpCheck.triedHosts) ? icpCheck.triedHosts : [];
-      state.icpInfo = record ? (matched && matched !== pageHost ? `${record}（主域 ${matched}）` : record) : (missing ? "未查询到备案信息" : "");
+      const recordLabel = record && matched && matched !== pageHost ? `${record}（主域 ${matched}）` : record;
+      state.icpInfo = record
+        ? (pageIcp.mismatch
+          ? `${recordLabel}（页面展示 ${pageIcp.declared.join(" / ")}，按未更新处理）`
+          : recordLabel)
+        : (missing ? "未查询到备案信息" : "");
       state._icpQuerySettled = true; state._icpQueryFailed = false;
       NS.silverfoxLog("intel-icp", record ? "valid" : (missing ? "missing" : "empty"), String(state.icpInfo || "").slice(0, 80), "host=", pageHost);
       const ageDays = NS.getWhoisAgeDays();
       const skipMissingIcp = state._perfBenign || state._intelLightMode || NS.isBenignContentPage() || (ageDays != null && ageDays >= 365) || NS.looksLikeUltraMatureWhoisDomain() || NS.looksLikeLongLivedWhoisDomain();
-      if (missing && !skipMissingIcp) {
+      // 页面已展示无法核验的备案号时，用「假冒ICP备案信息：备案号」替代普通
+      // 「无ICP备案信息」，避免同一事实重复展示和重复计分。
+      if (missing && !skipMissingIcp && !pageIcp.unverifiedClaim) {
         const whoisNote = whois.queriedHost && whois.queriedHost !== pageHost ? `，WHOIS 经 ${whois.queriedHost}` : "";
         const triedNote = tried.length ? `，ICP 候选 ${tried.join(" -> ")}` : "";
         NS.addSignal("无ICP备案信息", 6, `当前域名 ${location.hostname}${whoisNote}${triedNote} 未查询到备案信息`);
+      }
+      // 高置信身份欺诈组合：新注册域名 + 权威源确认未备案 + 页脚自称备案。
+      // 这不是单纯加分，必须同步禁用/拦截本页下载入口。
+      if (typeof NS.enforceUnverifiedPageIcpDownloadBlock === "function") {
+        NS.enforceUnverifiedPageIcpDownloadBlock(pageIcp, ageDays);
       }
       // 真硬套件（SEO/强制弹窗/乱码）即使有 ICP 也不得 officialSafe
       const realHard = typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat();
@@ -558,7 +579,11 @@
       if (!realHard && (NS.hasValidIcpRecord() || (ageDays != null && ageDays >= 3650) || NS.looksLikeUltraMatureWhoisDomain())) {
         try {
           if (typeof NS.forceLiftSoftProtectionForTrustedPortal === "function") {
-            NS.forceLiftSoftProtectionForTrustedPortal(NS.hasValidIcpRecord() ? "valid-icp-force-lift" : "whois-ultra-force-lift");
+            NS.forceLiftSoftProtectionForTrustedPortal(
+              NS.hasValidIcpRecord()
+                ? (pageIcp.mismatch ? "valid-icp-page-stale-force-lift" : "valid-icp-force-lift")
+                : "whois-ultra-force-lift"
+            );
           } else {
             NS.clearBrandSpoofFalsePositive("valid-icp");
             state.remoteDownloadDispatchDetected = false;

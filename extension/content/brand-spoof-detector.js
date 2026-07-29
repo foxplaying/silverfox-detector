@@ -670,7 +670,7 @@
       state._brandSpoofPortalDetected = true;
       const noticeTitle = showBrand ? `已识别仿冒「${showBrand}」官网` : "已识别仿冒品牌官网";
       const noticeMsg = showBrand
-        ? `域名 ${location.hostname} 与标题品牌「${showBrand}」不匹配，疑似仿冒官网下载站`
+        ? `页面标题/正文品牌「${showBrand}」与当前域名不匹配，疑似仿冒官网。`
         : `域名 ${location.hostname} 与页面宣称品牌不匹配，疑似仿冒官网下载站`;
       const lockHardNow = titleHostCorr.hostMatch !== "padded"
         || !!(landingShell && (landingShell.hardShell || landingShell.hasHub));

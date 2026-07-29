@@ -45,15 +45,9 @@
       if (!data) return null;
       const tabId = this.activeTabId;
       const completed = this.isCompletedReport(data);
-      if (completed && data.analysisComplete !== false) {
+      if (completed) {
         if (tabId != null) this._lastCompletedByTab.set(tabId, { ...data, url: data.url || tabUrl, analysisComplete: true });
         return { ...data, analysisComplete: true };
-      }
-      if (completed && data.analysisComplete === false) {
-        // 有分数可展示：强制当 complete，并缓存
-        const fixed = { ...data, analysisComplete: true };
-        if (tabId != null) this._lastCompletedByTab.set(tabId, fixed);
-        return fixed;
       }
       const prev = tabId != null ? this._lastCompletedByTab.get(tabId) : null;
       if (!prev || !this.isCompletedReport(prev)) return data;
@@ -61,14 +55,11 @@
       const hPrev = this.hostKeyFromUrl(prev.url || tabUrl);
       if (hNew && hPrev && hNew === hPrev) {
         return {
-          ...prev,
           ...data,
+          ...prev,
           analysisComplete: true,
-          score: typeof data.score === "number" ? data.score : prev.score,
-          riskLevel: data.riskLevel || prev.riskLevel,
           icpInfo: data.icpInfo || prev.icpInfo,
           whoisInfo: data.whoisInfo || prev.whoisInfo,
-          details: (Array.isArray(data.details) && data.details.length) ? data.details : prev.details,
           url: tabUrl || data.url || prev.url
         };
       }
@@ -107,15 +98,20 @@
     /** 报告是否已完成扫描（或轻量路径）。 */
     isCompletedReport(data) {
       if (!data || typeof data !== "object") return false;
+      if (data.analysisComplete === false) return false;
       if (data.analysisComplete === true) return true;
-      // 只要带了评分+风险等级就展示结果，禁止 analysisComplete:false 把 UI 打回「正在分析」
-      // （WHOIS/ICP 回调常在 ~1s 后误发 incomplete）
+      // 兼容旧版未携带 analysisComplete 的已完成报告。
       if (typeof data.score === "number" && data.riskLevel) return true;
       if (data.type === "threat-risk" && typeof data.score === "number") return true;
       if (data.downloadGuardInstalled || data.packageBlocked || data.brandSpoofPortal || data.spoofBrand) return true;
       if (Array.isArray(data.details) && data.details.length > 0) return true;
       if (data.icpInfo || data.whoisInfo) return true;
       return false;
+    }
+
+    identityRiskFromData(data) {
+      const details = Array.isArray(data?.details) ? data.details : [];
+      return details.find((d) => /假冒ICP备案信息|页面冒用ICP备案号|备案信息无法核验|域名备案身份异常/i.test(`${d?.name || ""} ${d?.reason || ""}`)) || null;
     }
 
     /** 报告自身声明包保护仍 armed。 */
@@ -243,6 +239,7 @@
       const brandSpoof = !!(matchedData?.brandSpoofPortal || brandName);
       const detailsEarly = Array.isArray(matchedData?.details) ? matchedData.details : [];
       const multiSerp = detailsEarly.some((d) => /多平台下载指向搜索引擎/i.test(d.name || ""));
+      const identityRisk = this.identityRiskFromData(matchedData);
 
       if (brandSpoof) {
         this.root.appendChild(this.el("div", "high", brandName && brandName !== "品牌" ? `已识别仿冒「${brandName}」官网` : "已识别仿冒品牌官网下载站"));
@@ -252,16 +249,16 @@
       } else if (multiSerp) {
         this.root.appendChild(this.el("div", "high", "已拦截异常下载跳转"));
         this.root.appendChild(this.el("div", "item", "多平台下载入口统一跳转搜索引擎，不是真实安装包。"));
-      } else if (showNotice && !this.looksLikeSearchOrNonPackageTarget(latestNotice.message)) {
+      } else if (!identityRisk && showNotice && !this.looksLikeSearchOrNonPackageTarget(latestNotice.message)) {
         this.root.appendChild(this.el("div", "high", latestNotice.title || "已拦截可疑下载文件"));
         const item = this.el("div", "item");
         item.appendChild(document.createTextNode("说明: "));
         item.appendChild(document.createTextNode(String(latestNotice.message || "可疑下载目标")));
         this.root.appendChild(item);
-      } else if (showNotice && this.looksLikeSearchOrNonPackageTarget(latestNotice.message)) {
+      } else if (!identityRisk && showNotice && this.looksLikeSearchOrNonPackageTarget(latestNotice.message)) {
         this.root.appendChild(this.el("div", "high", latestNotice.title || "已拦截异常下载跳转"));
         this.root.appendChild(this.el("div", "item", String(latestNotice.message || "异常跳转（非安装包）")));
-      } else if (protectedActive && matchedData?.protectedTargets?.some((t) => this.looksLikePackageTarget(t))) {
+      } else if (!identityRisk && protectedActive && matchedData?.protectedTargets?.some((t) => this.looksLikePackageTarget(t))) {
         const pkg = matchedData.protectedTargets.find((t) => this.looksLikePackageTarget(t));
         this.root.appendChild(this.el("div", "high", "已拦截可疑安装包"));
         const item = this.el("div", "item");
@@ -281,21 +278,7 @@
         return;
       }
       if (!completed) {
-        // 有半份数据：直接当完成展示，不再卡「正在分析」
-        const { level, title } = this.resolveRiskPresentation(matchedData, protectedActive);
-        this.root.appendChild(this.el("div", level, title));
-        this.root.appendChild(this.el("div", "item", `评分: ${matchedData.score ?? 0}`));
-        this.appendIcp(matchedData);
-        this.appendWhois(matchedData);
-        if (details.length === 0 && !protectedActive) {
-          this.root.appendChild(this.el("div", "item", "未检测到威胁行为信号。"));
-        } else {
-          details.forEach((d) => {
-            const line = this.el("div", "item", `- ${d.name || "信号"}`);
-            if (d.reason) line.title = String(d.reason);
-            this.root.appendChild(line);
-          });
-        }
+        this.root.appendChild(this.el("div", "item", "正在核验网站身份与下载行为…"));
         return;
       }
       const { level, title } = this.resolveRiskPresentation(matchedData, protectedActive);
@@ -305,6 +288,7 @@
       this.appendWhois(matchedData);
       if (protectedActive && this.reportHasProtection(matchedData)) {
         if (brandSpoof) this.root.appendChild(this.el("div", "item", brandName && brandName !== "品牌" ? `状态: 已按仿冒「${brandName}」官网处理，下载入口已禁用` : "状态: 已按仿冒品牌官网处理，下载入口已禁用"));
+        else if (identityRisk) this.root.appendChild(this.el("div", "item", "状态: 已按身份异常站点处理，页面下载入口已禁用"));
         else if (multiSerp) this.root.appendChild(this.el("div", "item", "状态: 异常下载跳转已拦截（非安装包）"));
         else this.root.appendChild(this.el("div", "item", "状态: 可疑安装包下载已被禁用/拦截"));
       }
@@ -346,6 +330,11 @@
               // 同主机中间态 incomplete 不打断已完成 UI（coalesce 再处理）
             } else if (!urlsMatch(msg.url, this.activeTabUrl)) return;
           }
+          // 中间态必须从后台合并后的存储读取，不能直接用空白报告覆盖已完成结论。
+          if (msg.analysisComplete === false) {
+            this.refresh(this.activeTabUrl || msg.url);
+            return;
+          }
           this.renderRisk(msg, null, this.activeTabUrl || msg.url);
           return;
         }
@@ -385,4 +374,5 @@
     if (!root) return;
     new PopupRenderer(root).init();
   });
+  if (typeof module !== "undefined" && module.exports) module.exports = { PopupRenderer, urlsMatch };
 })();

@@ -252,9 +252,14 @@
         if (voteToo && !out.voteLatin.includes(t)) out.voteLatin.push(t);
       };
       const pushDig = (s) => {
-        const d = String(s || "").replace(/[^\d]/g, "");
-        if (!/^\d{3,6}$/.test(d) || /^(?:19|20)\d{2}$/.test(d)) return;
-        if (!out.digits.includes(d)) out.digits.push(d);
+        // 只读取连续数字段，禁止把 360weishi-360 删除字母后拼成 360360。
+        const runs = String(s || "").match(/\d{3,6}/g) || [];
+        runs.forEach((d) => {
+          if (!/^\d{3,6}$/.test(d) || /^(?:19|20)\d{2}$/.test(d)) return;
+          if (typeof NS.isRepeatedNumericBrandToken === "function"
+            && NS.isRepeatedNumericBrandToken(d)) return;
+          if (!out.digits.includes(d)) out.digits.push(d);
+        });
       };
 
       const padCore = brandCore || "";
@@ -737,13 +742,20 @@
   // 仅协议/扩展名/字面量——不维护业务词黑名单；品牌取舍靠域名相关度
   const BRAND_TOKEN_STOP_RE = /^(https?|http|www|html|htm|com|net|org|css|js|png|jpg|jpeg|gif|svg|webp|json|xml|php|asp|aspx|true|false|null|undefined)$/i;
   NS.BRAND_TOKEN_STOP_RE = BRAND_TOKEN_STOP_RE;
-
   /**
    * 资源/图标/构建/CMS/版权垃圾 token（B1icon13、Cover、Reserved…）绝不当品牌。
    * Reserved 来自页脚 All Rights Reserved，曾抢占「火绒」展示名。
    */
   NS.looksLikeAssetGarbageToken = function (token) {
-    const s = String(token || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+    const raw = String(token || "").trim();
+    // 本函数只识别拉丁资源/CSS/CMS token。纯中文身份词必须交给
+    // isWeakChineseBrandToken 判断；先删中文再检查会把所有中文品牌误判为空垃圾。
+    if (/[一-鿿]/.test(raw) && !/[A-Za-z]/.test(raw)) return false;
+    const s = raw.toLowerCase().replace(/[^a-z0-9]/g, "");
+    // 混合产品名不能先删中文再按纯拉丁长度判断：QQ音乐会被误看成 qq。
+    if (/[一-鿿]/.test(raw) && /[A-Za-z]/.test(raw)) {
+      if (/^[A-Z]{2}[一-鿿]{1,8}$/.test(raw)) return false;
+    }
     if (!s || s.length < 3) return true;
     if (BRAND_TOKEN_STOP_RE.test(s)) return true;
     // 页脚版权 / 法律英语（All Rights Reserved / Copyright 2024）
@@ -944,7 +956,10 @@
     // 保留 CamelCase 整词（DingTalk）；过滤图标/资源/WP 垃圾（B1icon13、Cover）
     (String(text || "").match(/[A-Za-z][A-Za-z0-9]{2,}/g) || []).forEach((b) => {
       const low = b.toLowerCase();
-      if (low.length < 4 || low.length > 24) return;
+      // 允许全大写 3 字母缩写进入候选池；它是不是品牌由后续
+      // “强身份字段复现 + 域名相关度”决定，而不是在这里维护缩写词表。
+      const shortAcronym = b.length === 3 && /^[A-Z][A-Z0-9]{2}$/.test(b);
+      if ((!shortAcronym && low.length < 4) || low.length > 24) return;
       if (BRAND_TOKEN_STOP_RE.test(low)) return;
       if (typeof NS.looksLikeAssetGarbageToken === "function" && NS.looksLikeAssetGarbageToken(low)) return;
       // 连字符 CMS 段：ca-aurora-template → 跳过整段里的 template/aurora
@@ -1227,6 +1242,46 @@
   // 数字+中文产品形态：2345看图王 / 360安全卫士（结构正则，非词表）
   const CN_DIGIT_PRODUCT_RE = /^\d{2,6}[一-鿿]{2,6}$/;
   NS.CN_DIGIT_PRODUCT_RE = CN_DIGIT_PRODUCT_RE;
+  /** 是否两个相同三位数字核被错误粘连：360360 / 789789。 */
+  NS.isRepeatedNumericBrandToken = function (token) {
+    const s = String(token || "").replace(/[^\d]/g, "");
+    return /^\d{6}$/.test(s) && s.slice(0, 3) === s.slice(3);
+  };
+  /** 近期年份 + 文案尾串是版本/时效标签，不是数字品牌。 */
+  NS.looksLikeYearMarketingBrandToken = function (token) {
+    try {
+      const s = String(token || "").replace(/[\s_\-–—|·:：]+/g, "");
+      const m = s.match(/^((?:19|20)\d{2})(.*)$/u);
+      if (!m) return false;
+      const year = Number(m[1]);
+      const tail = String(m[2] || "").replace(/^年/u, "");
+      if (!tail) return true;
+      // 动态时间窗：无需枚举“最新/新版/特别版”等营销文案。
+      const currentYear = new Date().getFullYear();
+      return year >= currentYear - 5 && year <= currentYear + 2 && tail.length <= 12;
+    } catch { return false; }
+  };
+
+  /**
+   * 平台、架构、版本和发行渠道标签不是站点品牌。
+   * 这是有限且稳定的版本语法分类（PC版、x64版、桌面版等），不是品牌名单。
+   */
+  NS.looksLikePlatformEditionLabel = function (token) {
+    try {
+      const raw = String(token || "").trim();
+      if (!raw) return false;
+      const s = raw.replace(/[\s_\-–—|·:：/\\]+/g, "");
+      if (!s) return false;
+      if (/^(?:pc|win(?:dows)?|mac(?:os)?|linux|android|ios|iphone|ipad|web|x86|x64|arm(?:32|64)?|32bit|64bit|32位|64位)(?:端|平台)?(?:版|版本|客户端|下载)?$/i.test(s)) return true;
+      if (/^(?:电脑|桌面|手机|移动|网页|安卓|苹果|鸿蒙|通用|绿色|便携|免安装|安装|免费|正式|官方|最新|新版|旧版|专业|企业|个人|家庭|教育|国际|中文|测试|开发|稳定|会员)(?:版|版本)$/u.test(s)) return true;
+      // 短大写缩写 +「版」描述的是该缩写的发行版本；真正品牌应从其它身份字段提取。
+      if (/^[A-Z0-9]{2,8}(?:版|版本)$/u.test(s)) return true;
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
   // 兼容旧引用：无预设词表，恒为永不匹配
   const NEVER = /(?!)/;
   NS.CN_BRAND_GENERIC_RE = NEVER;
@@ -1239,6 +1294,10 @@
   NS.isPlausibleChineseBrandLength = function (token) {
     const s = String(token || "").trim();
     if (!s || s.length < 2) return false;
+    if (typeof NS.looksLikeYearMarketingBrandToken === "function"
+      && NS.looksLikeYearMarketingBrandToken(s)) return false;
+    if (typeof NS.looksLikePlatformEditionLabel === "function"
+      && NS.looksLikePlatformEditionLabel(s)) return false;
     if (CN_DIGIT_PRODUCT_RE.test(s)) return s.length >= 4 && s.length <= 12;
     if (/[A-Za-z]/.test(s) && /[一-鿿]/.test(s)) return s.length >= 3 && s.length <= 10;
     if (/^\d+$/.test(s)) return false;
@@ -1283,7 +1342,11 @@
       let t = String(name || "").trim();
       if (!t) return "";
       // 数字门户品牌原样展示
-      if (/^\d{3,6}$/.test(t) && !/^(?:19|20)\d{2}$/.test(t)) return t;
+      if (/^\d{3,6}$/.test(t) && !/^(?:19|20)\d{2}$/.test(t)) {
+        if (typeof NS.isRepeatedNumericBrandToken === "function"
+          && NS.isRepeatedNumericBrandToken(t)) return "";
+        return t;
+      }
       // 版权/法律词绝不当展示品牌（All Rights Reserved → Reserved）
       if (typeof NS.looksLikeAssetGarbageToken === "function" && NS.looksLikeAssetGarbageToken(t)) return "";
       if (/^(?:reserved|rights|copyright|all\s*rights(\s*reserved)?)$/i.test(t)) return "";
@@ -1363,6 +1426,65 @@
   };
 
   /**
+   * 音视频规格/品质卖点不是品牌。
+   * 采用“形容词 + 媒体属性”的结构判断，避免把 Hi-Res 无损音质抽成
+   * 「Res无损音质」；这里没有维护任何厂商品牌名单。
+   */
+  NS.looksLikeMediaFeatureClaimToken = function (token) {
+    try {
+      const s = String(token || "")
+        .replace(/[\s\-_/·•]+/g, "")
+        .replace(/^(?:hi|ultra|full)?(?:res|hd|uhd|hdr|hifi)/i, "")
+        .trim();
+      if (!s || !/[一-鿿]/.test(s)) return false;
+      const cn = s.replace(/[A-Za-z0-9]/g, "");
+      if (!cn) return false;
+      return /^(?:(?:超|极|至臻|高|专业|影院级|母带级)?(?:高清|超清|无损|高保真|高解析|高码率|沉浸式?|臻品|卓越|极致|纯净))+(?:音质|音效|声效|画质|品质|听感|视听|影音|体验|播放|解码)$/.test(cn)
+        || /^(?:无损|高清|超清|高保真|高解析|高码率)(?:音频|音乐|视频)$/.test(cn);
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * “技术缩写/能力标签 + 功能动作”属于功能标题，不属于站点身份。
+   * 只有具备产品品类尾缀（QQ音乐、Firefox浏览器）或拉丁部分与域名对齐时，
+   * 混合词才保留为品牌候选。该规则按语言形态工作，不依赖厂商品牌表。
+   */
+  NS.looksLikeFunctionalClaimBrandToken = function (token) {
+    try {
+      const s = String(token || "").replace(/[\s\-_/·•]+/g, "").trim();
+      if (!s || !/[一-鿿]/.test(s)) return false;
+      if (typeof NS.looksLikeMediaFeatureClaimToken === "function"
+        && NS.looksLikeMediaFeatureClaimToken(s)) return true;
+
+      const mixed = s.match(/^([A-Za-z][A-Za-z0-9]{1,11})([一-鿿]{2,10})$/);
+      const latin = mixed ? mixed[1] : "";
+      const cn = mixed ? mixed[2] : s;
+      const productSuffix = /(?:音乐|浏览器|播放器|输入法|客户端|安全卫士|杀毒软件|网盘|办公套件|助手|管家)$/;
+      if (mixed && productSuffix.test(cn)) return false;
+      if (mixed && typeof NS.candidateDomainAligned === "function"
+        && NS.candidateDomainAligned(latin) >= 1) return false;
+
+      // 编辑/推荐/生成等是动作中心语；前面的 AI、PDF、GPT 只是技术或格式限定。
+      const actionTail = /(?:编辑|推荐|生成|识别|分析|检测|搜索|翻译|创作|剪辑|修复|转换|处理|管理|优化|加速|同步|备份|清理|压缩|解压|录制|播放|下载|安装)$/;
+      if (mixed && actionTail.test(cn)) return true;
+
+      // 短大写缩写 + 三字以上非产品品类说明，默认视为能力标签；
+      // 真正与域名一致的缩写已在上方获得身份豁免。
+      if (mixed && /^[A-Z][A-Z0-9]{1,4}$/.test(latin)
+        && cn.length >= 3 && !productSuffix.test(cn)) return true;
+
+      // 纯中文功能标题通常由方式/程度修饰语开头、动作中心语收尾。
+      if (!mixed && /^(?:智能|自动|一键|在线|实时|快速|极速|精准|批量|免费|专业|高效|便捷|云端)/.test(cn)
+        && actionTail.test(cn)) return true;
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
    * 是否「不可用」中文品牌 token（结构判断，无业务词表）。
    * 挡 UI/卖点残片与站点栏目：「可访问」「技术支持」「下载中心」等绝不当仿冒展示名。
    */
@@ -1370,9 +1492,19 @@
     const s = String(token || "").trim();
     if (!s) return true;
     if (s.length < 2) return true;
+    if (typeof NS.looksLikeYearMarketingBrandToken === "function"
+      && NS.looksLikeYearMarketingBrandToken(s)) return true;
+    if (typeof NS.looksLikePlatformEditionLabel === "function"
+      && NS.looksLikePlatformEditionLabel(s)) return true;
+    if (typeof NS.looksLikeMediaFeatureClaimToken === "function"
+      && NS.looksLikeMediaFeatureClaimToken(s)) return true;
+    if (typeof NS.looksLikeFunctionalClaimBrandToken === "function"
+      && NS.looksLikeFunctionalClaimBrandToken(s)) return true;
     // 纯数字：年份弱；3–6 位门户数字品牌（4399/360/2345）放行
     if (/^\d+$/.test(s)) {
       if (/^(?:19|20)\d{2}$/.test(s)) return true;
+      if (typeof NS.isRepeatedNumericBrandToken === "function"
+        && NS.isRepeatedNumericBrandToken(s)) return true;
       if (/^\d{3,6}$/.test(s)) return false;
       return true;
     }
@@ -1418,7 +1550,15 @@
     const s = String(token || "").trim();
     if (!s || s.length < 2) return false;
     if (NS.CN_DIGIT_PRODUCT_RE && NS.CN_DIGIT_PRODUCT_RE.test(s)) return true;
-    if (/[A-Za-z]/.test(s) && /[一-鿿]/.test(s) && s.length >= 3) return true;
+    if (/[A-Za-z]/.test(s) && /[一-鿿]/.test(s) && s.length >= 3) {
+      if (typeof NS.looksLikeFunctionalClaimBrandToken === "function"
+        && NS.looksLikeFunctionalClaimBrandToken(s)) return false;
+      const mixed = s.replace(/[\s\-_/·•]+/g, "").match(/^([A-Za-z][A-Za-z0-9]{1,20})([一-鿿]{1,10})$/);
+      if (!mixed) return false;
+      if (/(?:音乐|浏览器|播放器|输入法|客户端|安全卫士|杀毒软件|网盘|办公套件|助手|管家)$/.test(mixed[2])) return true;
+      return typeof NS.candidateDomainAligned === "function"
+        && NS.candidateDomainAligned(mixed[1]) >= 1;
+    }
     // 专名 + 品类后缀（火绒安全 / 360安全卫士）
     if (/[一-鿿]{2,}(?:浏览器|客户端|播放器|输入法|安全卫士|安全|杀毒|卫士|管家|助手|音乐|网盘|办公)$/.test(s)
       && !/^(?:安全|杀毒|卫士)$/.test(s)) return true;
@@ -2037,22 +2177,22 @@
         );
       };
 
-      // 0) ★ 页内等权中文/混合产品（QQ音乐）永远优先于主机拉丁碎片（Yinle）
+      // 0) collectPrimaryBrandKeywords 已完成跨字段、强字段和域名证据总榜；
+      // 展示层必须服从其 display，不能再用“中文优先”等旁路改写冠军。
+      {
+        const dDisp = clean(kw.display);
+        if (dDisp) return dDisp;
+      }
+
+      // 0b) 总榜无可用展示名时，才回退到中文/数字候选。
       if (kw.cn && kw.cn.length) {
         for (let i = 0; i < kw.cn.length; i++) {
           const cn = String(kw.cn[i] || "").trim();
           if (!cn) continue;
-          // 优先含中文的产品名
-          if (!/[一-鿿]/.test(cn) && !/^\d{3,6}/.test(cn)) continue;
           const d0 = clean(cn);
           if (d0 && /[一-鿿]/.test(d0)) return d0;
           if (d0 && /^\d{3,6}/.test(d0)) return d0;
         }
-      }
-      // 0b) display 本身已是中文产品
-      {
-        const dDisp = clean(kw.display);
-        if (dDisp && /[一-鿿]/.test(dDisp)) return dDisp;
       }
 
       // 0c) 页内中文 + 域名桥（火绒/钉钉 @ 夹带域）
@@ -2501,6 +2641,61 @@
     return d >= 1 && d <= 2;
   };
 
+  /**
+   * 中文产品形态的通用拼音尾缀（不是品牌名单）。
+   * 用于识别「中文品牌名 + 官网」场景下，域名产品尾缀多/少/错一个字母：
+   * qishuiyinyuer vs 汽水音乐(yinyue) → expected qishuiyinyue。
+   */
+  NS.CHINESE_PRODUCT_ROMANIZED_SUFFIXES = [
+    ["远程桌面", "yuanchengzhuomian"],
+    ["安全卫士", "anquanweishi"],
+    ["音乐播放器", "yinyuebofangqi"],
+    ["浏览器", "liulanqi"],
+    ["播放器", "bofangqi"],
+    ["客户端", "kehuduan"],
+    ["输入法", "shurufa"],
+    ["安全", "anquan"],
+    ["杀毒", "shadu"],
+    ["卫士", "weishi"],
+    ["音乐", "yinyue"],
+    ["办公", "bangong"],
+    ["网盘", "wangpan"],
+    ["助手", "zhushou"],
+    ["管家", "guanjia"]
+  ];
+
+  NS.detectChineseProductRomanizedSuffixTypo = function (cnBrand, hostLabel) {
+    try {
+      const brand = String(cnBrand || "").replace(/\s+/g, "");
+      const label = String(hostLabel || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (!brand || !/[一-鿿]/.test(brand) || label.length < 7) return null;
+      for (const [cnSuffix, expectedSuffix] of NS.CHINESE_PRODUCT_ROMANIZED_SUFFIXES) {
+        if (!brand.endsWith(cnSuffix)) continue;
+        // 正确拼音尾缀不得因截短一位后“距离为 1”被反向误判。
+        if (label.endsWith(expectedSuffix)) return null;
+        const minLen = Math.max(4, expectedSuffix.length - 1);
+        const maxLen = Math.min(label.length - 2, expectedSuffix.length + 1);
+        for (let actualLen = minLen; actualLen <= maxLen; actualLen++) {
+          const actualSuffix = label.slice(-actualLen);
+          const prefix = label.slice(0, -actualLen);
+          if (prefix.length < 2) continue;
+          const distance = NS.editDistanceShort(actualSuffix, expectedSuffix);
+          if (distance !== 1) continue;
+          return {
+            chineseSuffix: cnSuffix,
+            expectedSuffix,
+            actualSuffix,
+            expectedHostLabel: `${prefix}${expectedSuffix}`,
+            distance
+          };
+        }
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
   NS.pickBrandTokenForHost = function (tokens, labelRaw) {
     const list = Array.isArray(tokens) ? tokens.filter((t) => t && !BRAND_TOKEN_STOP_RE.test(t)) : [];
     if (!list.length) return "";
@@ -2582,6 +2777,8 @@
     if (/^[a-z0-9]+$/i.test(t) && t.length <= 24) {
       // 常见驼峰：crystaldiskmark → CrystalDiskMark；todesk → ToDesk；dingtalk → DingTalk
       const low = t.toLowerCase();
+      // 短品牌缩写在计票时统一存为小写，展示时恢复行业通用的大写形式。
+      if (/^[a-z]{2,3}$/.test(low)) return low.toUpperCase();
       if (low.length >= 6 && /disk|mark|soft|desk|talk|safe|guard|music|cloud/i.test(low)) {
         try {
           const camel = low

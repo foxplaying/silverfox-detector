@@ -9,7 +9,7 @@
 行为式网页威胁检测器 —— 一个 Chrome 扩展，通过 DOM 启发式与 MAIN-world 行为钩子识别可疑下载落地页。
 
 [![Manifest](https://img.shields.io/badge/manifest-v3-blue)](https://developer.chrome.com/docs/extensions/mv3/intro/)
-[![Version](https://img.shields.io/badge/version-0.1.1-green)](./extension/manifest.json)
+[![Version](https://img.shields.io/badge/version-0.1.2-green)](./extension/manifest.json)
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey)](./LICENSE)
 
 </div>
@@ -118,6 +118,7 @@ service worker
 
 | 信号 | 权重 |
 |--------|-------:|
+| 假冒ICP备案信息（权威源明确未备案，显示页面声明号） | 25 |
 | SEO伪装跳转脚本 / 仿冒品牌官网下载站 | 24 |
 | 仿冒品牌官网下载壳 / 仿冒官网第三方分发 / 多版本下载同一安装包 | 22 |
 | 仿冒官网加密下载配置 / 已拦截可疑安装包下载 | 20 |
