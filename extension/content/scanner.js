@@ -498,7 +498,7 @@
         if (brandish) {
           const noticeTitle = brandTok ? `已识别仿冒「${brandTok}」官网` : "已识别仿冒品牌官网下载";
           const noticeMsg = brandTok
-            ? `域名 ${location.hostname} 与标题品牌「${brandTok}」不匹配，已拦截安装包 ${label}`
+            ? `页面标题/正文品牌「${brandTok}」与当前域名不匹配，疑似仿冒官网。`
             : `页面宣称官方下载，但域名/安装包异常，已拦截 ${label}`;
           if (brandTok) state.spoofBrand = brandTok;
           try { NS.addSignal("仿冒品牌官网下载站", 20, noticeMsg); } catch { /* ignore */ }

@@ -175,10 +175,20 @@
 
       const bumpCn = (brand, src, fieldText) => {
         let s = normalizeCn(brand);
+        // 未知缩写 + 中文尾串：只有缩写与当前域名确有结构关联时才折叠为品牌核。
+        // 这是证据规则，不需要知道缩写属于哪家厂商；QQ音乐等无 3+ 字母域名核的
+        // 完整产品名仍按混合品牌保留。
+        const mixedAcronym = String(s || "").match(/^([A-Z][A-Z0-9]{2,5})[一-鿿]{1,8}$/u);
+        if (mixedAcronym && mixedAcronym[1]
+          && typeof NS.candidateDomainAligned === "function"
+          && NS.candidateDomainAligned(mixedAcronym[1]) >= 1) {
+          bumpLat(mixedAcronym[1], src, fieldText);
+          return;
+        }
         // ToDesk官网 → ToDesk（混合拉丁+官网尾巴）
         if (s && typeof NS.normalizeDisplayBrandName === "function") {
           const n = NS.normalizeDisplayBrandName(s);
-          if (n && n.length >= 2) s = n;
+          if (n.length >= 2) s = n;
         } else if (s && typeof NS.trimChineseBrandTrail === "function") {
           s = NS.trimChineseBrandTrail(s) || s;
         }
@@ -224,6 +234,8 @@
         const d = String(raw || "").replace(/[^\d]/g, "");
         if (!/^\d{3,6}$/.test(d)) return;
         if (/^(?:19|20)\d{2}$/.test(d)) return; // 年份
+        if (typeof NS.isRepeatedNumericBrandToken === "function"
+          && NS.isRepeatedNumericBrandToken(d)) return;
         const ft = String(fieldText || "");
         if (src !== "domain" && !ft.includes(d)) return;
         // 须像站名/产品名，而非纯版本号上下文（Android 6.0 不匹配整段 4399）
@@ -389,11 +401,14 @@
           votes = reHits.length;
         }
         if (votes >= 2) {
-          // 拉丁仅出现在 keywords/description 等弱字段、从未进 title/h1/og/domain →
-          // 视为「别名噪声」（Resso Music 只在 keywords），不当主品牌
+          // 拉丁仅出现在 span/logo/footer/keywords/description 等辅助字段，
+          // 从未进 title/h1/OG/schema/domain：不能靠辅助字段凑票取得品牌资格。
+          // PURE SHIELD 同时出现在副标与页脚，也只能佐证，不能推翻中文主身份。
           if (!isCn && !reHits.some((k) => STRONG_FIELD.test(k))) {
-            // 仍可进 latin 列表供主机对齐，但 display 选择时会让位中文
-            return true;
+            const domainAligned = typeof NS.candidateDomainAligned === "function"
+              ? NS.candidateDomainAligned(cand)
+              : 0;
+            return domainAligned >= 1;
           }
           return true;
         }
@@ -410,7 +425,11 @@
           }
           const ft = fieldTexts[reHits[0]] || "";
           if (digitRe.test(cand)) return true;
-          if (/[A-Za-z]/.test(cand) && /[一-鿿]/.test(cand)) return true;
+          // 混合词不能再无条件当品牌：PC版、AI智能推荐、Res无损音质
+          // 都属于版本/功能标题。统一服从产品形态和域名身份校验。
+          if (/[A-Za-z]/.test(cand) && /[一-鿿]/.test(cand)
+            && typeof NS.looksLikeChineseProductBrandMorphology === "function"
+            && NS.looksLikeChineseProductBrandMorphology(cand)) return true;
           if (new RegExp(cand.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(?:官网|官方|下载|安全|杀毒|软件|客户端|音乐)", "i").test(ft)) return true;
           if (typeof NS.looksLikeChineseProductBrandMorphology === "function"
             && NS.looksLikeChineseProductBrandMorphology(cand) && cand.length >= 3) return true;
@@ -590,7 +609,8 @@
       }
       // 中文+域名桥（火绒 @ huorong.cn）优先于拉丁
       if (bestCnEntry && /[一-鿿]/.test(bestCnEntry.c)
-        && ((bestCnEntry.domainAlign || 0) >= 1 || (hostCores.padCore && hostCores.padCore.length >= 4))
+        // 必须是该中文候选自身与域名对齐；“域名存在任意长核”不是中文品牌证据。
+        && (bestCnEntry.domainAlign || 0) >= 1
         && bestOverall && bestOverall.script === "lat"
         && (isHostDebris(bestOverall.c) || (bestOverall.domainAlign || 0) <= (bestCnEntry.domainAlign || 0))) {
         const cnDisp = fmtDisp(bestCnEntry.c) || bestCnEntry.c;
@@ -707,6 +727,12 @@
       let bestMatch = "none";
       let bestTok = "";
       let bestScore = 0;
+      const cnRomanizedSuffixTypo = typeof NS.detectChineseProductRomanizedSuffixTypo === "function"
+        ? NS.detectChineseProductRomanizedSuffixTypo(
+          (kw.display && /[一-鿿]/.test(kw.display) ? kw.display : (kw.cn || []).find((x) => /[一-鿿]/.test(String(x))) || ""),
+          apexLabel || label
+        )
+        : null;
       const consider = (tok, match, score) => {
         if (typeof NS.looksLikeAssetGarbageToken === "function" && NS.looksLikeAssetGarbageToken(tok)
           && !/^(?:ai|gpt|ml|bot|llm)$/i.test(tok)) return;
@@ -1002,6 +1028,12 @@
         }
       }
 
+      // 页面资源/页脚可能全部复制当前假域名，不能让这些自证据把拼音尾缀 typo 覆盖成 exact。
+      if (cnRomanizedSuffixTypo) {
+        // 匹配 token 用推断出的拉丁域名核；最终展示仍统一取 kw.display 中文品牌。
+        consider(cnRomanizedSuffixTypo.expectedHostLabel, "typo", 110);
+      }
+
       // 半真半假：夹带/拼写/连字符/弱 partial → squat（按盗版）
       // 几乎关联：仅 exact / category（及极高分 partial 且拉丁主品牌≥5）
       let squat = bestMatch === "padded" || bestMatch === "typo" || bestMatch === "hyphen"
@@ -1244,6 +1276,21 @@
 
       // 与下载落地壳对齐：勿用裸「杀毒软件/安全软件」当官网 pitch（博客评测误报）
       const officialPitchEarly = /官网|官方下载|官方正版|官方网站|电脑版官网|免费下载|立即免费下载|官方桌面|官方客户端|官方安全|官方杀毒|专业.*工具|立即下载|全平台官方|Enterprise|Collaboration|AI-Powered|安静|纯净|强悍|个人版|终端安全/i.test(`${claimText} ${identityText}`);
+      const cnRomanizedSuffixTypo = cnDisplay && typeof NS.detectChineseProductRomanizedSuffixTypo === "function"
+        ? NS.detectChineseProductRomanizedSuffixTypo(cnDisplay, (pageApex.split(".")[0] || labelRaw))
+        : null;
+      if (officialPitchEarly && cnRomanizedSuffixTypo) {
+        return {
+          mismatch: true,
+          brandToken: cnRomanizedSuffixTypo.expectedHostLabel,
+          brandHits: 16,
+          hostMatch: "typo",
+          hostLabel: label,
+          pageApex,
+          rigorousMatch: false,
+          displayBrand: cnDisplay
+        };
+      }
       // 主机营销夹带核心：即使页上无 Huorong 拉丁，huorong-pc 也可推断
       const inferredHostCore = typeof NS.inferMarketingPaddedBrandCore === "function"
         ? (NS.inferMarketingPaddedBrandCore(labelRaw) || "")

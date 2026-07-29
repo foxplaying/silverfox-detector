@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SilverFox Detector",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Detect suspicious download landing pages via DOM heuristics and MAIN-world behavioral hooks.",
   "permissions": [
     "storage",
