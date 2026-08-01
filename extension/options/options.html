@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>SilverFox Detector 设置</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        font-family: system-ui, -apple-system, "Segoe UI", Arial, sans-serif;
+        max-width: 560px;
+        margin: 24px auto;
+        padding: 0 16px 32px;
+        line-height: 1.5;
+        color: #1a1a1a;
+      }
+      @media (prefers-color-scheme: dark) {
+        body { color: #e8e8e8; }
+        input, button { background: #2a2a2a; color: #e8e8e8; border-color: #555; }
+        button.primary { background: #1565c0; border-color: #1565c0; color: #fff; }
+        .card { background: #1e1e1e; border-color: #333; }
+        .hint { color: #aaa; }
+      }
+      h1 {
+        font-size: 1.25rem;
+        font-weight: 700;
+        margin: 0 0 8px;
+      }
+      .sub {
+        font-size: 0.875rem;
+        color: #666;
+        margin-bottom: 20px;
+      }
+      .card {
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        padding: 16px;
+        background: #fafafa;
+      }
+      label {
+        display: block;
+        font-weight: 600;
+        font-size: 0.9rem;
+        margin-bottom: 8px;
+      }
+      input[type="password"],
+      input[type="text"] {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 8px 10px;
+        font-size: 0.875rem;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        font-family: ui-monospace, Consolas, monospace;
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 12px;
+        align-items: center;
+      }
+      button {
+        font-size: 0.875rem;
+        padding: 6px 14px;
+        cursor: pointer;
+        border: 1px solid #bbb;
+        border-radius: 4px;
+        background: #f0f0f0;
+      }
+      button.primary {
+        background: #1565c0;
+        color: #fff;
+        border-color: #1565c0;
+      }
+      button:hover { filter: brightness(0.97); }
+      .status { font-size: 0.85rem; min-height: 1.2em; }
+      .status.ok { color: #2e7d32; }
+      .status.err { color: #d93025; }
+      .hint {
+        margin-top: 12px;
+        font-size: 0.8rem;
+        color: #666;
+      }
+      .hint a { color: #1565c0; }
+      .foot {
+        margin-top: 20px;
+        font-size: 0.8rem;
+        color: #888;
+      }
+      .toggle-row {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        font-weight: 400;
+        cursor: pointer;
+        margin-bottom: 0;
+      }
+      .toggle-row input[type="checkbox"] {
+        margin-top: 4px;
+        width: 16px;
+        height: 16px;
+        flex-shrink: 0;
+      }
+      .toggle-row strong {
+        font-weight: 600;
+        font-size: 0.9rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>SilverFox Detector 设置</h1>
+    <p class="sub">配置项与风险分析报告分开；保存后立即生效。</p>
+
+    <div class="card">
+      <label for="vt-api-key">VirusTotal API Key</label>
+      <input
+        id="vt-api-key"
+        type="password"
+        autocomplete="off"
+        spellcheck="false"
+        placeholder="在 virustotal.com 账户设置中复制 API Key"
+      />
+      <div class="row">
+        <button type="button" class="primary" id="vt-api-save">保存</button>
+        <button type="button" id="vt-api-clear">清除</button>
+        <button type="button" id="vt-api-toggle" title="显示/隐藏">显示</button>
+        <span class="status" id="vt-api-status"></span>
+      </div>
+      <p class="hint">
+        用于解析安装包/压缩包的 VT 检出比。免费 Community Key 约 4 次/分钟。
+        未配置时扩展会尝试在浏览器内打开 VT 页读取，可能受 reCAPTCHA 限制。<br />
+        <a href="https://www.virustotal.com/gui/my-apikey" target="_blank" rel="noopener noreferrer"
+          >获取 API Key →</a
+        >
+      </p>
+    </div>
+
+    <div class="card" style="margin-top: 16px">
+      <label style="margin-bottom: 12px">文件 → VirusTotal 真·文件上传</label>
+      <label class="toggle-row" for="vt-auto-submit">
+        <input type="checkbox" id="vt-auto-submit" checked />
+        <span>
+          <strong>自动上传文件</strong>
+          <span class="hint" style="display: block; margin-top: 2px; font-weight: 400">
+            仅在已配置 <strong>API Key</strong> 时生效：VT 库中无该样本则通过 API 上传文件（上限 650MB）。
+            无 Key 不自动上传，请手动打开
+            <a href="https://www.virustotal.com/gui/home/upload" target="_blank" rel="noopener noreferrer">上传页</a>。
+          </span>
+        </span>
+      </label>
+      <div class="row">
+        <span class="status" id="vt-feed-status"></span>
+      </div>
+    </div>
+
+    <p class="foot">也可从扩展管理页 → 详细信息 → 扩展程序选项 打开本页。</p>
+    <script src="options.js"></script>
+  </body>
+</html>

@@ -474,24 +474,23 @@
         const label = hrefForGuard ? (NS.formatPackageLabel(hrefForGuard) || hrefForGuard) : (firstHref && !/^https?:/i.test(String(firstHref)) ? String(firstHref) : "可疑安装包");
         const fnGuard = hrefForGuard ? NS.getFilenameFromUrl(hrefForGuard) : "";
         let brandTok = state.spoofBrand || "";
+        if (brandTok && typeof NS.canonicalizeBrandDisplayCandidate === "function") {
+          brandTok = NS.canonicalizeBrandDisplayCandidate(brandTok);
+          if (!brandTok) state.spoofBrand = "";
+        }
         if (!brandTok || (NS.BRAND_TOKEN_STOP_RE && NS.BRAND_TOKEN_STOP_RE.test(String(brandTok).toLowerCase()))) {
           try {
-            // 中文产品名优先；禁止 CMS 词 Template/Aurora 进 toast
-            const corr = NS.evaluateTitleHostBrandCorrelation();
-            if (typeof NS.pickBrandDisplayName === "function") {
-              brandTok = NS.pickBrandDisplayName({
-                title: document.title || "",
-                displayBrand: corr && corr.displayBrand,
-                brandToken: (corr && corr.brandToken) || ""
-              }) || "";
-            } else {
-              const primary = typeof NS.pickPrimaryTitleBrandToken === "function"
-                ? NS.pickPrimaryTitleBrandToken(document.title || "", (location.hostname || "").split(".")[0] || "")
-                : "";
-              const raw = (corr && corr.displayBrand) || (primary && primary.length >= 5 ? primary : "") || (corr && corr.brandToken) || "";
-              brandTok = typeof NS.formatBrandTokenForDisplay === "function" ? NS.formatBrandTokenForDisplay(raw) : raw;
-            }
+            // brandToken 只是域名相关性核，不能进入 toast；只认页面身份共识。
+            const primary = typeof NS.collectPrimaryBrandKeywords === "function"
+              ? NS.collectPrimaryBrandKeywords()
+              : null;
+            brandTok = typeof NS.resolveSpoofDisplayBrand === "function"
+              ? (NS.resolveSpoofDisplayBrand(location.hostname, primary) || "")
+              : ((primary && primary.display) || "");
             if (brandTok && NS.BRAND_TOKEN_STOP_RE && NS.BRAND_TOKEN_STOP_RE.test(String(brandTok).toLowerCase())) brandTok = "";
+            if (brandTok && typeof NS.canonicalizeBrandDisplayCandidate === "function") {
+              brandTok = NS.canonicalizeBrandDisplayCandidate(brandTok);
+            }
           } catch { /* ignore */ }
         }
         const brandish = pkgHitBrandNear || !!brandTok || titleHot || /官网|官方下载/i.test(document.title || "");
@@ -522,22 +521,12 @@
         }
         NS.disableAllDownloadIntentControls();
       } else if (found && state.downloadGuardInstalled) {
-        // 品牌检测已 arm 时仍把包链禁用，并补强 toast（若先前只有弱通知则 force）
+        // 品牌检测已 arm 时仍把包链禁用，但不要再用“已拦截安装包 …”改写
+        // 同一个品牌 toast。包名留在风险详情，页面只维持一条稳定的品牌通知。
         NS.disableAllDownloadIntentControls();
-        if (!state.protectionNoticeSent || state._brandSpoofPortalDetected || state._fakeBrandShellDetected) {
+        if (state._brandSpoofPortalDetected || state._fakeBrandShellDetected || state.spoofBrand) {
           try {
-            const hrefForGuard = firstHref && (NS.isPackageFileUrl(firstHref) || /^https?:\/\//i.test(String(firstHref))) ? firstHref : "";
-            const label = hrefForGuard ? (NS.formatPackageLabel(hrefForGuard) || hrefForGuard) : "";
-            if (label && (state._brandSpoofPortalDetected || state._fakeBrandShellDetected || state.spoofBrand)) {
-              const brandTok = state.spoofBrand || "";
-              NS.showGuardOverlay(hrefForGuard, {
-                title: brandTok ? `已识别仿冒「${brandTok}」官网` : "已识别仿冒品牌官网下载",
-                message: brandTok ? `已拦截安装包 ${label}` : `已拦截 ${label}`,
-                toast: true,
-                forceNotify: true,
-                guardKind: "brand-spoof"
-              });
-            }
+            if (typeof NS.ensureBrandSpoofNotice === "function") NS.ensureBrandSpoofNotice(false);
           } catch { /* ignore */ }
         }
       }

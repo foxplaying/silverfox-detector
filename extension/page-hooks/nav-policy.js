@@ -109,7 +109,15 @@
 
     markLightPage() { this.lightPage = true; }
 
+    noteTrustedDownloadIntent(href) {
+      // 这里只上报候选 URL；是否可信由隔离世界 content 依据有效 ICP/WHOIS 决定。
+      if (!href) return;
+      try { this.post({ type: "trusted-download-intent", href: String(href).slice(0, 2000) }); } catch { /* ignore */ }
+    }
+
     _shouldBlockUrl(href) {
+      // content 已用 ICP/WHOIS 判定可信后，MAIN hook 不得再以 sticky hop 反向覆盖。
+      if (this.officialSafe) return false;
       if (!href || typeof href !== "string") return false;
       if (/^\s*#/.test(href) || href.trim() === "") return false;
       if (PackageHeuristics.isStrongProductInstallerUrl(href)) return false;
@@ -167,6 +175,7 @@
     }
 
     _rememberHop(url) {
+      if (this.officialSafe) return;
       if (!url) return;
       if (PackageHeuristics.isClearOrStrongProductPackageUrl(url)) return;
       this.blockedHops.add(url);
@@ -215,6 +224,7 @@
      * - 下载空壳或薄跳板或 guard：无手势跨域跳转
      */
     tryBlockNavigation(url, reason) {
+      if (this.officialSafe) return false;
       if (url == null || url === "") return false;
       const href = PackageHeuristics.coerceHref(url).trim();
       if (!href) return false;
@@ -317,6 +327,7 @@
         const api = window.__silverfoxNavApi;
         if (!api) return;
         if (typeof api.setGuard === "function") api.setGuard(this.guardEnabled);
+        if (typeof api.setOfficialSafe === "function") api.setOfficialSafe(this.officialSafe);
         if (typeof api.setExtraPolicy === "function") {
           // 避免递归：extraPolicy 不得再调 nav-boot tryBlock
           api.setExtraPolicy((href) => this._extraPolicy(href));
@@ -326,6 +337,7 @@
 
     _extraPolicy(href) {
       try {
+        if (this.officialSafe) return false;
         if (!href) return false;
         if (PackageHeuristics.isClearOrStrongProductPackageUrl(href)) return false;
         if (PackageHeuristics.isSameApexOfficialDownloadPath(href)) return false;

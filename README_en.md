@@ -9,7 +9,7 @@ English | [简体中文](./README.md)
 Behavioral web threat detector - a Chrome extension that flags suspicious download landing pages via DOM heuristics and MAIN-world behavioral hooks.
 
 [![Manifest](https://img.shields.io/badge/manifest-v3-blue)](https://developer.chrome.com/docs/extensions/mv3/intro/)
-[![Version](https://img.shields.io/badge/version-0.1.2-green)](./extension/manifest.json)
+[![Version](https://img.shields.io/badge/version-0.2.0-green)](./extension/manifest.json)
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey)](./LICENSE)
 
 </div>

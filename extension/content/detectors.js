@@ -157,7 +157,20 @@
       let hostLabel = sample;
       try { hostLabel = new URL(sample).hostname.replace(/^www\./, ""); } catch { /* keep */ }
       NS.addSignal("多平台下载指向搜索引擎", 18, `多平台下载入口（Windows/macOS/Linux 等）统一跳转搜索引擎/非安装包地址（${hostLabel || "外链"}），非真实安装包`);
-      NS.installDownloadGuard("多平台下载跳转搜索引擎（非安装包）", { notify: true, href: "", message: `多平台下载按钮跳转搜索引擎（${hostLabel || "外链"}），不是安装包`, title: "已拦截异常下载跳转", guardKind: "nav-trap", forceNotify: true, lockHard: true });
+      // 品牌结论可能已成立但正等待 ICP 门控，guard 尚未真正 arm。此时也不要
+      // 先闪一次“异常跳转”再被报告阶段的品牌通知覆盖；静默装上 nav guard，
+      // emitRiskReport 会统一补发可信品牌通知。
+      const preserveBrandNotice = !!(state._brandSpoofPortalDetected
+        || (state.details || []).some((d) => /仿冒品牌官网/i.test(d.name || "")));
+      NS.installDownloadGuard("多平台下载跳转搜索引擎（非安装包）", {
+        notify: !preserveBrandNotice,
+        href: "",
+        message: `多平台下载按钮跳转搜索引擎（${hostLabel || "外链"}），不是安装包`,
+        title: "已拦截异常下载跳转",
+        guardKind: "nav-trap",
+        forceNotify: !preserveBrandNotice,
+        lockHard: true
+      });
       NS.postToHooks({ type: "set-guard", enabled: true });
       NS.armBackgroundProtect("full");
       NS.disableAllDownloadIntentControls();

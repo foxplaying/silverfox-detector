@@ -125,9 +125,19 @@
       const onUserActivate = (event) => {
         if (event && typeof event.button === "number" && event.button !== 0) return; // 右键原生菜单
         if (event && event.type === "contextmenu") return;
-        if (policy.lightPage || policy.officialSafe || policy.isLightPage()) return;
         const t = event.target;
         if (!t || typeof t.closest !== "function") return;
+        try {
+          const candidateEl = t.closest("a, button, [role='button'], .download-btn, .download-btn-nav, .btn-download, #mainDownloadBtn");
+          if (candidateEl) {
+            const candidateHref = (candidateEl.getAttribute("href") || candidateEl.getAttribute("data-href") || candidateEl.getAttribute("data-url") || "").trim();
+            if (candidateHref) policy.noteTrustedDownloadIntent(candidateHref);
+          }
+        } catch { /* ignore */ }
+        if (policy.officialSafe) {
+          return;
+        }
+        if (policy.lightPage || policy.isLightPage()) return;
         try {
           const tag = (t.tagName || "").toUpperCase();
           if (tag === "INPUT" || tag === "TEXTAREA" || t.isContentEditable) return; // 搜索框输入
@@ -414,12 +424,29 @@
         if (!fromSelf && !fromTop) return;
         if (data.type === "set-official-safe" || data.type === "set-light-page") {
           if (!fromSelf) return; // 仅本 frame content 可改 light/safe
-          if (data.type === "set-official-safe") policy.officialSafe = !!data.enabled;
+          if (data.type === "set-official-safe") {
+            policy.officialSafe = !!data.enabled;
+            try {
+              if (window.__silverfoxNavApi && typeof window.__silverfoxNavApi.setOfficialSafe === "function") {
+                window.__silverfoxNavApi.setOfficialSafe(policy.officialSafe);
+              }
+            } catch { /* ignore */ }
+          }
           if (data.type === "set-light-page" && data.enabled) policy.lightPage = true;
           if (policy.officialSafe) {
             policy.guardEnabled = false;
+            policy.forceDesktopDlKit = false;
             policy.lightPage = true;
-            try { if (window.__silverfoxNavApi && typeof window.__silverfoxNavApi.setGuard === "function") window.__silverfoxNavApi.setGuard(false); } catch { /* ignore */ }
+            policy.blockedHops.clear();
+            try {
+              if (window.__silverfoxNavApi) {
+                if (typeof window.__silverfoxNavApi.setGuard === "function") window.__silverfoxNavApi.setGuard(false);
+                if (typeof window.__silverfoxNavApi.clearHops === "function") window.__silverfoxNavApi.clearHops();
+              }
+            } catch { /* ignore */ }
+            try { if (window.__silverfoxGuardMo) { window.__silverfoxGuardMo.disconnect(); window.__silverfoxGuardMo = null; } } catch { /* ignore */ }
+            DownloadUi.restoreAllDownloadButtonsInPage();
+            [50, 200, 600].forEach((ms) => setTimeout(DownloadUi.restoreAllDownloadButtonsInPage, ms));
           }
           if (policy.lightPage || policy.officialSafe) {
             try { DomGuard.restoreNativeDomProtos(this.restoreList); } catch { /* ignore */ }

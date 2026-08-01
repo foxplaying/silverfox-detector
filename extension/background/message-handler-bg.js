@@ -7,12 +7,31 @@
 
   const { PackageHeuristicsBg } = NS;
 
+  // 情报/SSL 常用公共 API 主机（优先放行；其余 HTTPS 仍允许，仅拦私网）
   NS.ICP_FETCH_HOSTS = new Set([
+    // ICP
     "icp.aizhan.com",
     "beiancx.com",
     "uapis.cn",
+    // WHOIS / RDAP
+    "who-dat.as93.net",
     "rdap.ss",
-    "whoiscx.com"
+    "whoiscx.com",
+    "api.tian.hu",
+    "rdap.org",
+    "rdap.verisign.com",
+    "rdap.publicinterestregistry.org",
+    "rdap.identitydigital.services",
+    // SSL / CT
+    "api.ssllabs.com",
+    "api.certspotter.com",
+    "crt.sh",
+    "ctl.shodan.io",
+    "urlscan.io",
+    "networkcalc.com",
+    // 安装包 VT（试验）
+    "www.virustotal.com",
+    "virustotal.com"
   ]);
 
   NS.isAllowedFetchUrl = function (rawUrl) {
@@ -146,7 +165,8 @@
       timestamp: incoming.timestamp || previous.timestamp || Date.now(),
       analysisComplete: true,
       icpInfo: incoming.icpInfo || previous.icpInfo || "",
-      whoisInfo: incoming.whoisInfo || previous.whoisInfo || ""
+      whoisInfo: incoming.whoisInfo || previous.whoisInfo || "",
+      sslInfo: incoming.sslInfo || previous.sslInfo || null
     };
   };
 
@@ -180,6 +200,59 @@
             });
           }
         } catch { /* ignore */ }
+        try { sendResponse({ success: true }); } catch { /* ignore */ }
+        return;
+      }
+      if (msg.type === "relay-page-threat-toast") {
+        const tabId = sender.tab?.id ?? null;
+        // 只接受 content script 的子 frame 转发；页面脚本无法调用 runtime.sendMessage。
+        if (tabId != null && Number.isInteger(sender.frameId) && sender.frameId > 0) {
+          try {
+            chrome.tabs.sendMessage(tabId, {
+              type: "show-page-threat-toast",
+              title: String(msg.title || "已拦截可疑下载文件").slice(0, 120),
+              message: String(msg.message || "可疑下载已被拦截").slice(0, 240),
+              force: msg.force !== false
+            }, { frameId: 0 }, () => { void chrome.runtime.lastError; });
+          } catch { /* ignore */ }
+        }
+        try { sendResponse({ success: true }); } catch { /* ignore */ }
+        return;
+      }
+      if (msg.type === "set-tab-download-trust") {
+        const tabId = sender.tab?.id ?? null;
+        // 仅顶层 content script 可设置；子 frame 不能替整个标签页建立信任。
+        if (tabId != null && (sender.frameId == null || sender.frameId === 0)) {
+          if (msg.enabled) {
+            const pageUrl = sender.tab?.url || msg.url || "";
+            // 可信来源建立时同步清除之前的软保护残留，再写入信任状态。
+            NS.clearTabAnalysisState(tabId);
+            if (typeof NS.setTrustedDownloadSource === "function") NS.setTrustedDownloadSource(tabId, pageUrl);
+          } else {
+            if (typeof NS.clearTrustedDownloadSource === "function") NS.clearTrustedDownloadSource(tabId);
+            else NS.trustedDownloadTabs.delete(tabId);
+          }
+        }
+        try { sendResponse({ success: true }); } catch { /* ignore */ }
+        return;
+      }
+      if (msg.type === "trusted-download-intent") {
+        const tabId = sender.tab?.id ?? null;
+        // 顶层候选始终登记来源供页内提示；只有 content 核验身份后才登记可信放行。
+        if (tabId != null && (sender.frameId == null || sender.frameId === 0)
+          && typeof NS.rememberTrustedDownloadIntent === "function") {
+          if (typeof NS.rememberDownloadSourceIntent === "function") {
+            NS.rememberDownloadSourceIntent(tabId, msg.href || "");
+          }
+          if (msg.identityVerified === true && typeof NS.setTrustedDownloadSource === "function") {
+            NS.setTrustedDownloadSource(tabId, sender.tab?.url || msg.url || "");
+            // setTrustedDownloadSource 会清掉该 tab 的旧来源候选，恢复本次精确 URL。
+            if (typeof NS.rememberDownloadSourceIntent === "function") {
+              NS.rememberDownloadSourceIntent(tabId, msg.href || "");
+            }
+          }
+          if (msg.identityVerified === true) NS.rememberTrustedDownloadIntent(tabId, msg.href || "");
+        }
         try { sendResponse({ success: true }); } catch { /* ignore */ }
         return;
       }
@@ -244,6 +317,155 @@
         } catch (e) { console.warn("background: error handling threat-risk", e && e.message ? e.message : e); }
         try { sendResponse({ success: true }); } catch { /* ignore */ }
         return;
+      }
+      if (msg.type === "get-ssl-cert") {
+        // 保留 www（www.gov.cn / www.12306.cn）；缓存键在 ssl-cert-bg 内再去 www
+        let host = String(msg.host || "").toLowerCase().replace(/\.$/, "");
+        if (!host && sender.tab && sender.tab.url) {
+          try { host = new URL(sender.tab.url).hostname.toLowerCase(); } catch { /* ignore */ }
+        }
+        const tabId = sender.tab?.id ?? null;
+        const force = !!msg.force;
+        // 页面已是 HTTPS 时，CT 全失败仍可回退展示 DV
+        let pageHttps = msg.https !== false;
+        if (msg.https == null && sender.tab && sender.tab.url) {
+          try { pageHttps = /^https:/i.test(sender.tab.url); } catch { pageHttps = true; }
+        }
+        (async () => {
+          try {
+            let info = null;
+            if (!force && typeof NS.getSslCertInfoForHost === "function") {
+              info = NS.getSslCertInfoForHost(host);
+            }
+            // 仅忽略旧版空占位；https-assumed 可展示
+            if (info && (info.source === "https-reachability" || info.source === "page-https")) info = null;
+            // 无机构名的 OV/EV 也强制再探（补 Subject.O）
+            const needOrg = info && /^(OV|EV)$/i.test(String(info.validation || ""))
+              && !String(info.organization || "").trim();
+            if ((!info || needOrg || force) && typeof NS.resolveSslCertInfo === "function") {
+              info = await NS.resolveSslCertInfo(host, { force: force || needOrg, https: pageHttps });
+            }
+            if (info && (info.source === "https-reachability" || info.source === "page-https")) info = null;
+            if (info && tabId != null) {
+              try {
+                chrome.tabs.sendMessage(tabId, { type: "ssl-cert-info", sslInfo: info }, () => {
+                  void chrome.runtime.lastError;
+                });
+              } catch { /* ignore */ }
+            }
+            try { sendResponse({ success: true, sslInfo: info || null, host }); } catch { /* ignore */ }
+
+            // 首次 DV / 无 org 的 OV：后台再探（Labs 常稍后 READY 才有 certs PEM）
+            const v0 = String((info && info.validation) || "").toUpperCase();
+            const org0 = String((info && info.organization) || "").trim();
+            if (info && (v0 === "DV" || (v0 === "OV" && !org0))
+              && typeof NS.probeSslCertForHost === "function" && tabId != null) {
+              const upgradeHost = host;
+              const rank0 = v0 === "OV" ? 2 : 1;
+              const tryUpgrade = async () => {
+                try {
+                  const up = await NS.probeSslCertForHost(upgradeHost);
+                  if (!up || !up.validation) return false;
+                  const ru = String(up.validation).toUpperCase() === "EV" ? 3
+                    : String(up.validation).toUpperCase() === "OV" ? 2 : 1;
+                  const orgUp = String(up.organization || "").trim();
+                  if (ru < rank0) return false;
+                  if (ru === rank0 && !(orgUp && !org0)) return false;
+                  if (typeof NS.storeSslCertInfo === "function") NS.storeSslCertInfo(upgradeHost, up);
+                  try {
+                    chrome.tabs.sendMessage(tabId, { type: "ssl-cert-info", sslInfo: up }, () => {
+                      void chrome.runtime.lastError;
+                    });
+                  } catch { /* ignore */ }
+                  return !!(orgUp || ru > rank0);
+                } catch {
+                  return false;
+                }
+              };
+              // 50ms 立即；3s/10s/20s 再试（等 SSL Labs 全局 READY 写满 certs[] PEM）
+              // xinhuanet 等多 IP 站 IN_PROGRESS→READY 常超过 8s
+              setTimeout(() => { void tryUpgrade(); }, 50);
+              if (v0 === "OV" && !org0) {
+                setTimeout(() => { void tryUpgrade(); }, 3000);
+                setTimeout(() => { void tryUpgrade(); }, 10000);
+                setTimeout(() => { void tryUpgrade(); }, 20000);
+              }
+            }
+          } catch (e) {
+            try { sendResponse({ success: false, error: e && e.message ? e.message : "ssl-fail", host }); } catch { /* ignore */ }
+          }
+        })();
+        return true;
+      }
+      if (msg.type === "vt-api-key-updated") {
+        try {
+          if (typeof NS.clearVtLookupCache === "function") NS.clearVtLookupCache();
+        } catch { /* ignore */ }
+        try { sendResponse({ success: true }); } catch { /* ignore */ }
+        return false;
+      }
+      if (msg.type === "refresh-vt-engine-details") {
+        (async () => {
+          try {
+            if (typeof NS.refreshStoredVirusTotalDetails !== "function") {
+              sendResponse({ success: false, error: "vt-refresh-unavailable" });
+              return;
+            }
+            const tabId = Number.isInteger(msg.tabId) && msg.tabId >= 0 ? msg.tabId : null;
+            const result = await NS.refreshStoredVirusTotalDetails(msg.sha256, tabId);
+            sendResponse(result || { success: false, error: "vt-refresh-fail" });
+          } catch (e) {
+            try {
+              sendResponse({ success: false, error: e && e.message ? e.message : "vt-refresh-fail" });
+            } catch { /* ignore */ }
+          }
+        })();
+        return true;
+      }
+      if (msg.type === "refresh-nested-vt-signatures") {
+        (async () => {
+          try {
+            if (typeof NS.refreshStoredNestedSignatures !== "function") {
+              sendResponse({ success: false, error: "nested-signature-refresh-unavailable" });
+              return;
+            }
+            const tabId = Number.isInteger(msg.tabId) && msg.tabId >= 0 ? msg.tabId : null;
+            const result = await NS.refreshStoredNestedSignatures(msg.sha256, tabId);
+            sendResponse(result || { success: false, error: "nested-signature-refresh-fail" });
+          } catch (e) {
+            try {
+              sendResponse({
+                success: false,
+                error: e && e.message ? e.message : "nested-signature-refresh-fail"
+              });
+            } catch { /* ignore */ }
+          }
+        })();
+        return true;
+      }
+      if (msg.type === "inspect-package-vt" || msg.type === "inspect-exe-vt") {
+        // 手动/探测：对安装包 URL 做哈希 + VT（及 PE 签名粗检）
+        const url = String(msg.url || "").trim();
+        const filename = String(msg.filename || "").trim();
+        (async () => {
+          try {
+            if (!url || !/^https?:\/\//i.test(url)) {
+              sendResponse({ success: false, error: "bad-url" });
+              return;
+            }
+            if (typeof NS.inspectPackageUrl !== "function") {
+              sendResponse({ success: false, error: "pe-vt-unavailable" });
+              return;
+            }
+            const report = await NS.inspectPackageUrl(url, { filename });
+            sendResponse({ success: !!report.success, report });
+          } catch (e) {
+            try {
+              sendResponse({ success: false, error: e && e.message ? e.message : "inspect-fail" });
+            } catch { /* ignore */ }
+          }
+        })();
+        return true;
       }
       if (msg.type === "set-tab-protect") {
         const tabId = sender.tab?.id ?? msg.tabId ?? null;

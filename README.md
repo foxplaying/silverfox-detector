@@ -9,7 +9,7 @@
 行为式网页威胁检测器 —— 一个 Chrome 扩展，通过 DOM 启发式与 MAIN-world 行为钩子识别可疑下载落地页。
 
 [![Manifest](https://img.shields.io/badge/manifest-v3-blue)](https://developer.chrome.com/docs/extensions/mv3/intro/)
-[![Version](https://img.shields.io/badge/version-0.1.2-green)](./extension/manifest.json)
+[![Version](https://img.shields.io/badge/version-0.2.0-green)](./extension/manifest.json)
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey)](./LICENSE)
 
 </div>

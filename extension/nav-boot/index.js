@@ -40,8 +40,10 @@
       window.__silverfoxSearchLight = true;
       window.__silverfoxNavApi = {
         setGuard() {},
+        setOfficialSafe() {},
         setCloakingKit() {},
         rememberHop() {},
+        clearHops() {},
         setExtraPolicy() {},
         tryBlock() { return false; },
         hasGesture() { return true; },
@@ -64,8 +66,10 @@
       // 导出 nav api 供 page-hooks/content 复用
       window.__silverfoxNavApi = {
         setGuard: (v) => this.blocker.setGuard(v),
+        setOfficialSafe: (v) => this.blocker.setOfficialSafe(v),
         setCloakingKit: (v) => this.blocker.setCloakingKit(v),
         rememberHop: (u) => this.blocker.rememberHop(u),
+        clearHops: () => this.blocker.clearHops(),
         setExtraPolicy: (fn) => this.blocker.setExtraPolicy(fn),
         tryBlock: (u, reason) => this.blocker.tryBlock(u, reason),
         hasGesture: () => this.gesture.hasGesture(),

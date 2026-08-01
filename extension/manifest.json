@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SilverFox Detector",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Detect suspicious download landing pages via DOM heuristics and MAIN-world behavioral hooks.",
   "permissions": [
     "storage",
@@ -9,6 +9,7 @@
     "activeTab",
     "notifications",
     "downloads",
+    "offscreen",
     "scripting",
     "webNavigation",
     "declarativeNetRequestWithHostAccess"
@@ -17,9 +18,23 @@
   "background": {
     "service_worker": "background/background.js"
   },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
   "content_scripts": [
     {
+      "matches": ["https://www.virustotal.com/*"],
+      "js": ["content/vt-hook-main.js"],
+      "run_at": "document_start",
+      "all_frames": false,
+      "world": "MAIN"
+    },
+    {
       "matches": ["http://*/*", "https://*/*"],
+      "exclude_matches": [
+        "https://www.virustotal.com/*",
+        "https://virustotal.com/*"
+      ],
       "js": [
         "nav-boot/package-classifier.js",
         "nav-boot/sso-detector.js",
@@ -37,12 +52,17 @@
     },
     {
       "matches": ["http://*/*", "https://*/*"],
+      "exclude_matches": [
+        "https://www.virustotal.com/*",
+        "https://virustotal.com/*"
+      ],
       "js": [
         "page-hooks/package-heuristics.js",
         "page-hooks/page-context.js",
         "page-hooks/cloaking-kit.js",
         "page-hooks/download-ui.js",
         "page-hooks/nav-policy.js",
+        "page-hooks/mixed-content-quiet.js",
         "page-hooks/dom-guard.js",
         "page-hooks/index.js"
       ],
@@ -53,6 +73,10 @@
     },
     {
       "matches": ["http://*/*", "https://*/*"],
+      "exclude_matches": [
+        "https://www.virustotal.com/*",
+        "https://virustotal.com/*"
+      ],
       "js": [
         "content/state.js",
         "content/package-heuristics.js",
@@ -82,6 +106,10 @@
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     }
+  },
+  "options_ui": {
+    "page": "options/options.html",
+    "open_in_tab": true
   },
   "icons": {
     "16": "icons/icon16.png",

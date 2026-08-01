@@ -14,10 +14,18 @@
       this.post = post;
       this.hops = new Set();
       this.guard = false;
+      this.officialSafe = false;
       this.extraPolicy = null;
     }
 
     setGuard(v) { this.guard = !!v; }
+    setOfficialSafe(v) {
+      this.officialSafe = !!v;
+      if (this.officialSafe) {
+        this.guard = false;
+        this.hops.clear();
+      }
+    }
     setCloakingKit(v) {
       this.kitScanner.cloakingKit = !!v;
       if (v) this.guard = true;
@@ -26,6 +34,7 @@
       this.extraPolicy = typeof fn === "function" ? fn : null;
     }
     rememberHop(u) { this._remember(u); }
+    clearHops() { this.hops.clear(); }
 
     /** 记住已拦截的 hop（强产品安装包永不 sticky-block）。 */
     _remember(url) {
@@ -40,6 +49,7 @@
 
     /** 是否应阻断该 URL。 */
     shouldBlock(url) {
+      if (this.officialSafe) return false;
       const h = PackageClassifier.hrefOf(url).trim();
       if (!h || h.charAt(0) === "#") return false;
 

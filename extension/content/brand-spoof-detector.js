@@ -84,9 +84,40 @@
   NS.tryArmChineseBrandDownloadHomeSpoof = function () {
     try {
       const state = NS.state;
-      if (state.downloadGuardInstalled && state._brandSpoofPortalDetected) return true;
+      // 已 arm 时仍复检开源可信（DOM/情报后到），避免误报粘住
+      if (state.downloadGuardInstalled && state._brandSpoofPortalDetected) {
+        try {
+          if (typeof NS.pageLooksLikeTrustedOpenSourceDownloadPortal === "function"
+            && NS.pageLooksLikeTrustedOpenSourceDownloadPortal()) {
+            if (typeof NS.clearBrandSpoofFalsePositive === "function") {
+              NS.clearBrandSpoofFalsePositive("trusted-opensource");
+            }
+            NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "home-fast-lift-trusted-opensource");
+            return false;
+          }
+        } catch { /* ignore */ }
+        return true;
+      }
       if (NS.hasValidIcpRecord() && !state._seoCloakKitDetected && !state._desktopForceDlKit) return false;
       if (typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature()) return false;
+      // 公开代码仓 + 下载落在 forge/成熟同站 → 开源项目站，不按仿冒 arm
+      try {
+        if (typeof NS.pageLooksLikeTrustedOpenSourceDownloadPortal === "function"
+          && NS.pageLooksLikeTrustedOpenSourceDownloadPortal()) {
+          NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "home-fast-skip-trusted-opensource");
+          return false;
+        }
+        // 有仓但 ICP/WHOIS 尚未返回：暂不 home-fast arm，等情报 pipeline 再判
+        if (typeof NS.pageHasPublicCodeForgePresence === "function"
+          && NS.pageHasPublicCodeForgePresence()
+          && !(typeof NS.hasValidIcpRecord === "function" && NS.hasValidIcpRecord())
+          && (typeof NS.getWhoisAgeDays !== "function" || NS.getWhoisAgeDays() == null)
+          && !NS.state._icpQuerySettled) {
+          state._pendingSoftBrandSpoof = true;
+          NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "home-fast-defer-opensource-intel");
+          return false;
+        }
+      } catch { /* ignore */ }
       if (typeof NS.pageLooksLikeSoftwareCatalogPortal === "function" && NS.pageLooksLikeSoftwareCatalogPortal()) return false;
       if (typeof NS.pageLooksLikeAppMarketOrAppStoreListing === "function" && NS.pageLooksLikeAppMarketOrAppStoreListing()) return false;
       // Arch/Ubuntu 等发行版 ISO / 海量镜像列表：非银狐 exe 假官网，home-fast 直接跳过
@@ -233,14 +264,14 @@
           const pk = typeof NS.collectPrimaryBrandKeywords === "function"
             ? NS.collectPrimaryBrandKeywords()
             : null;
-          if (typeof NS.normalizeDisplayBrandName === "function" && pk && pk.display && !isDebris(pk.display)) {
-            brand = NS.normalizeDisplayBrandName(pk.display) || pk.display;
+          if (typeof NS.canonicalizeBrandDisplayCandidate === "function" && pk && pk.display && !isDebris(pk.display)) {
+            brand = NS.canonicalizeBrandDisplayCandidate(pk.display);
           } else if (pk && pk.display && !isDebris(pk.display)) {
             brand = pk.display;
           }
           if ((!brand || isDebris(brand)) && pk && pk.cn && pk.cn[0]) {
-            brand = typeof NS.normalizeDisplayBrandName === "function"
-              ? (NS.normalizeDisplayBrandName(pk.cn[0]) || pk.cn[0])
+            brand = typeof NS.canonicalizeBrandDisplayCandidate === "function"
+              ? NS.canonicalizeBrandDisplayCandidate(pk.cn[0])
               : pk.cn[0];
           }
           if ((!brand || isDebris(brand)) && pk && pk.latin) {
@@ -262,21 +293,28 @@
               if (blob.includes(cn)) { brand = cn; break; }
             }
             if (!brand || isDebris(brand)) {
-              brand = typeof NS.formatBrandTokenForDisplay === "function"
-                ? NS.formatBrandTokenForDisplay(core)
-                : core;
+              const coreInfo = pk && pk.scores && pk.scores[core];
+              const coreSources = Array.isArray(coreInfo && coreInfo.sources) ? coreInfo.sources : [];
+              // span/logo/footer 可能携带副标，只能佐证；展示名必须由主身份文本授权。
+              const pageDeclaredCore = coreSources.some((src) => /^(?:title|h1|ogTitle|twitterTitle|ogSite|schema)$/i.test(String(src)));
+              if (pageDeclaredCore) {
+                brand = typeof NS.formatBrandTokenForDisplay === "function"
+                  ? NS.formatBrandTokenForDisplay(core)
+                  : core;
+              }
             }
           }
         } catch { brand = ""; }
       }
       if (brand && isDebris(brand)) brand = "";
-      // 无等权身份时：夹带站仍可 arm，但 toast 用中性文案（勿把 Iehuorong/Reserved 当品牌）
-      if (!brand || brand.length < 2) {
-        if (!isPaddedHost && !hyphenHost && !digitPadHost) return false;
-        brand = "品牌";
+      if (brand && typeof NS.canonicalizeBrandDisplayCandidate === "function") {
+        brand = NS.canonicalizeBrandDisplayCandidate(brand);
       }
-      if (typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(brand)) return false;
-      if (typeof NS.looksLikeAssetGarbageToken === "function" && NS.looksLikeAssetGarbageToken(brand)) return false;
+      if (brand && typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(brand)) brand = "";
+      if (brand && typeof NS.looksLikeAssetGarbageToken === "function" && NS.looksLikeAssetGarbageToken(brand)) brand = "";
+      // 无等权身份时：夹带站仍可 arm，但状态和 toast 使用中性文案。
+      // 占位符绝不能写进 spoofBrand，否则会出现“仿冒「品牌」官网”。
+      if ((!brand || brand.length < 2) && !isPaddedHost && !hyphenHost && !digitPadHost) return false;
       // 夹带域（ca-hongrong）绝不可因「自托管资源」跳过；仅干净主机 + CDN 子域才跳过
       try {
         if (!isPaddedHost && !hyphenHost && !digitPadHost
@@ -357,16 +395,21 @@
           : pathHollowOrNetdisk
             ? (hollowSupport ? "宣称支持/联系但无真实联系方式" : "仅网盘扫码分发无安装包直链")
             : "域名与品牌无关";
-      state.spoofBrand = brand;
+      const showBrand = brand || "";
+      state.spoofBrand = showBrand;
       state._brandSpoofPortalDetected = true;
-      const noticeTitle = `已识别仿冒「${brand}」官网`;
-      const noticeMsg = `域名 ${location.hostname || host} 与标题品牌「${brand}」不匹配，疑似仿冒官网下载站`;
+      const noticeTitle = showBrand ? `已识别仿冒「${showBrand}」官网` : "已识别仿冒品牌官网下载站";
+      const noticeMsg = showBrand
+        ? `域名 ${location.hostname || host} 与标题品牌「${showBrand}」不匹配，疑似仿冒官网下载站`
+        : `域名 ${location.hostname || host} 呈现品牌夹带/仿冒结构，疑似仿冒官网下载站`;
       NS.addSignal(
         "仿冒品牌官网下载站",
         24,
-        `标题/正文品牌「${brand}」与域名 ${location.hostname || host} 不匹配（${matchHint}）；下载导流门户`
+        showBrand
+          ? `标题/正文品牌「${showBrand}」与域名 ${location.hostname || host} 不匹配（${matchHint}）；下载导流门户`
+          : `域名 ${location.hostname || host} 呈现品牌夹带结构（${matchHint}）；下载导流门户`
       );
-      NS.installDownloadGuard(`仿冒品牌官网下载站（仿冒「${brand}」）`, {
+      NS.installDownloadGuard(showBrand ? `仿冒品牌官网下载站（仿冒「${showBrand}」）` : "仿冒品牌官网下载站", {
         notify: true,
         href: "",
         message: noticeMsg,
@@ -378,7 +421,7 @@
       NS.disableAllDownloadIntentControls();
       state._pendingSoftBrandSpoof = false;
       NS.silverfoxLog && NS.silverfoxLog(
-        "brand-spoof", "home-fast-path", brand, host,
+        "brand-spoof", "home-fast-path", showBrand || "(neutral)", host,
         pathSquat ? `squat:${(rel && rel.hostMatch) || "padded"}` : "unrelated-official",
         "cta=", dlCta, "hub=", hub
       );
@@ -516,6 +559,16 @@
         return false;
       }
 
+      // 公开代码仓 + 安装包指向 forge 或成熟同站（ICP/WHOIS）→ 开源项目官网，非银狐仿冒
+      try {
+        if (typeof NS.pageLooksLikeTrustedOpenSourceDownloadPortal === "function"
+          && NS.pageLooksLikeTrustedOpenSourceDownloadPortal()) {
+          NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "skip-trusted-opensource-portal");
+          state._pendingSoftBrandSpoof = false;
+          return false;
+        }
+      } catch { /* ignore */ }
+
       // 用 domainRel 构造错配状态（不再依赖 partial 误放行）
       const hasBrandKw = !!(domainRel && (domainRel.brand || domainRel.brandToken
         || (domainRel.keywords && domainRel.keywords.length)));
@@ -601,14 +654,21 @@
             : null;
           brandDisp = (pkD && pkD.display) || "";
           if (brandDisp && debrisHost(brandDisp)) brandDisp = "";
-          if (brandDisp && typeof NS.normalizeDisplayBrandName === "function") {
-            brandDisp = NS.normalizeDisplayBrandName(brandDisp) || brandDisp;
+          if (brandDisp && typeof NS.canonicalizeBrandDisplayCandidate === "function") {
+            brandDisp = NS.canonicalizeBrandDisplayCandidate(brandDisp);
           }
           if (brandDisp && debrisHost(brandDisp)) brandDisp = "";
           if (brandDisp && typeof NS.looksLikeAssetGarbageToken === "function" && NS.looksLikeAssetGarbageToken(brandDisp)) {
-            brandDisp = (pkD && pkD.cn && pkD.cn[0]) || (productBrand && productBrand.cnBrand) || "";
+            const fallbackCn = (pkD && pkD.cn && pkD.cn[0]) || (productBrand && productBrand.cnBrand) || "";
+            brandDisp = typeof NS.canonicalizeBrandDisplayCandidate === "function"
+              ? NS.canonicalizeBrandDisplayCandidate(fallbackCn)
+              : fallbackCn;
           }
-          if ((!brandDisp || debrisHost(brandDisp)) && pkD && pkD.cn && pkD.cn[0]) brandDisp = pkD.cn[0];
+          if ((!brandDisp || debrisHost(brandDisp)) && pkD && pkD.cn && pkD.cn[0]) {
+            brandDisp = typeof NS.canonicalizeBrandDisplayCandidate === "function"
+              ? NS.canonicalizeBrandDisplayCandidate(pkD.cn[0])
+              : pkD.cn[0];
+          }
         }
       } catch { /* keep brandDisp */ }
       // domainRel.brand 仅当已在等权 cn/latin 列表中才补（避免 bestTok=Reserved/Iehuorong 进 UI）
@@ -616,8 +676,8 @@
         && !debrisHost(domainRel.brand)
         && !(typeof NS.looksLikeAssetGarbageToken === "function" && NS.looksLikeAssetGarbageToken(domainRel.brand))) {
         try {
-          const b0 = typeof NS.normalizeDisplayBrandName === "function"
-            ? (NS.normalizeDisplayBrandName(domainRel.brand) || domainRel.brand)
+          const b0 = typeof NS.canonicalizeBrandDisplayCandidate === "function"
+            ? NS.canonicalizeBrandDisplayCandidate(domainRel.brand)
             : domainRel.brand;
           const pk2 = typeof NS.collectPrimaryBrandKeywords === "function"
             ? NS.collectPrimaryBrandKeywords()
@@ -634,13 +694,16 @@
       }
       if (brandDisp && debrisHost(brandDisp)) brandDisp = "";
       if (brandDisp && typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(brandDisp)) {
-        brandDisp = (productBrand && productBrand.cnBrand) || "";
+        const fallbackCn = (productBrand && productBrand.cnBrand) || "";
+        brandDisp = typeof NS.canonicalizeBrandDisplayCandidate === "function"
+          ? NS.canonicalizeBrandDisplayCandidate(fallbackCn)
+          : fallbackCn;
       }
-      if (brandDisp && /[一-鿿]/.test(brandDisp) && typeof NS.trimChineseBrandTrail === "function") {
-        brandDisp = NS.trimChineseBrandTrail(brandDisp) || brandDisp;
+      if (brandDisp && typeof NS.canonicalizeBrandDisplayCandidate === "function") {
+        brandDisp = NS.canonicalizeBrandDisplayCandidate(brandDisp);
       }
       if (!brandDisp || (NS.BRAND_TOKEN_STOP_RE && NS.BRAND_TOKEN_STOP_RE.test(String(brandDisp).toLowerCase()))) {
-        state.spoofBrand = state.spoofBrand || "";
+        state.spoofBrand = "";
       } else {
         state.spoofBrand = brandDisp;
       }
@@ -658,7 +721,10 @@
           : titleHostCorr.hostMatch === "hyphen" ? "域名用连字符拆分品牌名"
             : titleHostCorr.hostMatch === "none" ? "域名与品牌无关"
               : "关联不严谨";
-      const signalDetail = `标题/正文品牌「${showBrand || titleHostCorr.brandToken}」与域名 ${location.hostname} 不匹配（${matchHint}）`;
+      // 拒绝的功能词或仅由域名推导出的核不能再从详情文案回流到 Popup。
+      const signalDetail = showBrand
+        ? `标题/正文品牌「${showBrand}」与域名 ${location.hostname} 不匹配（${matchHint}）`
+        : `页面宣称品牌与域名 ${location.hostname} 不匹配（${matchHint}）`;
 
       if (NS.hasValidIcpRecord() && !state._seoCloakKitDetected && !state._fakeSpaDetected
         && titleHostCorr.hostMatch === "padded") {
@@ -1025,10 +1091,15 @@
           const rel2 = NS.evaluateDomainKeywordRelevance();
           if (rel2 && !rel2.related && (rel2.mismatch || rel2.hostMatch === "none") && (rel2.brand || rel2.brandToken)) {
             parentMismatch = true;
-            parentBrand = parentBrand || rel2.brand || rel2.brandToken || "";
+            // brandToken 可能只是从 padded 域名剥出的核，只用于判定 mismatch；
+            // 只有已通过页面身份共识的 rel2.brand 才能进入展示状态。
+            parentBrand = parentBrand || rel2.brand || "";
           }
         }
       } catch { /* ignore */ }
+      if (parentBrand && typeof NS.canonicalizeBrandDisplayCandidate === "function") {
+        parentBrand = NS.canonicalizeBrandDisplayCandidate(parentBrand);
+      }
 
       NS.silverfoxLog && NS.silverfoxLog(
         "proactive-probe", "start",
@@ -1103,7 +1174,9 @@
           }
           const showBrand = state.spoofBrand || parentBrand || "";
           const reason = landHit.analysis.brandSpoofLanding || parentMismatch
-            ? `主动探测：首页下载入口指向仿冒落地页（${showBrand || "品牌"} 与域名不匹配）`
+            ? (showBrand
+              ? `主动探测：首页下载入口指向仿冒落地页（${showBrand} 与域名不匹配）`
+              : "主动探测：首页下载入口指向仿冒落地页（页面品牌与域名不匹配）")
             : landHit.analysis.staticPackageLanding
               ? "主动探测：下载按钮指向的落地页含安装包分发"
               : "主动探测：下载按钮指向的落地页含远程配置/动态下发安装包链路";

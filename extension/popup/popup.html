@@ -4,15 +4,45 @@
     <meta charset="utf-8" />
     <style>
       body { width: 320px; padding: 10px; font-family: Arial, sans-serif; }
-      .title { font-weight: bold; margin-bottom: 8px; }
+      .title-row {
+        display: flex; align-items: center; justify-content: space-between;
+        margin-bottom: 8px; gap: 8px;
+      }
+      .title { font-weight: bold; }
+      .settings-link {
+        font-size: 11px; color: #1565c0; text-decoration: none; white-space: nowrap;
+      }
+      .settings-link:hover { text-decoration: underline; }
       .low { color: #2e7d32; }
       .medium { color: #f59e0b; }
       .high { color: #d93025; }
-      .item { font-size: 12px; margin-top: 4px; }
+      .item { font-size: 12px; margin-top: 6px; word-break: break-word; line-height: 1.4; }
+      .file-row, .sig-row { margin-top: 6px; }
+      .file-name { color: #222; }
+      .sha-row { margin-top: 4px; font-size: 11px; color: #555; }
+      .sha-text { font-family: ui-monospace, Consolas, monospace; font-size: 10px; }
+      .ssl-org { color: #2e7d32; font-weight: 600; }  /* OV/EV 绿色 */
+      .ssl-dv { color: #222; }                        /* DV */
+      .vt-ok { color: #2e7d32; }
+      .vt-warn { color: #f59e0b; }
+      .vt-bad { color: #d93025; font-weight: 600; }
+      /* 数字签名：有签黑 / VT 有效绿 / 无效或无签红 */
+      .sig-black { color: #111; }
+      .sig-valid { color: #2e7d32; font-weight: 600; }
+      .sig-invalid, .sig-none { color: #d93025; font-weight: 600; }
+      .sig-nested { font-size: 11px; margin-top: 4px; color: #444; }
+      .sig-nested-indent { margin-left: 8px; margin-top: 2px; }
+      .vt-a { color: #1565c0; font-size: 12px; text-decoration: none; }
+      .vt-a:hover { text-decoration: underline; }
+      .vt-link { margin-top: 4px; }
+      .vt-block { margin-top: 6px; }
     </style>
   </head>
   <body>
-    <div class="title">网页风险分析</div>
+    <div class="title-row">
+      <div class="title">网页风险分析</div>
+      <a class="settings-link" href="#" id="open-settings" title="扩展设置">设置</a>
+    </div>
     <div id="result">正在分析当前页面…</div>
     <script src="popup.js"></script>
   </body>
