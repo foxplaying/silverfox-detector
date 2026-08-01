@@ -15,11 +15,24 @@
       restoreList.push({ proto, method, orig });
     }
 
+    /** 保存访问器完整描述符；直接赋值无法正确恢复 href/src setter。 */
+    static saveProtoDescriptor(restoreList, proto, property, descriptor, marker) {
+      if (!proto || !property || !descriptor) return;
+      restoreList.push({ proto, property, descriptor, marker });
+    }
+
     static restoreNativeDomProtos(restoreList) {
       while (restoreList.length) {
         const item = restoreList.pop();
         try {
-          if (item && item.proto && item.method && item.orig) item.proto[item.method] = item.orig;
+          if (item && item.proto && item.property && item.descriptor) {
+            Object.defineProperty(item.proto, item.property, item.descriptor);
+            if (item.marker) {
+              try { delete item.proto[item.marker]; } catch { /* ignore */ }
+            }
+          } else if (item && item.proto && item.method && item.orig) {
+            item.proto[item.method] = item.orig;
+          }
         } catch { /* ignore */ }
       }
       try { if (Element.prototype.__silverfoxSetAttr) delete Element.prototype.__silverfoxSetAttr; } catch { /* ignore */ }
@@ -173,9 +186,9 @@
     static install(policy, restoreList) {
       DomGuard._wrapFetch(policy);
       DomGuard._wrapCreateElement(policy);
-      DomGuard._patchAnchorHrefProto(policy);
-      DomGuard._patchAnchorClickProto(policy);
-      DomGuard._patchIframeSrcProto(policy);
+      DomGuard._patchAnchorHrefProto(policy, restoreList);
+      DomGuard._patchAnchorClickProto(policy, restoreList);
+      DomGuard._patchIframeSrcProto(policy, restoreList);
       DomGuard._patchSetAttribute(policy, restoreList);
       DomGuard._wrapInsertMethods(policy, restoreList);
     }
@@ -184,6 +197,7 @@
       try {
         const origFetch = window.fetch.bind(window);
         window.fetch = function (...args) {
+          if (policy.officialSafe) return origFetch.apply(this, args);
           const input = args[0];
           const url = typeof input === "string" ? input : input && input.url;
           const urlStr = String(url || "");
@@ -207,6 +221,7 @@
             if (url && (looksLikeAdminApi || looksLikeVendorClientConfig)) {
               return p.then(async (response) => {
                 try {
+                  if (policy.officialSafe) return response;
                   const clone = response.clone();
                   const text = await clone.text();
                   let links = [];
@@ -257,6 +272,7 @@
         const origCreate = document.createElement.bind(document);
         document.createElement = function (tagName, ...args) {
           const el = origCreate(tagName, ...args);
+          if (policy.officialSafe) return el;
           const tag = String(tagName).toLowerCase();
           if (tag === "style") {
             try {
@@ -272,6 +288,7 @@
                   configurable: true, enumerable: true,
                   get() { return desc.get.call(this); },
                   set(v) {
+                    if (policy.officialSafe) return desc.set.call(this, v);
                     if (CloakingKit.isDesktopForceDownloadKitBlob(v)) {
                       policy.armDesktopForceDownloadKit("style.textContent dlp CSS");
                       return desc.set.call(this, "");
@@ -287,6 +304,8 @@
             const origClick = el.click.bind(el);
             el.click = function (...clickArgs) {
               const href = el.getAttribute("href") || el.href || "";
+              policy.noteTrustedDownloadIntent(href);
+              if (policy.officialSafe) return origClick(...clickArgs);
               if (policy.tryBlockNavigation(href, `dynamic-anchor-click -> ${href}`) || policy._tryBlock(href, `dynamic-anchor-click -> ${href}`)) return;
               if ((policy.forceDesktopDlKit || policy.guardEnabled) && href && PackageHeuristics.isPackageFileUrl(href) && !PackageHeuristics.isStrongProductInstallerUrl(href)) return;
               return origClick(...clickArgs);
@@ -298,6 +317,8 @@
                   configurable: true, enumerable: true,
                   get() { return desc.get.call(this); },
                   set(v) {
+                    policy.noteTrustedDownloadIntent(v);
+                    if (policy.officialSafe) return desc.set.call(this, v);
                     const val = String(v || "");
                     if (policy._shouldBlockUrl(val) || PackageHeuristics.looksLikeOpaqueDownloadHopUrl(val) || policy.blockedHops.has(val)
                       || PackageHeuristics.looksLikeObjectStoragePackageUrl(val)
@@ -337,6 +358,7 @@
                   configurable: true, enumerable: true,
                   get() { return desc.get.call(this); },
                   set(v) {
+                    if (policy.officialSafe) return desc.set.call(this, v);
                     const val = String(v || "");
                     if (policy.tryBlockNavigation(val, `${tag}.src-create -> ${val}`)) return;
                     if ((policy.forceDesktopDlKit || policy.guardEnabled) && PackageHeuristics.isPackageFileUrl(val) && !PackageHeuristics.isStrongProductInstallerUrl(val)) {
@@ -363,6 +385,7 @@
                   configurable: true, enumerable: true,
                   get() { return cDesc.get.call(this); },
                   set(v) {
+                    if (policy.officialSafe) return cDesc.set.call(this, v);
                     const s = String(v || "");
                     if (/\bdlp-(?:overlay|modal|topbar|btn|badge)\b/i.test(s)) {
                       policy.armDesktopForceDownloadKit(`className 注入 ${s.slice(0, 40)}`);
@@ -379,16 +402,19 @@
       } catch { /* ignore */ }
     }
 
-    static _patchAnchorHrefProto(policy) {
+    static _patchAnchorHrefProto(policy, restoreList) {
       try {
         const proto = HTMLAnchorElement.prototype;
         const desc = Object.getOwnPropertyDescriptor(proto, "href");
         if (desc && desc.set && !proto.__silverfoxHrefPatched) {
+          DomGuard.saveProtoDescriptor(restoreList, proto, "href", desc, "__silverfoxHrefPatched");
           proto.__silverfoxHrefPatched = true;
           Object.defineProperty(proto, "href", {
             configurable: true, enumerable: true,
             get() { return desc.get.call(this); },
             set(v) {
+              policy.noteTrustedDownloadIntent(v);
+              if (policy.officialSafe) return desc.set.call(this, v);
               const val = String(v || "");
               if (policy._shouldBlockUrl(val) || PackageHeuristics.looksLikeOpaqueDownloadHopUrl(val) || policy.blockedHops.has(val)) {
                 policy._rememberHop(val);
@@ -408,27 +434,35 @@
       } catch { /* ignore */ }
     }
 
-    static _patchAnchorClickProto(policy) {
+    static _patchAnchorClickProto(policy, restoreList) {
       try {
         const origAnchorClick = HTMLAnchorElement.prototype.click;
+        DomGuard.saveProtoMethod(restoreList, HTMLAnchorElement.prototype, "click", origAnchorClick);
         HTMLAnchorElement.prototype.click = function (...args) {
           const href = this.getAttribute("href") || this.href || "";
+          policy.noteTrustedDownloadIntent(href);
+          if (policy.officialSafe) return origAnchorClick.apply(this, args);
           if (policy._tryBlock(href, `anchor.click -> ${href}`)) return;
           return origAnchorClick.apply(this, args);
         };
       } catch { /* ignore */ }
     }
 
-    static _patchIframeSrcProto(policy) {
+    static _patchIframeSrcProto(policy, restoreList) {
       const patchSrc = (proto, tag) => {
         if (!proto || proto.__silverfoxSrcPatched) return;
         const desc = Object.getOwnPropertyDescriptor(proto, "src");
         if (!desc || !desc.set) return;
+        DomGuard.saveProtoDescriptor(restoreList, proto, "src", desc, "__silverfoxSrcPatched");
         proto.__silverfoxSrcPatched = true;
         Object.defineProperty(proto, "src", {
           configurable: true, enumerable: true,
-          get() { return desc.get.call(this); },
-          set(v) {
+            get() { return desc.get.call(this); },
+            set(v) {
+              if (policy.officialSafe) {
+                policy.noteTrustedDownloadIntent(v);
+                return desc.set.call(this, v);
+              }
             const val = String(v || "");
             if (policy.tryBlockNavigation(val, `${tag}.src -> ${val}`)) return;
             if ((policy.forceDesktopDlKit || policy.guardEnabled) && PackageHeuristics.isPackageFileUrl(val)
@@ -648,6 +682,7 @@
           get() { return downloadUriValue; },
           set(v) {
             downloadUriValue = String(v || "");
+            if (policy.officialSafe) return;
             if (!downloadUriValue) return;
             let multiBind = false;
             try {

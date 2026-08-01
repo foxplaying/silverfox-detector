@@ -437,7 +437,15 @@
       if (NS.apexSameBrandFamily(info.pageApex, info.topBrandApex)) return false;
       const reasons = [`当前域 ${location.hostname}（apex=${info.pageApex}）`, `盗用品牌资源主机 ${info.topBrandApex}（命中 ${info.topCount}+）`];
       if (hostSquatsBrand) reasons.push(`域名冒用品牌词「${brandRoot}」`);
-      if (titleHostMismatch) reasons.push(`标题/正文品牌「${corr.brandToken}」出现约 ${corr.brandHits} 次，与域名 ${corr.hostLabel} 关联不严谨（${corr.hostMatch}）`);
+      if (titleHostMismatch) {
+        let corrBrand = "";
+        try {
+          if (typeof NS.resolveSpoofDisplayBrand === "function") corrBrand = NS.resolveSpoofDisplayBrand(location.hostname) || "";
+        } catch { /* ignore */ }
+        reasons.push(corrBrand
+          ? `标题/正文品牌「${corrBrand}」出现约 ${corr.brandHits} 次，与域名 ${corr.hostLabel} 关联不严谨（${corr.hostMatch}）`
+          : `页面宣称品牌与域名 ${corr.hostLabel} 关联不严谨（${corr.hostMatch}）`);
+      }
       if (faviconOffBrand) reasons.push("favicon/图标来自官方域");
       if (jsonLdBrandMismatch) reasons.push("结构化数据指向官方域");
       state._brandResourceMismatchDetected = true;
@@ -486,18 +494,25 @@
       const label = pkg ? NS.formatPackageLabel(pkg) : "远程乱码安装包";
       NS.addSignal("远程下发乱码安装包", 22, pkg ? `官网下载页远程拉取安装包，文件名/主机异常: ${label}` : "官网下载页通过脚本远程下发安装包（乱码文件名或高熵下载域名）");
       if (squat === "padded" || squat === "typo" || squat === "hyphen") {
-        const lab0 = (location.hostname || "").toLowerCase().replace(/^www\./, "").split(".")[0] || "";
         let brandTok = "";
         try {
           if (typeof NS.resolveSpoofDisplayBrand === "function") brandTok = NS.resolveSpoofDisplayBrand(location.hostname) || "";
         } catch { /* ignore */ }
         if (!brandTok) {
-          brandTok = NS.pickBrandTokenForHost(NS.extractLatinBrandTokens(title), lab0) || NS.extractLatinBrandTokens(title)[0] || "";
-          if (brandTok) brandTok = NS.formatBrandTokenForDisplay(brandTok);
+          const primary = typeof NS.collectPrimaryBrandKeywords === "function"
+            ? NS.collectPrimaryBrandKeywords()
+            : null;
+          brandTok = (primary && primary.display) || "";
+        }
+        if (brandTok && typeof NS.canonicalizeBrandDisplayCandidate === "function") {
+          brandTok = NS.canonicalizeBrandDisplayCandidate(brandTok);
         }
         if (brandTok) state.spoofBrand = brandTok;
         const shapeHint = squat === "hyphen" ? "域名用连字符拆分品牌名" : "域名夹带品牌前缀/后缀";
         NS.addSignal("仿冒品牌官网下载站", 24, brandTok ? `标题/正文品牌「${brandTok}」与域名 ${location.hostname} 不匹配（${shapeHint}）` : `域名 ${location.hostname} 呈品牌营销站形态，且远程下发异常安装包`);
+      }
+      if (state.spoofBrand && typeof NS.canonicalizeBrandDisplayCandidate === "function") {
+        state.spoofBrand = NS.canonicalizeBrandDisplayCandidate(state.spoofBrand);
       }
       NS.installDownloadGuard(pkg ? `远程乱码安装包: ${label}` : "远程下发乱码安装包", { notify: true, href: pkg || "", message: pkg ? `远程安装包异常: ${label}` : "官网下载页远程下发乱码安装包", title: state.spoofBrand ? `已识别仿冒「${state.spoofBrand}」官网` : "已拦截远程异常安装包", forceNotify: true, guardKind: state.spoofBrand ? "brand-spoof" : "package", lockHard: true });
       NS.postToHooks({ type: "set-guard", enabled: true });

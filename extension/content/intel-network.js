@@ -190,11 +190,22 @@
   NS.looksLikeIcpLicense = function (value) {
     if (!value) return false;
     const v = String(value).trim();
+    // 接口占位/失败文案绝不当备案号
+    if (/查询失败|信息查询失败|未找到|未查询|未备案|没有|无备案|暂无|查无|不存在|失败|错误|null|undefined/i.test(v)) {
+      return false;
+    }
     if (/(ICP|备案)/i.test(v) && /\d{4,}/.test(v)) return true;
     if (/^[一-鿿]{1,3}[A-Z]?\d{1,4}-\d{5,}(?:-\d+)?$/i.test(v)) return true;
-    if (/^[一-鿿].{0,6}\d{5,}/.test(v) && !/未|没有|无|暂|失败|错误|找不到/.test(v)) return true;
+    if (/^[一-鿿].{0,6}\d{5,}/.test(v)) return true;
     return false;
   };
+
+  /** uapis/beiancx 字段占位：查询失败、无法识别 等 */
+  function isIcpPlaceholderField(s) {
+    const v = String(s || "").trim();
+    if (!v) return true;
+    return /^(?:查询失败|查询成功|失败|错误|无|暂无|null|undefined|n\/a|无法识别|-|—|－)$/i.test(v);
+  }
 
   function extractIcpFromAizhanResponse(text) {
     if (!text) return { success: false };
@@ -211,6 +222,60 @@
   const ICP_BEIANCX_TIMEOUT_MS = 2800;
   // 任一源已给出明确 missing 后，再给其它源抢备案号的宽限
   const ICP_RACE_MISSING_GRACE_MS = 500;
+
+  /**
+   * 解析 uapis.cn ICP JSON，区分三类结局：
+   *  - 命中备案号 → success + icpRecord
+   *  - 明确无备案 → success + icpMissing（NOT_FOUND / No ICP record）
+   *  - 查询失败   → success:false（假 200+查询失败、INVALID_PARAMETER 等，绝不当 missing）
+   *
+   * 实测失败样例：
+   *  {"code":"200","serviceLicence":"查询失败",...,"msg":"查询成功"}
+   *  {"code":"NOT_FOUND","message":"No ICP record found for this domain."}
+   *  {"code":"INVALID_PARAMETER","message":"ICP信息查询失败"}
+   */
+  function parseUapisIcpJson(data, host) {
+    if (!data || typeof data !== "object") return { success: false, source: "uapis" };
+    const code = String(data.code ?? data.status ?? "").trim().toUpperCase();
+    const msg = String(data.msg || data.message || "").trim();
+    const licenseRaw = String(
+      data.serviceLicence || data.serviceLicense || data.icp || data.license || ""
+    ).trim();
+    const unitRaw = String(data.unitName || "").trim();
+    const natureRaw = String(data.natureName || "").trim();
+    const domain = intelHost(data.domain || host);
+    const unitName = isIcpPlaceholderField(unitRaw) ? "" : unitRaw;
+    const natureName = isIcpPlaceholderField(natureRaw) ? "" : natureRaw;
+    const base = { source: "uapis", unitName, natureName, domain };
+
+    // ① 明确无备案
+    if (code === "NOT_FOUND" || code === "404"
+      || /no\s*icp\s*record|not\s*found|no\s*record|未备案|无备案|查无|不存在/i.test(msg)) {
+      return { ...base, success: true, icpRecord: "", icpMissing: true, unitName: "", natureName: "" };
+    }
+
+    // ② 查询失败 / 参数错误（含 code=200 但字段全是「查询失败」的假成功）
+    if (code === "INVALID_PARAMETER" || code === "ERROR" || code === "FAIL"
+      || /信息查询失败|invalid\s*parameter|参数错误/i.test(msg)
+      || isIcpPlaceholderField(licenseRaw)
+      || /查询失败/.test(licenseRaw)) {
+      return { ...base, success: false };
+    }
+
+    // ③ 真实命中
+    if ((code === "200" || code === "0" || code === "OK" || code === "SUCCESS")
+      && NS.looksLikeIcpLicense(licenseRaw)) {
+      return {
+        ...base,
+        success: true,
+        icpRecord: licenseRaw,
+        icpMissing: false
+      };
+    }
+
+    // 其它 code / 空结果 → 失败，不写 missing 缓存
+    return { ...base, success: false };
+  }
 
   async function queryIcpAizhan(domain, batchMap) {
     return withIcpCache(domain, "aizhan", async (h) => {
@@ -229,94 +294,71 @@
       const result = await NS.fetchPageTextFromBackground(url, { timeoutMs: ICP_FAST_TIMEOUT_MS });
       if (!result.success || !result.text) return { success: false, queriedHost: h };
       try {
-        const data = JSON.parse(result.text);
-        const code = String(data.code ?? data.status ?? "").trim();
-        const license = String(data.serviceLicence || data.serviceLicense || data.icp || data.license || "").trim();
-        const unitName = String(data.unitName || "").trim();
-        const natureName = String(data.natureName || "").trim();
-        const msg = String(data.msg || data.message || "").trim();
-        if ((code === "200" || code === "0") && NS.looksLikeIcpLicense(license)) return { success: true, icpRecord: license, icpMissing: false, source: "uapis", unitName, natureName, queriedHost: h, domain: intelHost(data.domain || h) };
-        if (code === "200" || code === "404" || /未|无备案|查无|不存在|not\s*found|no\s*record/i.test(msg)) return { success: true, icpRecord: "", icpMissing: true, source: "uapis", unitName, natureName, queriedHost: h, domain: intelHost(data.domain || h) };
-        return { success: false, queriedHost: h };
-      } catch { return { success: false, queriedHost: h }; }
+        return { ...parseUapisIcpJson(JSON.parse(result.text), h), queriedHost: h };
+      } catch {
+        return { success: false, queriedHost: h, source: "uapis" };
+      }
     }, batchMap);
   }
 
   /**
-   * beiancx.com 结果页 HTML：https://beiancx.com/{domain}.html
-   * 查无/未备案按 404（及短 nginx 404 页）处理；备案号 / JSON-LD → license。
-   * 仅用 beiancx.com（不用 www.beiancx.com）。
+   * beiancx.com/{domain}.html
+   * SSR 把备案号写在 JSON-LD：mainEntity.identifier（京ICP备… / 粤B2-… 等）。
+   * 404 / 未备案 → missing；有 identifier → hit。不必扫整页 CSS/FAQ。
    */
   function extractIcpFromBeiancxHtml(html, httpStatus) {
-    const status = Number(httpStatus) || 0;
-    if (status === 404) return { success: true, icpRecord: "", icpMissing: true, source: "beiancx" };
-    const text = String(html || "");
-    if (!text) return { success: false, source: "beiancx" };
-    // 短 nginx/404 页（查无即 404，无需再扫「未备案」文案）
-    if (text.length < 1200 && /404\s*Not\s*Found|nginx/i.test(text) && !/备案号|ICP/i.test(text)) {
+    if (Number(httpStatus) === 404) {
       return { success: true, icpRecord: "", icpMissing: true, source: "beiancx" };
     }
-    // 结构化 JSON-LD
-    try {
-      const ldBlocks = text.match(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
-      for (const block of ldBlocks) {
-        const raw = block.replace(/^[\s\S]*?>/, "").replace(/<\/script>\s*$/i, "");
-        try {
-          const obj = JSON.parse(raw);
-          const pile = Array.isArray(obj) ? obj : [obj];
-          for (const o of pile) {
-            const lic = String(o?.serviceLicence || o?.serviceLicense || o?.icp || o?.license || o?.identifier || "").trim();
-            if (NS.looksLikeIcpLicense(lic)) {
-              return {
-                success: true,
-                icpRecord: lic,
-                icpMissing: false,
-                source: "beiancx",
-                unitName: String(o?.name || o?.unitName || "").trim(),
-                natureName: String(o?.natureName || "").trim()
-              };
-            }
-          }
-        } catch { /* ignore one block */ }
-      }
-    } catch { /* ignore */ }
-    // 页面「备案号」字段 / 常见 ICP 形态
-    const labeled = text.match(/备案号\s*<\/[^>]+>\s*<[^>]+>\s*([一-鿿A-Za-z0-9\-备证]{6,48})/i)
-      || text.match(/备案号[：:\s]*([一-鿿A-Za-z0-9\-备证]{6,48})/i)
-      || text.match(/>([一-鿿]{1,3}ICP[备证]\d{5,12}号(?:-\d+)?)</i)
-      || text.match(/([一-鿿]{1,3}ICP[备证]\d{5,12}号(?:-\d+)?)/i)
-      || text.match(/([一-鿿]{1,3}[A-Z]?\d{1,4}-\d{5,}(?:-\d+)?)/);
-    if (labeled && labeled[1]) {
-      const lic = String(labeled[1]).replace(/<[^>]+>/g, "").trim();
-      if (NS.looksLikeIcpLicense(lic)) {
-        let unitName = "";
-        const um = text.match(/主办单位名称\s*<\/[^>]+>\s*<[^>]+>\s*([^<]{2,80})/i)
-          || text.match(/主办单位名称[：:\s]*([^<\n]{2,80})/i);
-        if (um) unitName = String(um[1] || "").trim();
-        return { success: true, icpRecord: lic, icpMissing: false, source: "beiancx", unitName };
-      }
+    const t = String(html || "");
+    if (!t) return { success: false, source: "beiancx" };
+    if (t.length < 1200 && /404\s*Not\s*Found|nginx/i.test(t)) {
+      return { success: true, icpRecord: "", icpMissing: true, source: "beiancx" };
     }
-    // 明确「已备案」但抽不出号 → 不判 missing，留给其它源
-    if (/已查询到备案|已备案/i.test(text) && /备案号/i.test(text)) return { success: false, source: "beiancx" };
+
+    // ① JSON-LD mainEntity.identifier（站点稳定字段，含非 ICP 形态如 粤B2-20090059-5）
+    let lic = "";
+    const idm = t.match(/"mainEntity"\s*:\s*\{[^}]*?"identifier"\s*:\s*"([^"]*)"/i);
+    if (idm) lic = String(idm[1] || "").trim();
+
+    // ② 兜底：结果卡片 / 页内标准 ICP 号
+    if (!NS.looksLikeIcpLicense(lic)) {
+      const m = t.match(/result-label[^>]*>\s*备案号\s*<[\s\S]{0,120}?result-value[^>]*>([^<]{4,48})</i)
+        || t.match(/([一-鿿]{1,3}ICP[备证]\d{5,12}号(?:-\d+)?)/i);
+      if (m) lic = String(m[1] || "").trim();
+    }
+
+    if (NS.looksLikeIcpLicense(lic)) {
+      const um = t.match(/result-label[^>]*>\s*主办单位名称\s*<[\s\S]{0,120}?result-value[^>]*>([^<]{2,80})</i);
+      return {
+        success: true,
+        icpRecord: lic,
+        icpMissing: false,
+        source: "beiancx",
+        unitName: um ? String(um[1] || "").trim() : ""
+      };
+    }
+
+    // identifier 为空 / 明确未备案
+    if ((idm && !lic) || (/未备案|未查询到备案|暂无备案|没有备案/i.test(t)
+      && !/已查询到备案|已备案|ICP filing record/i.test(t))) {
+      return { success: true, icpRecord: "", icpMissing: true, source: "beiancx" };
+    }
     return { success: false, source: "beiancx" };
   }
 
   async function queryIcpBeiancx(domain, batchMap) {
     return withIcpCache(domain, "beiancx", async (h) => {
-      // 仅 beiancx.com，不用 www.beiancx.com；整页 HTML 重，超时压短
       const url = `https://beiancx.com/${encodeURIComponent(h)}.html`;
       const result = await NS.fetchPageTextFromBackground(url, { timeoutMs: ICP_BEIANCX_TIMEOUT_MS });
+      const st = Number(result && result.status) || 0;
       if (!result.success) {
-        if (result.status === 404 || /404|not\s*found/i.test(String(result.error || ""))) {
+        if (st === 404 || /404|not\s*found/i.test(String(result.error || ""))) {
           return { success: true, icpRecord: "", icpMissing: true, source: "beiancx", queriedHost: h };
         }
-        return { success: false, queriedHost: h };
+        return { success: false, queriedHost: h, source: "beiancx" };
       }
-      if (result.status === 404) {
-        return { success: true, icpRecord: "", icpMissing: true, source: "beiancx", queriedHost: h };
-      }
-      const parsed = extractIcpFromBeiancxHtml(result.text || "", result.status);
-      return { ...parsed, source: "beiancx", queriedHost: h, domain: h };
+      return { ...extractIcpFromBeiancxHtml(result.text || "", st), source: "beiancx", queriedHost: h, domain: h };
     }, batchMap);
   }
 
@@ -515,7 +557,7 @@
       return "";
     };
 
-    // ① 扁平 WHOIS 字段（rdap.ss → CNNIC whoisData / rawData）
+    // ① 扁平 WHOIS 字段（rdap.ss → CNNIC whoisData / rawData；who-dat → dates.created）
     const pullFlatDate = (obj) => {
       if (!obj || typeof obj !== "object" || Array.isArray(obj)) return "";
       const prefer = [
@@ -529,6 +571,17 @@
           if (iso) return iso;
         }
       }
+      // who-dat.as93.net：{ dates: { created, updated, expires } }
+      try {
+        if (obj.dates && typeof obj.dates === "object") {
+          for (const k of ["created", "creation", "registered"]) {
+            if (obj.dates[k] != null && obj.dates[k] !== "") {
+              const iso = toIso(obj.dates[k]);
+              if (iso) return iso;
+            }
+          }
+        }
+      } catch { /* ignore */ }
       try {
         for (const [k, v] of Object.entries(obj)) {
           if (typeof v !== "string" && typeof v !== "number") continue;
@@ -716,6 +769,29 @@
     }
   }
 
+  /** 从原始 WHOIS 文本抽注册日（CNNIC / ICANN 通用行） */
+  function extractDateFromWhoisText(rawWhois) {
+    if (!rawWhois) return "";
+    const s = String(rawWhois);
+    const lineRe = /(?:Registration\s*Time|Registration\s*Date|Created\s*Date|Creation\s*Date|Created\s*On|Domain\s*Name\s*Commencement\s*Date|注册时间|创建日期)\s*[：:]\s*([0-9]{4}[-/.][0-9]{1,2}[-/.][0-9]{1,2}(?:\s+[0-9:]{5,8}|T[0-9:]{5,8}Z?)?)/i;
+    const lm = s.match(lineRe);
+    if (lm) {
+      const iso = parseWhoisDateToIso(lm[1]);
+      if (iso) return iso;
+    }
+    return "";
+  }
+
+  /** 从候选字段列表取首个可解析日期 */
+  function firstParseableDate(candidates) {
+    for (const c of candidates) {
+      if (c == null || c === "") continue;
+      const iso = parseWhoisDateToIso(c);
+      if (iso) return iso;
+    }
+    return "";
+  }
+
   async function queryWhoisWhoiscx(host) {
     if (NS.isPublicSuffixOnlyHost(host)) return null;
     const url = "https://whoiscx.com/api/whois/info/";
@@ -731,23 +807,12 @@
         (data.data && (data.data.raw || data.data.whois || data.data.raw_whois || data.data.rawWhois))
         || info.raw || info.whois || fields.raw || ""
       );
-      let registeredAt = "";
-      // 结构化字段优先，再 CNNIC 文本行
-      const dateCandidates = [
+      let registeredAt = firstParseableDate([
         fields.creation_date, fields.Creation_Date, fields.created, fields.Created,
         info.creation_time, info.creation_date, info.created, info.Created,
         fields["Creation Date"], fields["Created Date"], info["Creation Date"], info["Created Date"]
-      ];
-      for (const c of dateCandidates) {
-        registeredAt = parseWhoisDateToIso(c);
-        if (registeredAt) break;
-      }
-      if (!registeredAt && rawWhois) {
-        // CNNIC / 通用 WHOIS 行
-        const lineRe = /(?:Registration\s*Time|Registration\s*Date|Created\s*Date|Creation\s*Date|Created\s*On|Domain\s*Name\s*Commencement\s*Date|注册时间|创建日期)\s*[：:]\s*([0-9]{4}[-/.][0-9]{1,2}[-/.][0-9]{1,2}(?:\s+[0-9:]{5,8})?)/i;
-        const lm = rawWhois.match(lineRe);
-        if (lm) registeredAt = parseWhoisDateToIso(lm[1]);
-      }
+      ]);
+      if (!registeredAt && rawWhois) registeredAt = extractDateFromWhoisText(rawWhois);
       // 仅有 creation_days 而无真实日期 → 丢弃（禁止反推「今天/0天」）
       if (!registeredAt) return null;
       let ageDaysOpt = null;
@@ -757,10 +822,143 @@
     } catch { return null; }
   }
 
+  /**
+   * who-dat（as93）：https://who-dat.as93.net/{domain}
+   * 免 Key；RDAP 封装，JSON 含 dates.created（ISO）。
+   * 例：qq.com → {"isRegistered":true,"dates":{"created":"1995-05-04T04:00:00Z",...}}
+   */
+  async function queryWhoisWhoDat(host) {
+    if (NS.isPublicSuffixOnlyHost(host)) return null;
+    const h = intelHost(host);
+    if (!h) return null;
+    // 路径段：去首尾斜杠；保留点号主机（www.xinhuanet.com / qq.com）
+    const url = `https://who-dat.as93.net/${encodeURIComponent(h)}`;
+    const result = await NS.fetchPageTextFromBackground(url, { timeoutMs: 4000 });
+    if (!result.success || !result.text) {
+      NS.silverfoxLog && NS.silverfoxLog("intel-whois", "whodat-fetch-fail", host, result && result.error);
+      return null;
+    }
+    try {
+      const text = String(result.text).trim();
+      if (!text.startsWith("{")) return null;
+      const data = JSON.parse(text);
+      if (!data || typeof data !== "object") return null;
+      // 明确未注册
+      if (data.isRegistered === false || data.isRegistered === "false") return null;
+      // 错误页 / 空结果
+      if (data.error || data.message === "not found" || data.status === 404) return null;
+      const dates = data.dates && typeof data.dates === "object" ? data.dates : {};
+      let registeredAt = firstParseableDate([
+        dates.created, dates.creation, dates.registered,
+        data.created, data.creationDate, data.registeredAt
+      ]);
+      // 若嵌套 contacts 无日期，再试标准 RDAP 字段（部分 TLD 可能原样透传）
+      if (!registeredAt) registeredAt = NS.extractRegistrationDateFromRdap(data);
+      if (!registeredAt) {
+        NS.silverfoxLog && NS.silverfoxLog("intel-whois", "whodat-no-date", host);
+        return null;
+      }
+      NS.silverfoxLog && NS.silverfoxLog("intel-whois", "whodat-hit", host, registeredAt.slice(0, 10));
+      return finalizeWhoisResult(host, registeredAt, null, "who-dat.as93.net");
+    } catch (e) {
+      NS.silverfoxLog && NS.silverfoxLog("intel-whois", "whodat-parse-err", host);
+      return null;
+    }
+  }
+
+  /**
+   * 天天 hu WHOIS：https://api.tian.hu/whois/{domain}
+   * 免 Key；限流约 25/min、300/日。对 .cn / gov.cn 解析质量好（含 Registration Time）。
+   */
+  async function queryWhoisTianHu(host) {
+    if (NS.isPublicSuffixOnlyHost(host)) return null;
+    const url = `https://api.tian.hu/whois/${encodeURIComponent(host)}`;
+    const result = await NS.fetchPageTextFromBackground(url, { timeoutMs: 4500 });
+    if (!result.success || !result.text) {
+      NS.silverfoxLog && NS.silverfoxLog("intel-whois", "tianhu-fetch-fail", host, result && result.error);
+      return null;
+    }
+    try {
+      const data = JSON.parse(result.text);
+      const code = data && data.code;
+      if (code !== 200 && code !== "200") {
+        NS.silverfoxLog && NS.silverfoxLog("intel-whois", "tianhu-code", host, code);
+        return null;
+      }
+      const payload = data.data || {};
+      // status: 1 已注册；0 未注册等
+      if (payload.status === 0 || payload.status === "0") return null;
+      const fmtDomain = (payload.formatted && payload.formatted.domain) || {};
+      let registeredAt = firstParseableDate([
+        fmtDomain.created_date_utc, fmtDomain.created_date,
+        fmtDomain.creation_date, fmtDomain.creation_date_utc,
+        fmtDomain.created, fmtDomain.Created
+      ]);
+      if (!registeredAt && payload.result) registeredAt = extractDateFromWhoisText(payload.result);
+      if (!registeredAt) {
+        NS.silverfoxLog && NS.silverfoxLog("intel-whois", "tianhu-no-date", host);
+        return null;
+      }
+      NS.silverfoxLog && NS.silverfoxLog("intel-whois", "tianhu-hit", host, registeredAt.slice(0, 10));
+      return finalizeWhoisResult(host, registeredAt, null, "api.tian.hu");
+    } catch (e) {
+      NS.silverfoxLog && NS.silverfoxLog("intel-whois", "tianhu-parse-err", host);
+      return null;
+    }
+  }
+
+  /**
+   * 官方 RDAP（免 Key）：按 TLD 直连注册局，或经 rdap.org 引导跳转。
+   * com/net → Verisign；org → PIR；info → Identity Digital；其余 → rdap.org。
+   * 已弃用：rdap.afilias.net（DNS 失效，.info 已迁至 identitydigital）。
+   */
+  function buildOfficialRdapUrls(host) {
+    const h = String(host || "").toLowerCase().replace(/\.+$/g, "");
+    const urls = [];
+    try {
+      if (/\.com$/i.test(h)) urls.push(`https://rdap.verisign.com/com/v1/domain/${encodeURIComponent(h)}`);
+      else if (/\.net$/i.test(h)) urls.push(`https://rdap.verisign.com/net/v1/domain/${encodeURIComponent(h)}`);
+      else if (/\.org$/i.test(h)) urls.push(`https://rdap.publicinterestregistry.org/rdap/domain/${encodeURIComponent(h)}`);
+      else if (/\.info$/i.test(h)) urls.push(`https://rdap.identitydigital.services/rdap/domain/${encodeURIComponent(h)}`);
+      // 通用引导：跟随 302 到对应注册局 RDAP
+      urls.push(`https://rdap.org/domain/${encodeURIComponent(h)}`);
+    } catch { /* ignore */ }
+    return urls;
+  }
+
+  async function queryWhoisOfficialRdap(host) {
+    if (NS.isPublicSuffixOnlyHost(host)) return null;
+    const urls = buildOfficialRdapUrls(host);
+    for (const url of urls) {
+      try {
+        const result = await NS.fetchPageTextFromBackground(url, { timeoutMs: 3500 });
+        if (!result.success || !result.text) continue;
+        // 非 JSON（HTML 错误页）跳过
+        const text = result.text.trim();
+        if (!text.startsWith("{") && !text.startsWith("[")) continue;
+        const data = JSON.parse(text);
+        if (data && (data.errorCode || data.error || data.title === "Error")) continue;
+        const registeredAt = NS.extractRegistrationDateFromRdap(data);
+        if (!registeredAt) continue;
+        NS.silverfoxLog && NS.silverfoxLog("intel-whois", "rdap-official-hit", host, registeredAt.slice(0, 10), url.slice(0, 48));
+        return finalizeWhoisResult(host, registeredAt, null, "rdap.org");
+      } catch { /* try next */ }
+    }
+    return null;
+  }
+
   function raceWhoisSources(host) {
     return new Promise((resolve) => {
       if (NS.isPublicSuffixOnlyHost(host)) { resolve(null); return; }
-      const tasks = [queryWhoisRdapSs(host), queryWhoisWhoiscx(host)];
+      // 多源并行竞速：任一拿到真实 registeredAt 即返回
+      // 需 Key 的商业源（WhoisXML / WhoisJSON / IP2WHOIS / WhoisFreaks 等）未接入
+      const tasks = [
+        queryWhoisWhoDat(host),        // who-dat.as93.net（RDAP 封装，dates.created）
+        queryWhoisRdapSs(host),        // rdap.ss
+        queryWhoisWhoiscx(host),       // whoiscx.com
+        queryWhoisTianHu(host),        // api.tian.hu（对 .cn 很强）
+        queryWhoisOfficialRdap(host)   // Verisign / PIR / Identity Digital / rdap.org
+      ];
       let pending = tasks.length; let settled = false;
       for (const p of tasks) {
         Promise.resolve(p).then((r) => {

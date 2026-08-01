@@ -17,6 +17,18 @@
 
   NS.showPageToast = function (title, message, opts = {}) {
     try {
+      // 子 frame 的 fixed Toast 可能落在隐藏/极小 iframe；经后台安全转发到顶层 frame。
+      try {
+        if (typeof NS.isTopFrame === "function" && !NS.isTopFrame() && chrome?.runtime?.id) {
+          chrome.runtime.sendMessage({
+            type: "relay-page-threat-toast",
+            title: String(title || "已拦截可疑下载文件"),
+            message: String(message || "可疑下载已被拦截"),
+            force: opts.force !== false
+          }, () => { void chrome.runtime.lastError; });
+          return;
+        }
+      } catch { /* fallback to local frame */ }
       const c = NS.caches;
       const key = `${title}::${message}`;
       const now = Date.now();
@@ -70,7 +82,8 @@
     const title = opts.title || "已拦截可疑下载文件";
     const message = opts.message || targetLabel;
     const key = `${title}::${message}`;
-    const userAction = !!opts.userAction || !!opts.forceNotify;
+    const explicitUserAction = !!opts.userAction;
+    const notifyRequested = explicitUserAction || !!opts.forceNotify;
     const isIdentityNotice = opts.guardKind === "brand-spoof" || opts.guardKind === "nav-trap" || /仿冒|官网|域名|跳转|搜索引擎/i.test(`${title} ${message}`);
     try {
       if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) return false;
@@ -87,12 +100,14 @@
     const c = NS.caches;
     const now = Date.now();
     const lastSys = c.sentNoticeLastAt.get(key) || 0;
+    const sameIdentityNotice = isIdentityNotice
+      && state._lastGuardNoticeKind === (opts.guardKind || "")
+      && state._lastGuardNoticeKey === key;
     // 仿冒身份类：更易再次发系统通知（2.5s 内去重即可）
     const sysGap = isIdentityNotice ? 2500 : 8000;
     const canSys = !c.sentNoticeKeys.has(key)
-      || (userAction && now - lastSys >= sysGap)
-      || (opts.forceNotify && now - lastSys >= (isIdentityNotice ? 2500 : 3000))
-      || (isIdentityNotice && now - lastSys >= sysGap);
+      || (explicitUserAction && now - lastSys >= sysGap)
+      || (!isIdentityNotice && opts.forceNotify && now - lastSys >= 3000);
     if (canSys) {
       c.sentNoticeKeys.add(key);
       c.sentNoticeLastAt.set(key, now);
@@ -102,7 +117,7 @@
         message,
         url: location.href,
         timestamp: now,
-        force: !!(userAction || opts.forceNotify || isIdentityNotice),
+        force: !!(notifyRequested || isIdentityNotice),
         guardKind: opts.guardKind || ""
       };
       try {
@@ -119,7 +134,13 @@
         if (!/Extension context invalidated/i.test(msg)) console.warn("showGuardOverlay failed", msg);
       }
     }
-    if (opts.toast !== false) NS.showPageToast(title, message, { force: userAction || !!opts.forceNotify || isIdentityNotice });
+    const canToast = !sameIdentityNotice
+      || (explicitUserAction && now - lastSys >= sysGap);
+    if (opts.toast !== false && canToast) {
+      NS.showPageToast(title, message, { force: notifyRequested || isIdentityNotice });
+    }
+    state._lastGuardNoticeKind = opts.guardKind || "";
+    state._lastGuardNoticeKey = key;
     if (opts.guardKind === "brand-spoof") {
       state._brandSpoofNoticeSent = true;
       state._brandSpoofNoticeKey = `${title}::${message}`;
@@ -135,7 +156,11 @@
   NS.reconcileActiveSpoofBrand = function ({ force = false } = {}) {
     try {
       const state = NS.state;
-      const current = String(state.spoofBrand || "").trim();
+      let current = String(state.spoofBrand || "").trim();
+      if (current && typeof NS.canonicalizeBrandDisplayCandidate === "function") {
+        current = NS.canonicalizeBrandDisplayCandidate(current);
+        if (!current) state.spoofBrand = "";
+      }
       const active = !!(state._brandSpoofPortalDetected || current
         || (state.details || []).some((d) => /仿冒品牌官网/i.test(d.name || "")));
       if (!active || typeof NS.collectPrimaryBrandKeywords !== "function") return current;
@@ -155,8 +180,8 @@
       }
       const pk = NS.collectPrimaryBrandKeywords();
       let candidate = String((pk && pk.display) || "").trim();
-      if (candidate && typeof NS.normalizeDisplayBrandName === "function") {
-        candidate = NS.normalizeDisplayBrandName(candidate) || candidate;
+      if (candidate && typeof NS.canonicalizeBrandDisplayCandidate === "function") {
+        candidate = NS.canonicalizeBrandDisplayCandidate(candidate);
       }
       if (!candidate) return current;
       if (typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(candidate)) return current;
@@ -213,18 +238,30 @@
         || (state.details || []).some((d) => /仿冒品牌官网/i.test(d.name || "")));
       if (!active) return false;
       const brand = String(NS.reconcileActiveSpoofBrand() || state.spoofBrand || "").trim();
-      if (!brand) return false;
-      const title = `已识别仿冒「${brand}」官网`;
-      const message = `页面标题/正文品牌「${brand}」与当前域名不匹配，疑似仿冒官网。`;
+      const title = brand ? `已识别仿冒「${brand}」官网` : "已识别仿冒品牌官网";
+      const message = brand
+        ? `页面标题/正文品牌「${brand}」与当前域名不匹配，疑似仿冒官网。`
+        : `域名 ${location.hostname} 与页面宣称品牌不匹配，疑似仿冒官网下载站。`;
       const key = `${title}::${message}`;
-      if (state._brandSpoofNoticeSent && state._brandSpoofNoticeKey === key) return false;
-      return NS.showGuardOverlay("", {
+      if (state._brandSpoofNoticeSent && state._brandSpoofNoticeKey === key
+        && state._lastGuardNoticeKind === "brand-spoof"
+        && state._lastGuardNoticeKey === key) return false;
+      const shown = NS.showGuardOverlay("", {
         title,
         message,
         toast: true,
         forceNotify: true,
         guardKind: "brand-spoof"
       }) === true;
+      // showGuardOverlay 在正常运行时会记录这组状态；这里再写一次，保证被测试桩、
+      // 兼容层或定制 UI 包装后，品牌通知仍能正确去重并保持最高展示优先级。
+      if (shown) {
+        state._brandSpoofNoticeSent = true;
+        state._brandSpoofNoticeKey = key;
+        state._lastGuardNoticeKind = "brand-spoof";
+        state._lastGuardNoticeKey = key;
+      }
+      return shown;
     } catch {
       return false;
     }
@@ -276,16 +313,21 @@
     } catch { /* ignore */ }
     const threatDetails = state.details.filter((d) => (d.weight || 0) > 0);
     const signalCount = threatDetails.length;
-    // 可信门户：报告侧不展示 packageBlocked（即使残留 remote 标志）
-    const trustedPortal = (typeof NS.shouldNeverArmProtection === "function" && NS.shouldNeverArmProtection())
+    // 身份可信与下载保护是两条轴：备案/成熟度可清软品牌误报，但不能掩盖
+    // 已实锤的 SEO、强制下载、乱码包等硬行为。
+    const realHardKit = typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat();
+    const identityTrusted = (
+      (typeof NS.shouldNeverArmProtection === "function" && NS.shouldNeverArmProtection())
       || (typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature())
-      || NS.hasValidIcpRecord();
-    try { NS.ensureBrandSpoofNotice(trustedPortal); } catch { /* ignore */ }
-    const packageBlockedLive = !trustedPortal && !!(state.downloadGuardInstalled || state.remoteDownloadDispatchDetected);
+      || NS.hasValidIcpRecord()
+    );
+    const protectionTrusted = identityTrusted && !realHardKit;
+    try { NS.ensureBrandSpoofNotice(identityTrusted); } catch { /* ignore */ }
+    const packageBlockedLive = !protectionTrusted && !!(state.downloadGuardInstalled || state.remoteDownloadDispatchDetected);
     const hasPackageThreat = packageBlockedLive
-      || (!trustedPortal && threatDetails.some((d) => /安装包|下载拦截|仿冒|可疑下载|远程配置|PHP 下载/i.test(d.name || "")));
+      || (!protectionTrusted && threatDetails.some((d) => /安装包|下载拦截|仿冒|可疑下载|远程配置|PHP 下载/i.test(d.name || "")));
     const riskLevel = NS.resolveReportRiskLevel({
-      trustedPortal,
+      trustedPortal: protectionTrusted,
       remoteDownloadDispatchDetected: !!state.remoteDownloadDispatchDetected,
       hasPackageThreat,
       downloadGuardInstalled: !!state.downloadGuardInstalled,
@@ -293,10 +335,10 @@
       signalCount
     });
     let score = Math.min(100, state.score);
-    if (!trustedPortal && state.downloadGuardInstalled && score < 16) score = Math.max(score, 16);
-    if (!trustedPortal && state.remoteDownloadDispatchDetected && score < 28) score = Math.max(score, 28);
-    if (trustedPortal) score = Math.min(score, Math.max(0, state.score));
-    const pkgTargets = trustedPortal ? [] : (state.protectedTargets || []).filter((t) => {
+    if (!protectionTrusted && state.downloadGuardInstalled && score < 16) score = Math.max(score, 16);
+    if (!protectionTrusted && state.remoteDownloadDispatchDetected && score < 28) score = Math.max(score, 28);
+    if (protectionTrusted) score = Math.min(score, Math.max(0, state.score));
+    const pkgTargets = protectionTrusted ? [] : (state.protectedTargets || []).filter((t) => {
       try { return NS.isPackageFileUrl(t) || /\.(zip|exe|apk|dmg|msi|rar|7z)(?:\?|#|$)/i.test(String(t)); } catch { return false; }
     }).slice(0, 5);
     const analysisComplete = !!(state._analysisDone
@@ -305,17 +347,27 @@
       type: "threat-risk", score, riskLevel, analysisComplete,
       details: state.details.filter((d) => {
         if (d.name === "已查询到ICP备案号") return false;
-        if (d.name === "无ICP备案信息" && (NS.looksLikeUltraMatureWhoisDomain() || NS.looksLikeLongLivedWhoisDomain() || (NS.getWhoisAgeDays() != null && NS.getWhoisAgeDays() >= 365))) return false;
-        if (/仿冒品牌官网|仿冒站下载拦截|已启用安装包|非用户手势|跨域跳转/i.test(d.name || "") && trustedPortal) return false;
-        if (/仿冒品牌官网|仿冒站下载拦截/i.test(d.name || "") && (NS.hasValidIcpRecord() || NS.looksLikeUltraMatureWhoisDomain() || NS.looksLikeUltraMatureIcpDomain())) return false;
+        if (d.name === "无ICP备案信息" && (
+          NS.looksLikeUltraMatureWhoisDomain()
+          || NS.looksLikeLongLivedWhoisDomain()
+          || (NS.getWhoisAgeDays() != null && NS.getWhoisAgeDays() >= 365)
+          || (typeof NS.hasOrganizationValidatedSsl === "function" && NS.hasOrganizationValidatedSsl())
+        )) return false;
+        if (/仿冒品牌官网|仿冒站下载拦截/i.test(d.name || "") && identityTrusted) return false;
+        if (/已启用安装包|非用户手势|跨域跳转/i.test(d.name || "") && protectionTrusted) return false;
         return true;
       }).slice(0, 12),
-      icpInfo: state.icpInfo || "", whoisInfo: state.whoisInfo || "", url: location.href,
-      downloadGuardInstalled: trustedPortal ? false : !!state.downloadGuardInstalled,
+      icpInfo: (typeof NS.formatIcpInfoForReport === "function"
+        ? NS.formatIcpInfoForReport(state.icpInfo)
+        : (state.icpInfo || "")),
+      whoisInfo: state.whoisInfo || "",
+      sslInfo: state.sslInfo || null,
+      url: location.href,
+      downloadGuardInstalled: protectionTrusted ? false : !!state.downloadGuardInstalled,
       packageBlocked: packageBlockedLive,
       protectedTargets: pkgTargets,
-      spoofBrand: trustedPortal ? "" : (state.spoofBrand || ""),
-      brandSpoofPortal: trustedPortal ? false : (!!(state._brandSpoofPortalDetected || state.spoofBrand) || threatDetails.some((d) => /仿冒品牌官网/i.test(d.name || "")))
+      spoofBrand: identityTrusted ? "" : (state.spoofBrand || ""),
+      brandSpoofPortal: identityTrusted ? false : (!!(state._brandSpoofPortalDetected || state.spoofBrand) || threatDetails.some((d) => /仿冒品牌官网/i.test(d.name || "")))
     };
     try {
       if (!chrome?.runtime?.id) return;
@@ -331,7 +383,7 @@
     }
   };
 
-  NS.markRemoteDownloadDispatch = function (reason, href) {
+  NS.markRemoteDownloadDispatch = function (reason, href, opts = {}) {
     const state = NS.state;
     if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) return;
     if (href && (
@@ -350,7 +402,7 @@
     }
     if (!state.remoteDownloadDispatchDetected) { state.remoteDownloadDispatchDetected = true; NS.addSignal("已拦截可疑安装包下载", 20, reason); }
     else NS.addSignal("已拦截可疑下载链接", 8, reason);
-    NS.installDownloadGuard(reason, { notify: true, href, forceNotify: false });
+    NS.installDownloadGuard(reason, { notify: true, href, forceNotify: !!opts.forceNotify });
     NS.emitRiskReport(true);
   };
 
@@ -396,20 +448,51 @@
     if (!el) return;
     try {
       if (el.dataset.threatDetectorDisabled === "1") delete el.dataset.threatDetectorDisabled;
-      el.style.removeProperty("pointer-events"); el.style.removeProperty("opacity"); el.style.removeProperty("filter"); el.style.removeProperty("cursor");
+      el.style.removeProperty("pointer-events");
+      el.style.removeProperty("opacity");
+      el.style.removeProperty("filter");
+      el.style.removeProperty("cursor");
       if (el.getAttribute("aria-disabled") === "true") el.removeAttribute("aria-disabled");
       if (el.getAttribute("title") === "已拦截可疑安装包下载") el.removeAttribute("title");
+      // disable 时会把 A.href 写成 javascript:void(0) 并另存 data-threat-original-href。
+      // 旧逻辑要求 !getAttribute("href") 才还原——void(0) 仍算有 href，导致按钮永久死链。
       const orig = el.getAttribute("data-threat-original-href");
-      if (orig && el.tagName === "A" && !el.getAttribute("href")) { if (orig !== "js-download" && !/^javascript:/i.test(orig)) el.setAttribute("href", orig); }
+      if (orig && el.tagName === "A" && orig !== "js-download" && !/^javascript:/i.test(orig)) {
+        const cur = (el.getAttribute("href") || "").trim();
+        if (!cur || cur === "#" || /^javascript:/i.test(cur)) {
+          try { el.setAttribute("href", orig); } catch { /* ignore */ }
+          try { el.href = orig; } catch { /* ignore */ }
+        }
+      }
       el.removeAttribute("data-threat-original-href");
       if (el.tagName === "BUTTON" || el.tagName === "INPUT") el.disabled = false;
+      try { el.classList && el.classList.remove("silverfox-greyed"); } catch { /* ignore */ }
+      try { if (el.dataset) delete el.dataset.silverfoxGreyed; } catch { /* ignore */ }
+      try { el.removeAttribute("data-silverfox-greyed"); } catch { /* ignore */ }
     } catch { /* ignore */ }
   };
 
   NS.reEnableAllThreatDisabledElements = function () {
     try {
-      document.querySelectorAll("[data-threat-detector-disabled='1'], a[data-threat-original-href], button[aria-disabled='true']").forEach((el) => NS.reEnableOneThreatElement(el));
+      document.querySelectorAll(
+        "[data-threat-detector-disabled='1'], [data-silverfox-greyed='1'], a[data-threat-original-href], button[aria-disabled='true'], a[href='javascript:void(0)']"
+      ).forEach((el) => NS.reEnableOneThreatElement(el));
       NS.getAllDownloadIntentElements().forEach((el) => NS.reEnableOneThreatElement(el));
+      // 兜底：仍挂着 original-href 的锚点强制还原
+      document.querySelectorAll("a[data-threat-original-href]").forEach((el) => {
+        try {
+          const orig = el.getAttribute("data-threat-original-href");
+          if (orig && orig !== "js-download" && !/^javascript:/i.test(orig)) {
+            el.setAttribute("href", orig);
+            try { el.href = orig; } catch { /* ignore */ }
+          }
+          el.removeAttribute("data-threat-original-href");
+          el.style.removeProperty("pointer-events");
+          el.style.removeProperty("opacity");
+          el.style.removeProperty("filter");
+          el.style.removeProperty("cursor");
+        } catch { /* ignore */ }
+      });
     } catch { /* ignore */ }
   };
 
@@ -469,6 +552,12 @@
         if (state._fakeSpaDetected && state._seoCloakKitDetected) return true;
         return false;
       }
+      // 品牌对齐开源仓：软仿冒不算硬锁（否则按钮永远无法恢复）
+      let openSourceTrusted = false;
+      try {
+        openSourceTrusted = typeof NS.pageLooksLikeTrustedOpenSourceDownloadPortal === "function"
+          && NS.pageLooksLikeTrustedOpenSourceDownloadPortal();
+      } catch { openSourceTrusted = false; }
       if (
         state._seoCloakKitDetected
         || state._desktopForceDlKit
@@ -478,16 +567,22 @@
         || state._multiPlatformSerpTrap
         || state._fakeSpaDetected
         || state._fakeBrandShellDetected
-        || state._brandSpoofPortalDetected
-        || state._brandResourceMismatchDetected
         || state._cloneOfficialDetected
       ) return true;
+      // 软品牌仿冒：开源可信时不当硬锁
+      if (!openSourceTrusted && (state._brandSpoofPortalDetected || state._brandResourceMismatchDetected)) {
+        return true;
+      }
       if (state.remoteDownloadDispatchDetected
         && (state._seoCloakKitDetected || state._desktopForceDlKit || state._remoteGarbleDlDetected
           || state._fakeSpaDetected || state._fakeBrandShellDetected)) return true;
       try {
         for (const d of state.details || []) {
-          if (/仿冒品牌官网下载壳|仿冒品牌官网下载站|远程API动态绑定|SEO伪装|桌面端强制弹窗|远程乱码|远程下发乱码|SEO收录仿冒|多平台下载指向|仿冒官网加密|仿冒官网反调试|域名与品牌资源不一致|对象存储安装包/i.test(d.name || "")) return true;
+          const name = d.name || "";
+          // 真硬套件信号
+          if (/仿冒品牌官网下载壳|远程API动态绑定|SEO伪装|桌面端强制弹窗|远程乱码|远程下发乱码|SEO收录仿冒|多平台下载指向|仿冒官网加密|仿冒官网反调试|域名与品牌资源不一致|对象存储安装包/i.test(name)) return true;
+          // 软仿冒下载站：开源可信时忽略
+          if (!openSourceTrusted && /仿冒品牌官网下载站/i.test(name)) return true;
         }
       } catch { /* ignore */ }
       return false;
@@ -593,6 +688,17 @@
       const state = NS.state;
       // 真硬套件不 lift；超成熟/ICP 门户用 forceLift 清 soft 后再判
       if (typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat()) return false;
+      // 开源可信须先于 hasHardThreatKitLocked（后者含 _brandSpoofPortalDetected，会挡住自抬）
+      try {
+        if (typeof NS.pageLooksLikeTrustedOpenSourceDownloadPortal === "function"
+          && NS.pageLooksLikeTrustedOpenSourceDownloadPortal()) {
+          state._brandSpoofPortalDetected = false;
+          state.spoofBrand = "";
+          state._brandResourceMismatchDetected = false;
+          state.remoteDownloadDispatchDetected = false;
+          return true;
+        }
+      } catch { /* ignore */ }
       if (NS.hasHardThreatKitLocked()) return false;
       if (state.downloadGuardInstalled && /仿冒品牌官网下载壳|远程API动态|SEO伪装|桌面端强制|远程乱码|SEO收录仿冒/i.test(
         (state.details || []).map((d) => d.name || "").join(" ")
@@ -659,7 +765,9 @@
   NS.clearDownloadGuard = function (reason) {
     const state = NS.state;
     // 硬套件锁定时拒绝 clear——但「真硬套件」才挡；可信门户 soft-lift 必须能解开按钮
-    const trustedLift = /trusted-portal|valid-icp|whois-ultra|brand-spoof-skip-trusted|intel-light/i.test(String(reason || ""));
+    // official-or-safe-page 须算可信抬锁：maybeLift 常用此 reason，否则会被
+    // hasHardThreatKitLocked（仍含「仿冒品牌官网下载站」detail）挡回并重新上锁
+    const trustedLift = /trusted-portal|valid-icp|whois-ultra|brand-spoof-skip-trusted|intel-light|trusted-opensource|clear-brand-spoof|icp-clear-brand-spoof|official-or-safe-page|guard-skip-trusted/i.test(String(reason || ""));
     const realHard = typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat();
     if (!trustedLift && NS.hasHardThreatKitLocked() && reason !== "page-reset" && reason !== "serp-light-mode" && !/^reset/i.test(String(reason || ""))) {
       NS.silverfoxLog("guard-clear-blocked", reason || "", "hard-kit-locked");
@@ -671,21 +779,42 @@
       try { NS.disableAllDownloadIntentControls(); NS.applyDownloadGuardDomLock(true); NS.postToHooks({ type: "set-guard", enabled: true }); } catch { /* ignore */ }
       return;
     }
+    // 可信抬锁：先清软仿冒标志，避免后续 hasHardThreatKitLocked 仍因 detail 文案为真
+    if (trustedLift && !realHard) {
+      try {
+        state._brandSpoofPortalDetected = false;
+        state.spoofBrand = "";
+        state._pendingSoftBrandSpoof = false;
+        state._brandResourceMismatchDetected = false;
+      } catch { /* ignore */ }
+    }
     const hadGuard = state.downloadGuardInstalled || state._earlyShellArmed;
     state.downloadGuardInstalled = false;
     state._earlyShellArmed = false;
     state.protectionNoticeSent = false;
     state._brandSpoofNoticeSent = false;
     state._brandSpoofNoticeKey = "";
+    state._lastGuardNoticeKind = "";
+    state._lastGuardNoticeKey = "";
     state.remoteDownloadDispatchDetected = false;
     state.protectedTargets = [];
     state._guardRedisableArmed = false;
     try { NS.caches.sentNoticeKeys.clear(); } catch { /* ignore */ }
     try { NS.applyDownloadGuardDomLock(false); } catch { /* ignore */ }
     NS.postToHooks({ type: "set-guard", enabled: false });
+    try { NS.notifyHooksOfficialSafe(true); } catch { /* ignore */ }
     if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) NS.notifyHooksOfficialSafe(true);
     NS.reEnableAllThreatDisabledElements();
-    [50, 200, 600, 1500].forEach((ms) => setTimeout(() => { if (!state.downloadGuardInstalled) NS.reEnableAllThreatDisabledElements(); }, ms));
+    // 多次补还原：SPA/样式重写后仍可能丢掉 href
+    [0, 50, 200, 600, 1500, 3000].forEach((ms) => setTimeout(() => {
+      try {
+        if (!state.downloadGuardInstalled) {
+          NS.applyDownloadGuardDomLock(false);
+          NS.reEnableAllThreatDisabledElements();
+          NS.postToHooks({ type: "set-guard", enabled: false });
+        }
+      } catch { /* ignore */ }
+    }, ms));
     try {
       if (chrome?.runtime?.id) {
         chrome.runtime.sendMessage({ type: "set-tab-protect", enabled: false, force: true, url: location.href }, () => { void chrome.runtime.lastError; });
@@ -706,12 +835,29 @@
   NS.maybeLiftDownloadGuard = function () {
     try {
       const state = NS.state;
+      // 开源可信：整段 clearBrandSpoof（清信号+guard），勿走 official-or-safe-page 被硬锁挡回
+      try {
+        if (typeof NS.hasRealHardKitThreat === "function" && !NS.hasRealHardKitThreat()
+          && typeof NS.pageLooksLikeTrustedOpenSourceDownloadPortal === "function"
+          && NS.pageLooksLikeTrustedOpenSourceDownloadPortal()) {
+          if (typeof NS.clearBrandSpoofFalsePositive === "function") {
+            NS.clearBrandSpoofFalsePositive("trusted-opensource");
+          } else {
+            NS.clearDownloadGuard("trusted-opensource");
+          }
+          try { NS.applyDownloadGuardDomLock(false); NS.reEnableAllThreatDisabledElements(); } catch { /* ignore */ }
+          NS.silverfoxLog && NS.silverfoxLog("guard-lift", "trusted-opensource");
+          return true;
+        }
+      } catch { /* ignore */ }
       if (!NS.shouldLiftDownloadGuard()) return false;
       const locked = state.downloadGuardInstalled || state._earlyShellArmed || !!document.querySelector("[data-threat-detector-disabled='1'], [data-silverfox-greyed='1']");
       if (!locked && !(state.protectedTargets && state.protectedTargets.length)) {
         NS.postToHooks({ type: "set-guard", enabled: false });
+        try { NS.applyDownloadGuardDomLock(false); NS.reEnableAllThreatDisabledElements(); } catch { /* ignore */ }
         return false;
       }
+      // 须用可信 reason，否则 hasHardThreatKitLocked 会挡 clear 并 re-lock 按钮
       NS.clearDownloadGuard("official-or-safe-page");
       return true;
     } catch { return false; }
@@ -923,6 +1069,15 @@
       NS.notifyHooksOfficialSafe(true);
       return;
     }
+    // 品牌对齐开源仓 + 可信下载：软仿冒永不 arm，并解除已误锁按钮
+    if (isSoftBrandSpoofArm && !realHardPre
+      && typeof NS.pageLooksLikeTrustedOpenSourceDownloadPortal === "function"
+      && NS.pageLooksLikeTrustedOpenSourceDownloadPortal()) {
+      NS.silverfoxLog("guard-skip", "trusted-opensource-soft-brand-spoof");
+      try { NS.clearBrandSpoofFalsePositive("trusted-opensource"); } catch { /* ignore */ }
+      try { NS.notifyHooksOfficialSafe(true); } catch { /* ignore */ }
+      return;
+    }
     if ((ultraPre || NS.hasValidIcpRecord() || NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) && !realHardPre) {
       // 超成熟 / 有效 ICP 门户：软品牌仿冒 + lockHard 也一律不 arm（soft.china.com 误报根因）
       // 仅 SEO/强制弹窗/乱码等真硬套件可越过
@@ -978,6 +1133,15 @@
         NS.clearBrandSpoofFalsePositive("guard-arm-blocked-by-icp");
         return;
       }
+      // 品牌对齐开源仓 + 成熟下载：不 arm，并抬已误上的锁
+      try {
+        if (typeof NS.pageLooksLikeTrustedOpenSourceDownloadPortal === "function"
+          && NS.pageLooksLikeTrustedOpenSourceDownloadPortal()) {
+          NS.silverfoxLog("guard-skip", "brand-spoof-blocked-by-trusted-opensource");
+          NS.clearBrandSpoofFalsePositive("trusted-opensource");
+          return;
+        }
+      } catch { /* ignore */ }
       if (!hardNow && !state._fakeBrandShellDetected && !NS.icpSettledForSoftBrandSpoof()) {
         NS.silverfoxLog("guard-defer", "soft-brand-spoof-wait-icp");
         state._pendingSoftBrandSpoof = true;
@@ -996,6 +1160,7 @@
     NS.armBackgroundProtect("full");
     NS.armImmediatePackageBlock();
     state.downloadGuardInstalled = true;
+    state._guardArmedAt = Date.now();
     NS.postToHooks({ type: "set-guard", enabled: true });
     NS.disableSuspiciousDownloadButtons();
     NS.disableAllDownloadIntentControls();

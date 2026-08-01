@@ -74,12 +74,12 @@
 
   NS.onTabUrlChangedForAnalysis = function (tabId, newUrl) {
     if (tabId == null || tabId < 0) return;
-    NS.clearTabRiskStorage(tabId);
+    NS.clearTabRiskStorage(tabId, newUrl);
     if (newUrl && !/^https?:\/\//i.test(String(newUrl))) return;
     NS.notifyContentPageUrlChanged(tabId, newUrl);
   };
 
-  NS.clearTabRiskStorage = function (tabId) {
+  NS.clearTabRiskStorage = function (tabId, newUrl) {
     if (tabId == null || tabId < 0) return;
     NS.withExistingTab(tabId, () => {
       try {
@@ -88,10 +88,31 @@
       } catch { /* ignore */ }
     });
     chrome.storage.local.remove([`risk_${tabId}`], () => { void chrome.runtime.lastError; });
-    chrome.storage.local.get(["latestNotice", "risk_latest"], (r) => {
+    chrome.storage.local.get(["latestNotice", "risk_latest", "latestExeVt"], (r) => {
       const toRemove = [];
       if (r.latestNotice && r.latestNotice.tabId === tabId) toRemove.push("latestNotice");
       if (r.risk_latest && r.risk_latest.tabId === tabId) toRemove.push("risk_latest");
+      // 换站才清文件检测（同站 SPA 路径变化保留）；避免粘到其它域名
+      try {
+        const vt = r.latestExeVt;
+        // 检测进行中不要清（换页/开 VT 后台页会误杀「正在 VT 检测」）
+        if (vt && (vt.status === "checking" || vt.status === "uploading")
+          && (Date.now() - (Number(vt.timestamp) || 0) < 120000)) {
+          /* keep */
+        } else if (vt && (vt.tabId === tabId || vt.tabId == null)) {
+          const hostOf = (u) => {
+            try { return new URL(u || "").hostname.toLowerCase().replace(/^www\./, ""); } catch { return ""; }
+          };
+          const newHost = hostOf(newUrl);
+          const atHost = String(vt.pageHost || "").toLowerCase().replace(/^www\./, "") || hostOf(vt.pageUrl);
+          if (!newHost || !atHost || newHost !== atHost) toRemove.push("latestExeVt");
+        }
+      } catch {
+        if (r.latestExeVt && r.latestExeVt.tabId === tabId
+          && r.latestExeVt.status !== "checking" && r.latestExeVt.status !== "uploading") {
+          toRemove.push("latestExeVt");
+        }
+      }
       if (toRemove.length) chrome.storage.local.remove(toRemove, () => { void chrome.runtime.lastError; });
     });
   };
@@ -100,6 +121,8 @@
     if (tabId == null) return;
     NS.protectedTabs.delete(tabId);
     NS.protectedTabMeta.delete(tabId);
+    if (typeof NS.clearTrustedDownloadSource === "function") NS.clearTrustedDownloadSource(tabId);
+    else if (NS.trustedDownloadTabs) NS.trustedDownloadTabs.delete(tabId);
     NS.disarmHostileNavDnr(tabId);
     NS.withExistingTab(tabId, () => {
       try {
@@ -141,6 +164,9 @@
 
   NS.markTabProtected = function (tabId, pageUrl, opts = {}) {
     if (tabId == null || tabId < 0) return;
+    // 新的真实/临时保护信号会撤销此前的可信下载来源状态。
+    if (typeof NS.clearTrustedDownloadSource === "function") NS.clearTrustedDownloadSource(tabId);
+    else if (NS.trustedDownloadTabs) NS.trustedDownloadTabs.delete(tabId);
     const mode = opts.mode === "provisional" ? "provisional" : "full";
     const prev = NS.protectedTabMeta.get(tabId);
     const nextMode = prev && prev.mode === "full" ? "full" : mode;
@@ -203,6 +229,30 @@
         if (!ids.length) return;
         chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: ids }, () => { void chrome.runtime.lastError; });
       });
+    } catch { /* ignore */ }
+  };
+
+  /**
+   * 全局：把被动子资源 http→https（image/css/font/media）。
+   * 减轻 HTTPS 页 Mixed Content 自动升级噪音；不碰 main_frame / script / xhr。
+   * 规则 id 100–119，与会话导航阻断 500000+ 不冲突。
+   */
+  NS.ensureMixedContentUpgradeDnr = function () {
+    if (!chrome.declarativeNetRequest || !chrome.declarativeNetRequest.updateDynamicRules) return;
+    const RULE_ID = 101;
+    try {
+      chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: [RULE_ID],
+        addRules: [{
+          id: RULE_ID,
+          priority: 1,
+          action: { type: "upgradeScheme" },
+          condition: {
+            urlFilter: "|http://",
+            resourceTypes: ["image", "stylesheet", "font", "media", "object"]
+          }
+        }]
+      }, () => { void chrome.runtime.lastError; });
     } catch { /* ignore */ }
   };
 

@@ -75,6 +75,7 @@
     state.remoteDownloadDispatchDetected = false; state.downloadGuardInstalled = false;
     state.protectedTargets = []; state.protectionNoticeSent = false; state.spoofBrand = "";
     state._brandSpoofNoticeSent = false; state._brandSpoofNoticeKey = "";
+    state._lastGuardNoticeKind = ""; state._lastGuardNoticeKey = "";
     state._spoofBrandReconciledAt = 0;
     state.contextCache = null; state.contextCacheAt = 0;
     state._perfBenign = false; state._perfBenignAt = 0;
@@ -90,6 +91,7 @@
       state._icpQueryFailed = false;
       state.icpInfo = "";
       state.whoisInfo = "";
+      state.sslInfo = null;
       state.icpMatchedHost = "";
       state.pageDeclaredIcp = "";
       state._icpPageMismatch = false;
@@ -264,7 +266,50 @@
     try {
       if (chrome?.runtime?.onMessage) {
         chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-          try { if (msg && msg.type === "page-url-changed") { NS.handlePageUrlChanged("bg-page-url-changed", msg.url || ""); try { sendResponse({ ok: true }); } catch { /* ignore */ } return false; } } catch { /* ignore */ }
+          try {
+            if (msg && msg.type === "page-url-changed") {
+              NS.handlePageUrlChanged("bg-page-url-changed", msg.url || "");
+              try { sendResponse({ ok: true }); } catch { /* ignore */ }
+              return false;
+            }
+            if (msg && msg.type === "show-page-threat-toast") {
+              // 后台下载取消或子 frame 拦截统一在顶层页面显示，避免 Toast 落在隐藏 iframe。
+              try {
+                if (typeof NS.isTopFrame !== "function" || NS.isTopFrame()) {
+                  NS.showPageToast(
+                    String(msg.title || "已拦截可疑下载文件"),
+                    String(msg.message || "可疑下载已被拦截"),
+                    { force: msg.force !== false }
+                  );
+                }
+              } catch { /* ignore */ }
+              try { sendResponse({ ok: true }); } catch { /* ignore */ }
+              return false;
+            }
+            if (msg && msg.type === "ssl-cert-info" && msg.sslInfo) {
+              if (typeof NS.applySslCertInfo === "function") NS.applySslCertInfo(msg.sslInfo);
+              try { sendResponse({ ok: true }); } catch { /* ignore */ }
+              return false;
+            }
+            // SW 热启动/扩展重载后：若本页仍处于拦截态，重新登记 protect
+            if (msg && msg.type === "silverfox-sw-awake") {
+              try {
+                if (NS.state && (NS.state.downloadGuardInstalled || (NS.state.protectedTargets && NS.state.protectedTargets.length))) {
+                  chrome.runtime.sendMessage({
+                    type: "set-tab-protect",
+                    enabled: true,
+                    mode: "full",
+                    url: location.href
+                  }, () => { void chrome.runtime.lastError; });
+                } else if ((NS.hasValidIcpRecord() || (typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature()))
+                  && !(typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat())) {
+                  NS.notifyBackgroundDownloadTrust(true, "sw-awake-trusted");
+                }
+              } catch { /* ignore */ }
+              try { sendResponse({ ok: true }); } catch { /* ignore */ }
+              return false;
+            }
+          } catch { /* ignore */ }
           return false;
         });
       }
@@ -346,6 +391,28 @@
 
   /** MAIN-world hooks -> isolated content 消息桥。 */
   NS.installHooksMessageBridge = function () {
+    const releaseTrustedHookBlock = (reason) => {
+      try { NS.notifyHooksOfficialSafe(true); } catch { /* ignore */ }
+      let lifted = false;
+      try {
+        if (typeof NS.forceLiftSoftProtectionForTrustedPortal === "function") {
+          lifted = NS.forceLiftSoftProtectionForTrustedPortal(reason || "trusted-hook-block") === true;
+        }
+      } catch { lifted = false; }
+      // Hook 已先于情报结果改过 DOM 时，即使没有旧 guard 状态也要主动还原链接。
+      if (!lifted) {
+        try { NS.state.downloadGuardInstalled = false; } catch { /* ignore */ }
+        try { NS.applyDownloadGuardDomLock(false); } catch { /* ignore */ }
+        try { NS.reEnableAllThreatDisabledElements(); } catch { /* ignore */ }
+      }
+      [0, 80, 300, 800].forEach((ms) => setTimeout(() => {
+        try {
+          NS.notifyHooksOfficialSafe(true);
+          NS.applyDownloadGuardDomLock(false);
+          NS.reEnableAllThreatDisabledElements();
+        } catch { /* ignore */ }
+      }, ms));
+    };
     window.addEventListener("message", (event) => {
       if (event.source !== window) return;
       const data = event.data;
@@ -354,8 +421,28 @@
       const c = NS.caches;
       if (NS.silverfoxLog) NS.silverfoxLog("hooks-in", data.type, data.name || "", String(data.reason || data.href || "").slice(0, 100));
 
+      if (data.type === "trusted-download-intent") {
+        try {
+          const validIcp = typeof NS.hasValidIcpRecord === "function" && NS.hasValidIcpRecord();
+          const ageDays = typeof NS.getWhoisAgeDays === "function" ? NS.getWhoisAgeDays() : null;
+          const realHard = typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat();
+          // 有效 ICP + ≥1 年 WHOIS 是强身份组合：即使页面结构误中下载套件，也只放行刚上报的精确 URL。
+          const trusted = (validIcp && (!realHard || (ageDays != null && ageDays >= 365)))
+            || (typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature());
+          if (chrome?.runtime?.id && data.href) {
+            chrome.runtime.sendMessage({
+              type: "trusted-download-intent",
+              href: data.href,
+              url: location.href,
+              identityVerified: trusted
+            }, () => { void chrome.runtime.lastError; });
+          }
+        } catch { /* ignore */ }
+        return;
+      }
+
       if (data.type === "signal" && data.name) {
-        if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) { NS.notifyHooksOfficialSafe(true); return; }
+        if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) { releaseTrustedHookBlock("trusted-hook-signal"); return; }
         if (NS.isBenignContentPage() && !/安装包|下载|远程|PHP|API|仿冒|手势|跳转/i.test(data.name || "")) return;
         if (/非用户手势|自动下载|自动跳转|跨域跳转/i.test(data.name || "") || /非用户手势|auto-nav-no-gesture|kit-or-relay-auto-external|auto-external/i.test(data.reason || "")) {
           const r = String(data.reason || "");
@@ -404,7 +491,7 @@
       if (data.type === "blocked-download") {
         const href = data.href || "";
         const reason = data.reason || "";
-        if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) { NS.notifyHooksOfficialSafe(true); return; }
+        if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) { releaseTrustedHookBlock("trusted-hook-blocked-download"); return; }
         if (href && NS.isAuthSsoOrLoginRedirectUrl(href)) return;
         if (/非用户手势自动跳转/i.test(reason) && href && NS.isAuthSsoOrLoginRedirectUrl(href)) return;
         if (href && NS.isSiteHomeUrl(href) && !NS.isPackageFileUrl(href)) return;
@@ -424,7 +511,7 @@
         if (autoNoGesture && (NS.looksLikeSafeOfficialContext() || NS.isTrustedOfficialDownloadContext()) && !state._seoCloakKitDetected && !state._brandSpoofPortalDetected) return;
         if (autoNoGesture && href && (NS.isAllowlistedProductPackageUrl(href) || NS.looksLikeStrongProductInstallerName(fn))) return;
         if (href && !state.protectedTargets.includes(href)) state.protectedTargets.push(href);
-        NS.markRemoteDownloadDispatch(reason || `blocked -> ${href}`, href);
+        NS.markRemoteDownloadDispatch(reason || `blocked -> ${href}`, href, { forceNotify: true });
         let msg = NS.formatPackageLabel(href);
         try { const u = new URL(href, location.href); if (!NS.PACKAGE_EXT.test(u.pathname)) msg = `${u.hostname}${u.pathname}`; } catch { /* ignore */ }
         if (autoNoGesture) NS.installDownloadGuard(reason || "非用户手势自动下载", { notify: true, href, message: msg || "自动下载已拦截", forceNotify: !state.protectionNoticeSent });
@@ -433,7 +520,7 @@
         return;
       }
       if (data.type === "request-guard") {
-        if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) { NS.notifyHooksOfficialSafe(true); return; }
+        if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) { releaseTrustedHookBlock("trusted-hook-request-guard"); return; }
         try {
           const rr = String(data.reason || "");
           if (/非用户手势自动跳转|auto-nav-no-gesture|kit-or-relay-auto-external|auto-external/i.test(rr)) {
@@ -473,7 +560,14 @@
         if (data.key && typeof data.delta === "number" && data.key in state) state[data.key] = (state[data.key] || 0) + data.delta;
         return;
       }
-      if (data.type === "hooks-ready") { if (state.downloadGuardInstalled) NS.postToHooks({ type: "set-guard", enabled: true }); }
+      if (data.type === "hooks-ready") {
+        // MAIN 脚本可能晚于 ICP/WHOIS 结果就绪；握手时必须重放当前可信状态。
+        if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) {
+          releaseTrustedHookBlock("trusted-hooks-ready");
+        } else if (state.downloadGuardInstalled) {
+          NS.postToHooks({ type: "set-guard", enabled: true });
+        }
+      }
     });
   };
 
@@ -552,15 +646,16 @@
       state.icpMatchedHost = record ? NS.normalizeDomain(matched || pageHost) : "";
       const tried = Array.isArray(icpCheck.triedHosts) ? icpCheck.triedHosts : [];
       const recordLabel = record && matched && matched !== pageHost ? `${record}（主域 ${matched}）` : record;
+      // OV/EV 组织证书：不展示「未查询到备案信息」（境外正规站常见）
+      const orgSsl = typeof NS.hasOrganizationValidatedSsl === "function" && NS.hasOrganizationValidatedSsl();
+      // 仅展示备案记录本身，不再附加「页面展示 xxx，按未更新处理」
       state.icpInfo = record
-        ? (pageIcp.mismatch
-          ? `${recordLabel}（页面展示 ${pageIcp.declared.join(" / ")}，按未更新处理）`
-          : recordLabel)
-        : (missing ? "未查询到备案信息" : "");
+        ? recordLabel
+        : (missing && !orgSsl ? "未查询到备案信息" : "");
       state._icpQuerySettled = true; state._icpQueryFailed = false;
       NS.silverfoxLog("intel-icp", record ? "valid" : (missing ? "missing" : "empty"), String(state.icpInfo || "").slice(0, 80), "host=", pageHost);
       const ageDays = NS.getWhoisAgeDays();
-      const skipMissingIcp = state._perfBenign || state._intelLightMode || NS.isBenignContentPage() || (ageDays != null && ageDays >= 365) || NS.looksLikeUltraMatureWhoisDomain() || NS.looksLikeLongLivedWhoisDomain();
+      const skipMissingIcp = state._perfBenign || state._intelLightMode || NS.isBenignContentPage() || (ageDays != null && ageDays >= 365) || NS.looksLikeUltraMatureWhoisDomain() || NS.looksLikeLongLivedWhoisDomain() || orgSsl;
       // 页面已展示无法核验的备案号时，用「假冒ICP备案信息：备案号」替代普通
       // 「无ICP备案信息」，避免同一事实重复展示和重复计分。
       if (missing && !skipMissingIcp && !pageIcp.unverifiedClaim) {
@@ -622,6 +717,22 @@
         if (NS.hasValidIcpRecord()) NS.clearBrandSpoofFalsePositive("icp-mature-5y");
         try { const lab = (location.hostname || "").toLowerCase().replace(/^www\./, "").split(".")[0] || ""; if (lab.length >= 4 && (document.title || "").toLowerCase().includes(lab)) NS.clearBrandSpoofFalsePositive("host-in-title-5y"); } catch { /* ignore */ }
       }
+      // 公开代码仓 + 下载成熟度（forge / 同站 ICP·WHOIS）→ 清软仿冒误报
+      try {
+        // 强制失效 forge 阴性缓存后再判（DOM 可能刚挂上 GitHub 链）
+        try {
+          if (NS.caches) {
+            NS.caches._forgePresenceCache = null;
+            NS.caches._forgePresenceAt = 0;
+          }
+        } catch { /* ignore */ }
+        if (typeof NS.pageLooksLikeTrustedOpenSourceDownloadPortal === "function"
+          && NS.pageLooksLikeTrustedOpenSourceDownloadPortal()) {
+          NS.clearBrandSpoofFalsePositive("trusted-opensource");
+          try { NS.maybeLiftDownloadGuard(); } catch { /* ignore */ }
+          NS.silverfoxLog && NS.silverfoxLog("intel", "lift-trusted-opensource", ageDays);
+        }
+      } catch { /* ignore */ }
     } catch { /* ignore */ }
     if (gen === c.intelGeneration) c.intelDoneForUrl = urlKey;
     NS.maybeLiftDownloadGuard();
@@ -635,6 +746,30 @@
     void reason;
     try { if (typeof NS.isTopFrame === "function" && !NS.isTopFrame()) return; } catch { /* ignore */ }
     if (!NS.isHttpOrHttpsPage()) return;
+    // TLS 分类：先 DV 占位保证显示，再后台 CT 升级 OV/EV
+    try {
+      if (typeof NS.ensureSslPlaceholder === "function") NS.ensureSslPlaceholder();
+      if (typeof NS.requestSslCertInfo === "function") {
+        NS.requestSslCertInfo(false);
+        // 只补查未完成、弱 DV 或缺组织名的 OV/EV；可信结果不再无条件绕过缓存重扫六个源。
+        setTimeout(() => {
+          try {
+            const info = NS.state && NS.state.sslInfo;
+            if (!info || !info.validation) {
+              NS.requestSslCertInfo(false); // 首轮尚在途时由 background 合并并发
+              return;
+            }
+            const validation = String(info.validation || "").toUpperCase();
+            const organization = String(info.organization || "").trim();
+            const source = String(info.source || "");
+            const weakDv = validation === "DV"
+              && /^(?:https-assumed|ct-meta|crt\.sh-meta)$/i.test(source);
+            const missingOrg = /^(?:OV|EV)$/.test(validation) && !organization;
+            if (weakDv || missingOrg) NS.requestSslCertInfo(true);
+          } catch { /* ignore */ }
+        }, 2500);
+      }
+    } catch { /* ignore */ }
     const urlKey = location.href;
     if (c.intelDoneForUrl === urlKey) return;
     if (c.intelBusy && c.intelDoneForUrl === "" && NS.state._intelUrlKey === urlKey) return;
@@ -704,7 +839,13 @@
       }, 2000);
     } catch { /* ignore */ }
 
-    try { if (chrome?.runtime?.id) chrome.runtime.sendMessage({ type: "set-tab-protect", enabled: false, url: location.href }, () => { void chrome.runtime.lastError; }); } catch { /* ignore */ }
+    try {
+      if (chrome?.runtime?.id) {
+        // 新文档先撤销旧页面下载信任；情报核验完成后再显式建立。
+        NS.notifyBackgroundDownloadTrust(false, "boot-reset-download-trust");
+        chrome.runtime.sendMessage({ type: "set-tab-protect", enabled: false, url: location.href }, () => { void chrome.runtime.lastError; });
+      }
+    } catch { /* ignore */ }
 
     try {
       let lastPauseAt = 0;
@@ -857,6 +998,18 @@
           state._remoteApiChecked = false;
         }
         if (NS.looksLikeUltraMatureIcpDomain() || state._intelLightMode) { NS.enterIntelLightMode("load-ultra-mature"); NS.maybeLiftDownloadGuard(); NS.markAnalysisComplete("load-ultra-mature"); return; }
+        // load 时 DOM 已就绪：复检品牌对齐开源仓，清 home-fast 误报
+        try {
+          if (NS.caches) { NS.caches._forgePresenceCache = null; NS.caches._forgePresenceAt = 0; }
+          if (typeof NS.pageLooksLikeTrustedOpenSourceDownloadPortal === "function"
+            && NS.pageLooksLikeTrustedOpenSourceDownloadPortal()) {
+            if (typeof NS.clearBrandSpoofFalsePositive === "function") {
+              NS.clearBrandSpoofFalsePositive("trusted-opensource");
+            }
+            NS.maybeLiftDownloadGuard();
+            NS.silverfoxLog && NS.silverfoxLog("load", "lift-trusted-opensource");
+          }
+        } catch { /* ignore */ }
         NS.scanSuspiciousPackagesFast(true);
         if (typeof NS.shouldSkipHeavyPageScan === "function" && NS.shouldSkipHeavyPageScan()) {
           NS.maybeLiftDownloadGuard(); NS.markAnalysisComplete("load-skip-heavy-after-scan"); return;

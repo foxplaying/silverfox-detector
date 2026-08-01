@@ -234,8 +234,8 @@
       const rel = NS.evaluateDomainKeywordRelevance(host);
       if (!rel || !rel.squat || rel.hostMatch !== "typo") return false;
       let brand = String(rel.brand || (rel.primary && rel.primary.display) || "").trim();
-      if (brand && typeof NS.normalizeDisplayBrandName === "function") {
-        brand = NS.normalizeDisplayBrandName(brand) || brand;
+      if (brand && typeof NS.canonicalizeBrandDisplayCandidate === "function") {
+        brand = NS.canonicalizeBrandDisplayCandidate(brand);
       }
       if (!brand) return false;
 
@@ -307,6 +307,186 @@
     } catch { return false; }
   };
 
+  /** 是否有可展示的组织字段；证书等级本身可在没有组织名时单独展示。 */
+  NS.isDisplayableOrganizationSslInfo = function (info) {
+    try {
+      const v = String((info && info.validation) || "").toUpperCase();
+      if (v !== "OV" && v !== "EV") return false;
+      if (!String((info && info.organization) || "").trim()) return false;
+      if (v === "EV") return true;
+      return info.sniChainVerified === true || info.liveTlsLeafVerified === true
+        || info.unexpiredHostVerified === true;
+    } catch { return false; }
+  };
+
+  /** 是否具备可展示的组织级 SSL——用于隐藏「未查询到备案」文案 */
+  NS.hasOrganizationValidatedSsl = function () {
+    try {
+      return NS.isDisplayableOrganizationSslInfo(NS.state.sslInfo);
+    } catch { return false; }
+  };
+
+  /** 写入报告用的 ICP 文案：取得可展示的组织字段时才隐藏「未查询到备案信息」 */
+  NS.formatIcpInfoForReport = function (icpRaw) {
+    try {
+      const s = String(icpRaw != null ? icpRaw : (NS.state && NS.state.icpInfo) || "").trim();
+      if (!s) return "";
+      if (/未查询到|查询失败|暂无/.test(s) && NS.hasOrganizationValidatedSsl()) return "";
+      return s;
+    } catch {
+      return String(icpRaw || "");
+    }
+  };
+
+  function sslValidationRank(v) {
+    const u = String(v || "").toUpperCase();
+    if (u === "EV") return 3;
+    if (u === "OV") return 2;
+    if (u === "DV") return 1;
+    return 0;
+  }
+
+  /** 已废弃：不再提前写 DV 占位（探测完成前不展示 SSL） */
+  NS.ensureSslPlaceholder = function () { /* no-op */ };
+
+  /** 应用 background 推送/查询到的 SSL 证书分类（只升不降，除非 force） */
+  NS.applySslCertInfo = function (info, force) {
+    try {
+      if (!info || typeof info !== "object") return false;
+      const src = String(info.source || "");
+      // 旧空占位拒绝；https-assumed 是 CT 失败后的合法 HTTPS 回退
+      if (src === "page-https" || src === "https-reachability") return false;
+      const host = (location.hostname || "").toLowerCase().replace(/^www\./, "");
+      const infoHost = String(info.host || "").toLowerCase().replace(/^www\./, "");
+      if (infoHost && host && infoHost !== host) return false;
+      let nextVal = String(info.validation || "").toUpperCase();
+      if (!/^(DV|OV|EV)$/.test(nextVal)) return false;
+      const prev = NS.state.sslInfo;
+      const dirtyOrg = (o) => /internet\s*widgits|some[-\s]?state|default\s+company/i.test(String(o || ""));
+      const unboundOv = (validation, sniChainVerified, liveTlsLeafVerified, unexpiredHostVerified) => String(validation || "").toUpperCase() === "OV"
+        && sniChainVerified !== true && liveTlsLeafVerified !== true && unexpiredHostVerified !== true;
+      // OpenSSL 占位 O= 不当组织证书；未绑定 SNI 的 OV 保留等级、只清空组织名
+      if (dirtyOrg(info.organization)) {
+        if (nextVal === "OV" || nextVal === "EV") nextVal = "DV";
+      }
+      // 旧结果是占位 OV（Internet Widgits）：允许被正确 DV 覆盖
+      const prevBogusOv = prev && dirtyOrg(prev.organization)
+        && sslValidationRank(prev.validation) >= 2;
+      // 禁止用弱 DV 覆盖已识别的 OV/EV（脏占位 OV 除外）
+      if (!force && prev && sslValidationRank(prev.validation) > sslValidationRank(nextVal)
+        && !prevBogusOv) {
+        return false;
+      }
+      // 禁止用 https-assumed 覆盖已有 CT/Labs 结果
+      if (!force && prev && prev.validation && prev.source && prev.source !== "https-assumed"
+        && src === "https-assumed") {
+        return false;
+      }
+      // 同级时保留已有机构名；但拒绝把未绑定实时叶证书的 OV / OpenSSL 占位 org 粘住
+      let org = String(info.organization || "").trim();
+      if (dirtyOrg(org) || unboundOv(info.validation, info.sniChainVerified, info.liveTlsLeafVerified, info.unexpiredHostVerified)) org = "";
+      if (!org && prev && prev.organization && sslValidationRank(prev.validation) === sslValidationRank(nextVal)) {
+        if (!dirtyOrg(prev.organization)
+          && !unboundOv(prev.validation, prev.sniChainVerified, prev.liveTlsLeafVerified, prev.unexpiredHostVerified)) {
+          org = prev.organization;
+        }
+      }
+      // 新结果无 org 但旧结果是脏 CDN/占位 org：清空
+      if (!org && prev && (dirtyOrg(prev.organization)
+        || unboundOv(prev.validation, prev.sniChainVerified, prev.liveTlsLeafVerified, prev.unexpiredHostVerified))) org = "";
+      const finalVal = nextVal;
+      NS.state.sslInfo = {
+        validation: finalVal,
+        organization: org,
+        commonName: String(info.commonName || (prev && prev.commonName) || host).trim(),
+        state: String(info.state || "secure"),
+        fingerprintSha256: String(info.fingerprintSha256 || ""),
+        host: infoHost || host,
+        at: Number(info.at) || Date.now(),
+        limited: !!info.limited,
+        source: src || "probe",
+        sniChainVerified: info.sniChainVerified === true,
+        liveTlsLeafVerified: info.liveTlsLeafVerified === true,
+        unexpiredHostVerified: info.unexpiredHostVerified === true,
+        assumed: !!info.assumed || src === "https-assumed"
+      };
+      // OV/EV 时清掉「未查询到备案」展示与软信号
+      if (NS.hasOrganizationValidatedSsl()) {
+        if (/未查询到|查询失败|暂无/.test(String(NS.state.icpInfo || ""))) {
+          NS.state.icpInfo = "";
+        }
+        try {
+          NS.state.details = (NS.state.details || []).filter((d) => d && d.name !== "无ICP备案信息");
+          if (NS.state.signalSet && typeof NS.state.signalSet.forEach === "function") {
+            const drop = [];
+            NS.state.signalSet.forEach((k) => {
+              if (/无ICP备案/i.test(String(k))) drop.push(k);
+            });
+            drop.forEach((k) => NS.state.signalSet.delete(k));
+          }
+          NS.state.score = (NS.state.details || []).reduce((s, d) => s + (Number(d.weight) || 0), 0);
+        } catch { /* ignore */ }
+      }
+      try { NS.emitRiskReport(true); } catch { /* ignore */ }
+      return true;
+    } catch { return false; }
+  };
+
+  /** 向 background 拉取当前主机证书分类（CT + Subject 解析）；完成前不展示 SSL */
+  NS.requestSslCertInfo = function (force) {
+    try {
+      if (!chrome?.runtime?.id) return;
+      if (!/^https:/i.test(String(location.protocol || ""))) {
+        NS.state.sslInfo = null;
+        return;
+      }
+      // 保留 www：www.gov.cn 叶子是 *.www.gov.cn，剥掉 www 会整链 miss → 假 DV
+      const host = (location.hostname || "").toLowerCase();
+      // 已是 OV/EV 且非强制则不重查（无机构名的 OV 仍允许再探补 O=）
+      if (!force && NS.hasOrganizationValidatedSsl && NS.hasOrganizationValidatedSsl()) {
+        const org = String((NS.state.sslInfo && NS.state.sslInfo.organization) || "").trim();
+        if (org) {
+          try { NS.emitRiskReport(true); } catch { /* ignore */ }
+          return;
+        }
+      }
+      // 已是 EV：不重复。OV/DV/assumed 允许再请求（升 EV 或纠正误判）
+      if (!force && NS.state.sslInfo && NS.state.sslInfo.validation) {
+        const v = String(NS.state.sslInfo.validation || "").toUpperCase();
+        const src = String(NS.state.sslInfo.source || "");
+        const org = String(NS.state.sslInfo.organization || "").trim();
+        if (v === "EV" && org && src !== "page-https" && src !== "https-reachability") {
+          return;
+        }
+        // OV 有机构名：短时内跳过；无机构名必须继续探
+        if (v === "OV" && org && !force && NS.state.sslInfo.at
+          && Date.now() - Number(NS.state.sslInfo.at) < 1500) {
+          return;
+        }
+        // DV 短时内仍允许 force 升级；非 force 时 1.5s 内不重复刷
+        if (v === "DV" && src !== "https-assumed" && src !== "page-https"
+          && src !== "https-reachability" && !force && NS.state.sslInfo.at
+          && Date.now() - Number(NS.state.sslInfo.at) < 1500) {
+          return;
+        }
+      }
+      chrome.runtime.sendMessage({
+        type: "get-ssl-cert",
+        host,
+        force: !!force,
+        https: true
+      }, (resp) => {
+        const err = chrome.runtime.lastError;
+        void err;
+        try {
+          if (resp && resp.success && resp.sslInfo) {
+            NS.applySslCertInfo(resp.sslInfo, !!force);
+          }
+        } catch { /* ignore */ }
+      });
+    } catch { /* ignore */ }
+  };
+
   /** 纯 WHOIS 年龄 ≥10 年（百度/pcsoft 等）——不因套件标志失效 */
   NS.isWhoisAgeUltraMature = function () {
     try {
@@ -345,6 +525,435 @@
   };
 
   /**
+   * 主机是否公开代码托管/发行平台（基础设施域结构，非产品品牌名单）。
+   * 含 releases CDN（githubusercontent）与 pages（github.io / gitlab.io）。
+   */
+  NS.hostLooksLikePublicCodeForge = function (hostname) {
+    try {
+      const h = String(hostname || "").toLowerCase().replace(/^www\./, "");
+      if (!h || h.length < 4) return false;
+      if (/(?:^|\.)github\.com$/i.test(h)) return true;
+      if (/(?:^|\.)githubusercontent\.com$/i.test(h)) return true;
+      if (/(?:^|\.)github\.io$/i.test(h)) return true;
+      if (/(?:^|\.)gitlab\.com$/i.test(h)) return true;
+      if (/(?:^|\.)gitlab\.io$/i.test(h)) return true;
+      if (/(?:^|\.)gitee\.com$/i.test(h)) return true;
+      if (/(?:^|\.)gitcode\.(?:com|net)$/i.test(h)) return true;
+      if (/(?:^|\.)codeberg\.org$/i.test(h)) return true;
+      if (/(?:^|\.)bitbucket\.org$/i.test(h)) return true;
+      if (/(?:^|\.)(?:sourceforge|sf)\.net$/i.test(h)) return true;
+      if (/(?:^|\.)(?:git\.)?sr\.ht$/i.test(h)) return true;
+      if (/(?:^|\.)sourcehut\.org$/i.test(h)) return true;
+      return false;
+    } catch { return false; }
+  };
+
+  /** 路径是否像仓库/发行页（/owner/repo、/releases、/-/releases…），避免仅链到平台首页 */
+  NS.pathLooksLikePublicCodeRepoOrRelease = function (pathname) {
+    try {
+      const p = String(pathname || "").replace(/\/+$/, "") || "/";
+      if (p === "/" || p.length < 3) return false;
+      if (/\/releases?(?:\/|$)/i.test(p)) return true;
+      if (/\/-\/releases?(?:\/|$)/i.test(p)) return true;
+      if (/\/archive\//i.test(p)) return true;
+      if (/\/download(?:s)?(?:\/|$)/i.test(p) && /\/(?:repo|project|p)\//i.test(p)) return true;
+      // /owner/repo 或更深（排除纯用户主页单段）
+      const segs = p.split("/").filter(Boolean);
+      if (segs.length >= 2) {
+        const a = segs[0];
+        const b = segs[1];
+        if (/^(?:settings|login|signup|explore|topics|marketplace|pricing|features|about|orgs|organizations|dashboard|notifications|search)$/i.test(a)) {
+          return false;
+        }
+        if (a.length >= 1 && b.length >= 1 && !/^(?:http|https)$/i.test(a)) return true;
+      }
+      return false;
+    } catch { return false; }
+  };
+
+  /**
+   * 页内用于对齐代码仓的品牌核（拉丁/主机核），不写死具体产品名单。
+   * 来源：等权品牌关键词 + 主机标签/产品线首段。
+   */
+  NS.collectPageBrandTokensForForgeAlign = function () {
+    const out = [];
+    const seen = new Set();
+    const push = (raw, minLen) => {
+      const t = String(raw || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      const min = minLen != null ? minLen : 3;
+      if (!t || t.length < min || t.length > 32) return;
+      if (/^(?:com|net|org|www|http|https|html|download|release|releases|official|software|security|antivirus|client|setup|install|github|gitlab|gitee|codeberg|bitbucket)$/i.test(t)) return;
+      if (seen.has(t)) return;
+      seen.add(t);
+      out.push(t);
+    };
+    try {
+      if (typeof NS.collectPrimaryBrandKeywords === "function") {
+        const pk = NS.collectPrimaryBrandKeywords();
+        if (pk) {
+          push(pk.display, 3);
+          (pk.latin || []).forEach((x) => push(x, 3));
+          (pk.tokens || []).forEach((x) => {
+            if (/^[a-z0-9][a-z0-9._-]{2,}$/i.test(String(x || "")) || /[A-Za-z]{3,}/.test(String(x || ""))) {
+              push(x, 3);
+            }
+          });
+        }
+      }
+    } catch { /* ignore */ }
+    try {
+      if (typeof NS.resolveSpoofDisplayBrand === "function") {
+        push(NS.resolveSpoofDisplayBrand(location.hostname), 3);
+      }
+    } catch { /* ignore */ }
+    try {
+      const host = (location.hostname || "").toLowerCase().replace(/^www\./, "");
+      const labelRaw = (host.split(".")[0] || "").toLowerCase();
+      const label = labelRaw.replace(/[^a-z0-9]/g, "");
+      push(label, 4);
+      // 连字符产品线：pyas-security → pyas
+      if (/-/.test(labelRaw)) {
+        labelRaw.split(/[-_]/).forEach((seg) => push(seg, 3));
+        if (typeof NS.hostLabelIsBrandProductCategoryDomain === "function") {
+          const head = (labelRaw.split(/[-_]/)[0] || "").replace(/[^a-z0-9]/g, "");
+          if (head.length >= 3 && NS.hostLabelIsBrandProductCategoryDomain(labelRaw, head)) push(head, 3);
+        }
+      }
+      if (typeof NS.resolveHostBrandCore === "function") {
+        push(NS.resolveHostBrandCore(host), 4);
+      }
+      if (typeof NS.inferMarketingPaddedBrandCore === "function") {
+        const core = NS.inferMarketingPaddedBrandCore(labelRaw) || "";
+        // 产品线域 infer 常返回空；夹带核仅作补充
+        if (core) push(core, 4);
+      }
+    } catch { /* ignore */ }
+    // 长 token 优先，短 token 靠后（匹配时仍全试）
+    out.sort((a, b) => b.length - a.length);
+    return out;
+  };
+
+  /**
+   * 代码仓/发行 URL 是否与品牌核强相关：
+   * owner、repo、路径段或文件名须完整包含品牌 token（≥4 字母优先；3 字母须整段相等）。
+   * 防止页脚随手链一个无关 GitHub 组织却洗白仿冒站。
+   */
+  NS.forgeUrlStronglyAlignedWithBrandTokens = function (href, brandTokensOpt) {
+    try {
+      const tokens = Array.isArray(brandTokensOpt) && brandTokensOpt.length
+        ? brandTokensOpt
+        : NS.collectPageBrandTokensForForgeAlign();
+      if (!tokens.length) return false;
+      let u;
+      try { u = new URL(String(href || ""), location.href); } catch { return false; }
+      if (!NS.hostLooksLikePublicCodeForge(u.hostname)) return false;
+
+      const hostFlat = u.hostname.toLowerCase().replace(/[^a-z0-9.]/g, "");
+      const segs = (u.pathname || "").split("/").filter(Boolean).map((s) => s.toLowerCase().replace(/[^a-z0-9._-]/g, ""));
+      const pathFlat = segs.join("/");
+      const fileName = (typeof NS.getFilenameFromUrl === "function"
+        ? NS.getFilenameFromUrl(u.href) : (segs[segs.length - 1] || "")).toLowerCase();
+      const fileFlat = fileName.replace(/[^a-z0-9]/g, "");
+      // owner / repo 优先（github.com/owner/repo/...）
+      const owner = segs[0] || "";
+      const repo = segs[1] || "";
+      const ownerFlat = owner.replace(/[^a-z0-9]/g, "");
+      const repoFlat = repo.replace(/[^a-z0-9]/g, "");
+      // github.io：user.github.io/project
+      const hostLeft = (u.hostname.split(".")[0] || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+
+      const strongHit = (tok) => {
+        const t = String(tok || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        if (!t || t.length < 3) return false;
+        // 3 字母：必须整段相等（owner/repo/文件主名），防误命中
+        if (t.length === 3) {
+          return ownerFlat === t || repoFlat === t || hostLeft === t
+            || segs.some((s) => s.replace(/[^a-z0-9]/g, "") === t)
+            || fileFlat === t || fileFlat.startsWith(t);
+        }
+        // ≥4：owner/repo/路径/主机/文件名 包含品牌核
+        if (ownerFlat === t || repoFlat === t || ownerFlat.includes(t) || repoFlat.includes(t)) return true;
+        if (hostLeft === t || hostLeft.includes(t)) return true;
+        if (pathFlat.replace(/[^a-z0-9]/g, "").includes(t)) return true;
+        if (fileFlat.includes(t)) return true;
+        if (hostFlat.includes(t) && !/github|gitlab|gitee|codeberg|bitbucket|sourceforge|githubusercontent/.test(t)) {
+          return hostLeft.includes(t);
+        }
+        return false;
+      };
+
+      // 优先用较长品牌核命中
+      for (let i = 0; i < tokens.length; i++) {
+        if (strongHit(tokens[i])) return true;
+      }
+      return false;
+    } catch { return false; }
+  };
+
+  /**
+   * 从 DOM 锚点 + HTML 切片收集候选 forge URL（document_start 时 links 可能仍空）。
+   */
+  NS.collectPublicCodeForgeHrefCandidates = function (limitOpt) {
+    const out = [];
+    const seen = new Set();
+    const push = (raw) => {
+      if (!raw || raw.startsWith("#") || raw.startsWith("javascript:")) return;
+      let abs = "";
+      try { abs = new URL(String(raw), location.href).href; } catch { return; }
+      if (seen.has(abs)) return;
+      let u;
+      try { u = new URL(abs); } catch { return; }
+      if (!/^https?:$/i.test(u.protocol)) return;
+      if (!NS.hostLooksLikePublicCodeForge(u.hostname)) return;
+      seen.add(abs);
+      out.push(abs);
+    };
+    try {
+      const limit = Math.min(Math.max(Number(limitOpt) || 160, 40), 240);
+      const anchors = document.links || document.querySelectorAll("a[href]");
+      const n = Math.min(anchors.length || 0, limit);
+      for (let i = 0; i < n; i++) {
+        const a = anchors[i];
+        push((a && (a.getAttribute("href") || a.href)) || "");
+        if (out.length >= limit) return out;
+      }
+      // 锚点未挂载时扫 HTML（含 github.com/.../releases/download/...）
+      if (out.length < 4) {
+        const html = typeof NS.getHtmlSlice === "function"
+          ? NS.getHtmlSlice(90000)
+          : String((document.documentElement && document.documentElement.innerHTML) || "").slice(0, 90000);
+        const re = /https?:\/\/(?:www\.)?(?:github\.com|gitlab\.com|gitee\.com|codeberg\.org|bitbucket\.org|gitcode\.(?:com|net)|(?:git\.)?sr\.ht|sourceforge\.net|objects\.githubusercontent\.com)[^\s"'<>]{4,220}/gi;
+        let m;
+        while ((m = re.exec(html)) !== null && out.length < limit) {
+          push(m[0].replace(/[),.;]+$/, ""));
+        }
+      }
+    } catch { /* ignore */ }
+    return out;
+  };
+
+  /**
+   * 页内是否出现「与品牌强相关」的公开代码仓链接。
+   * 仅 forge 主机不够：owner/repo（或发行路径）须含页内品牌核。
+   * 注意：否定结果不长缓存（document_start 时尚无 DOM 会假阴性）。
+   */
+  NS.pageHasPublicCodeForgePresence = function () {
+    try {
+      const c = NS.caches || {};
+      const now = Date.now();
+      const href0 = location.href || "";
+      // 仅缓存阳性；阴性最多 400ms，避免早扫锁死
+      if (c._forgePresenceCache === true && c._forgePresenceUrl === href0 && now - (c._forgePresenceAt || 0) < 8000) {
+        return true;
+      }
+      if (c._forgePresenceCache === false && c._forgePresenceUrl === href0 && now - (c._forgePresenceAt || 0) < 400) {
+        return false;
+      }
+      const brands = NS.collectPageBrandTokensForForgeAlign();
+      // title 兜底：collectPrimary 未就绪时仍可从标题抽 PYAS
+      try {
+        const title = document.title || "";
+        (title.match(/[A-Za-z][A-Za-z0-9]{2,24}/g) || []).forEach((w) => {
+          const t = w.toLowerCase().replace(/[^a-z0-9]/g, "");
+          if (t.length >= 3 && t.length <= 24 && !/^(?:the|and|for|free|security|antivirus|download|source|view)$/i.test(t)) {
+            if (!brands.includes(t)) brands.push(t);
+          }
+        });
+      } catch { /* ignore */ }
+      let hit = false;
+      if (brands.length) {
+        brands.sort((a, b) => b.length - a.length);
+        const hrefs = NS.collectPublicCodeForgeHrefCandidates(160);
+        for (let i = 0; i < hrefs.length; i++) {
+          const abs = hrefs[i];
+          let u;
+          try { u = new URL(abs); } catch { continue; }
+          if (!NS.pathLooksLikePublicCodeRepoOrRelease(u.pathname)
+            && !/(?:^|\.)githubusercontent\.com$/i.test(u.hostname)
+            && !/(?:^|\.)(?:github|gitlab)\.io$/i.test(u.hostname)) {
+            continue;
+          }
+          if (NS.forgeUrlStronglyAlignedWithBrandTokens(abs, brands)) {
+            hit = true;
+            break;
+          }
+        }
+      }
+      c._forgePresenceCache = hit;
+      c._forgePresenceAt = now;
+      c._forgePresenceUrl = href0;
+      return hit;
+    } catch { return false; }
+  };
+
+  /** 当前页主机是否具备成熟归属证据：有效 ICP，或 WHOIS 注册足够久（与超成熟门户阈值独立） */
+  NS.currentPageHostLooksMatureForTrust = function (minDaysOpt) {
+    try {
+      if (typeof NS.hasValidIcpRecord === "function" && NS.hasValidIcpRecord()) return true;
+      const minDays = Number.isFinite(minDaysOpt) ? minDaysOpt : 180;
+      const days = typeof NS.getWhoisAgeDays === "function" ? NS.getWhoisAgeDays() : null;
+      return days != null && days >= minDays;
+    } catch { return false; }
+  };
+
+  /**
+   * 收集页内安装包类下载 URL（同步、有限扫描）。
+   */
+  NS.collectPagePackageDownloadHrefs = function (limitOpt) {
+    const out = [];
+    const seen = new Set();
+    const pushPkg = (raw) => {
+      if (!raw || raw.startsWith("#") || raw.startsWith("javascript:")) return;
+      let abs = raw;
+      try { abs = new URL(String(raw), location.href).href; } catch { return; }
+      if (seen.has(abs)) return;
+      const isPkg = (typeof NS.isPackageFileUrl === "function" && NS.isPackageFileUrl(abs))
+        || (typeof NS.looksLikeProductPackageName === "function"
+          && NS.looksLikeProductPackageName(typeof NS.getFilenameFromUrl === "function" ? NS.getFilenameFromUrl(abs) : abs))
+        || /\.(?:zip|exe|msi|dmg|apk|rar|7z)(?:\?|#|$)/i.test(abs);
+      if (!isPkg) return;
+      seen.add(abs);
+      out.push(abs);
+    };
+    try {
+      const limit = Math.min(Math.max(Number(limitOpt) || 40, 8), 80);
+      const nodes = document.querySelectorAll("a[href], a[data-href], button[data-href], [download]");
+      for (let i = 0; i < nodes.length && out.length < limit; i++) {
+        const el = nodes[i];
+        pushPkg((el.getAttribute("href") || el.getAttribute("data-href") || el.getAttribute("download") || "").trim());
+      }
+      // DOM 未就绪：从 HTML 抽 forge release 安装包
+      if (out.length < 2) {
+        const html = typeof NS.getHtmlSlice === "function"
+          ? NS.getHtmlSlice(90000)
+          : String((document.documentElement && document.documentElement.innerHTML) || "").slice(0, 90000);
+        const re = /https?:\/\/[^\s"'<>]+\.(?:zip|exe|msi|dmg|apk|rar|7z)(?:\?[^\s"'<>]*)?/gi;
+        let m;
+        while ((m = re.exec(html)) !== null && out.length < limit) {
+          pushPkg(m[0].replace(/[),.;]+$/, ""));
+        }
+      }
+    } catch { /* ignore */ }
+    return out;
+  };
+
+  /**
+   * 开源项目下载门户可信：
+   * 1) 页内有与品牌强相关的公开代码仓（owner/repo 含品牌核）；
+   * 2) 安装包下载落在 (a) 品牌对齐的 forge 发行，或 (b) 当前页同 apex 且页成熟（ICP/WHOIS）。
+   * 特例：只要存在「品牌对齐的 forge release 安装包」，即视为成熟下载目标（无需 WHOIS）。
+   * 真硬套件不放行。不写死产品品牌名单。
+   */
+  NS.pageLooksLikeTrustedOpenSourceDownloadPortal = function () {
+    try {
+      const state = NS.state;
+      if (state && (state._seoCloakKitDetected || state._desktopForceDlKit
+        || state._remoteGarbleDlDetected || state._indexNowPhishTemplate)) {
+        return false;
+      }
+      if (typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat()) return false;
+
+      // 每次实判前清阴性缓存，避免 document_start 假阴性粘住
+      try {
+        if (NS.caches && NS.caches._forgePresenceCache === false) {
+          NS.caches._forgePresenceCache = null;
+          NS.caches._forgePresenceAt = 0;
+        }
+      } catch { /* ignore */ }
+
+      let brands = NS.collectPageBrandTokensForForgeAlign();
+      // 标题/logo 再补一轮（PYAS Security）
+      try {
+        const blob = `${document.title || ""} ${(document.querySelector(".logo,a.logo,h1") || {}).textContent || ""}`;
+        (blob.match(/[A-Za-z][A-Za-z0-9]{2,24}/g) || []).forEach((w) => {
+          const t = w.toLowerCase().replace(/[^a-z0-9]/g, "");
+          if (t.length >= 3 && t.length <= 24
+            && !/^(?:the|and|for|free|security|antivirus|download|source|view|smart|endpoint|why|choose)$/i.test(t)
+            && !brands.includes(t)) brands.push(t);
+        });
+      } catch { /* ignore */ }
+      if (!brands.length) return false;
+      brands = brands.slice().sort((a, b) => b.length - a.length);
+
+      // 直接用候选 URL 判仓（不依赖可能过期的 presence 缓存）
+      const forgeHrefs = NS.collectPublicCodeForgeHrefCandidates(160);
+      let brandAlignedRepo = false;
+      let brandAlignedForgePkg = false;
+      for (let i = 0; i < forgeHrefs.length; i++) {
+        const abs = forgeHrefs[i];
+        let u;
+        try { u = new URL(abs); } catch { continue; }
+        const isPkg = /\.(?:zip|exe|msi|dmg|apk|rar|7z)(?:\?|#|$)/i.test(abs)
+          || (typeof NS.isPackageFileUrl === "function" && NS.isPackageFileUrl(abs));
+        const pathOk = NS.pathLooksLikePublicCodeRepoOrRelease(u.pathname)
+          || /(?:^|\.)githubusercontent\.com$/i.test(u.hostname)
+          || /(?:^|\.)(?:github|gitlab)\.io$/i.test(u.hostname)
+          || isPkg;
+        if (!pathOk) continue;
+        if (!NS.forgeUrlStronglyAlignedWithBrandTokens(abs, brands)) continue;
+        if (isPkg) brandAlignedForgePkg = true;
+        else brandAlignedRepo = true;
+      }
+      // 安装包列表再扫一轮（含 HTML 兜底）
+      if (!brandAlignedForgePkg) {
+        const pkgs = NS.collectPagePackageDownloadHrefs(40);
+        for (let i = 0; i < pkgs.length; i++) {
+          try {
+            const host = new URL(pkgs[i]).hostname;
+            if (!NS.hostLooksLikePublicCodeForge(host)) continue;
+            if (NS.forgeUrlStronglyAlignedWithBrandTokens(pkgs[i], brands)) {
+              brandAlignedForgePkg = true;
+              break;
+            }
+          } catch { /* ignore */ }
+        }
+      }
+      // 有品牌对齐仓链但未识别到 repo 页时：仅 release 包也够
+      if (!brandAlignedRepo && !brandAlignedForgePkg) {
+        // 回退 presence（含 title 补 brand）
+        if (!NS.pageHasPublicCodeForgePresence()) return false;
+        brandAlignedRepo = true;
+      }
+
+      const pageHost = (location.hostname || "").toLowerCase().replace(/^www\./, "");
+      const pageApex = (typeof NS.getRegistrableDomain === "function"
+        ? NS.getRegistrableDomain(pageHost) : pageHost) || pageHost;
+      const pageMature = NS.currentPageHostLooksMatureForTrust(180);
+
+      // ★ 品牌对齐的 forge 安装包 = 成熟下载目标（github releases），无需 WHOIS
+      if (brandAlignedForgePkg) return true;
+
+      const pkgs = NS.collectPagePackageDownloadHrefs(40);
+      // 无安装包直链：品牌对齐仓 + 当前页成熟 → 文档/介绍型开源站
+      if (!pkgs.length) {
+        return !!(brandAlignedRepo && pageMature);
+      }
+
+      let ok = 0;
+      let bad = 0;
+      for (let i = 0; i < pkgs.length; i++) {
+        const pkg = pkgs[i];
+        let host = "";
+        try { host = new URL(pkg).hostname.toLowerCase().replace(/^www\./, ""); } catch { bad++; continue; }
+        if (NS.hostLooksLikePublicCodeForge(host)) {
+          if (NS.forgeUrlStronglyAlignedWithBrandTokens(pkg, brands)) ok++;
+          else bad++;
+          continue;
+        }
+        const apex = (typeof NS.getRegistrableDomain === "function"
+          ? NS.getRegistrableDomain(host) : host) || host;
+        if (apex && pageApex && apex === pageApex) {
+          if (pageMature) ok++;
+          else bad++;
+          continue;
+        }
+        bad++;
+      }
+      return ok >= 1 && bad === 0;
+    } catch { return false; }
+  };
+
+  /**
    * 可信门户软误报一键解除：有效 ICP 或 WHOIS≥10 年。
    * 清 soft flags + guard + packageBlocked，避免 popup 仍显示「可疑安装包已禁用」。
    */
@@ -356,6 +965,9 @@
         || (typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature())
         || (NS.getWhoisAgeDays() != null && NS.getWhoisAgeDays() >= 3650);
       if (!trusted) return false;
+      const liftStartedAt = Date.now();
+      const liftGeneration = Number(state._softLiftGeneration || 0) + 1;
+      state._softLiftGeneration = liftGeneration;
       state._brandSpoofPortalDetected = false;
       state._brandResourceMismatchDetected = false;
       state._fakeBrandShellDetected = false;
@@ -391,6 +1003,7 @@
       state.downloadGuardInstalled = false;
       state._earlyShellArmed = false;
       try { NS.clearDownloadGuard(reason || "trusted-portal-soft-lift"); } catch { /* ignore */ }
+      try { NS.notifyBackgroundDownloadTrust(true, reason || "trusted-portal-soft-lift"); } catch { /* ignore */ }
       try {
         NS.applyDownloadGuardDomLock(false);
         NS.reEnableAllThreatDisabledElements();
@@ -401,6 +1014,9 @@
         [0, 80, 300, 800, 2000].forEach((ms) => {
           setTimeout(() => {
             try {
+              if (NS.state._softLiftGeneration !== liftGeneration) return;
+              if (typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat()) return;
+              if (Number(NS.state._guardArmedAt || 0) > liftStartedAt) return;
               if (NS.hasValidIcpRecord() || (typeof NS.isWhoisAgeUltraMature === "function" && NS.isWhoisAgeUltraMature())) {
                 NS.state.downloadGuardInstalled = false;
                 NS.applyDownloadGuardDomLock(false);
@@ -435,11 +1051,34 @@
     } catch { /* ignore */ }
   };
 
-  /** 清除软品牌仿冒误报（有真实 ICP / 超长 WHOIS）。硬套件（品牌壳/SEO/乱码等）不抬 guard、不恢复按钮。 */
+  /** 将已由 ICP/WHOIS 核验的顶层来源同步给后台下载判定。 */
+  NS.notifyBackgroundDownloadTrust = function (enabled, reason) {
+    try {
+      if (typeof NS.isTopFrame === "function" && !NS.isTopFrame()) return;
+      if (!chrome?.runtime?.id) return;
+      chrome.runtime.sendMessage({
+        type: "set-tab-download-trust",
+        enabled: !!enabled,
+        url: location.href,
+        reason: String(reason || "")
+      }, () => { void chrome.runtime.lastError; });
+    } catch { /* ignore */ }
+  };
+
+  /**
+   * 清除软品牌仿冒误报（ICP / 超长 WHOIS / 品牌对齐开源仓等）。
+   * 注意：不得用 hasHardThreatKitLocked() 在清标志前判定——它包含
+   * _brandSpoofPortalDetected，会导致「清仿冒却立刻重新锁上」。
+   * 仅真硬套件（SEO/乱码/强制弹窗/假壳）保留 guard。
+   */
   NS.clearBrandSpoofFalsePositive = function (reason) {
     const state = NS.state;
-    void reason;
-    const hardLocked = typeof NS.hasHardThreatKitLocked === "function" && NS.hasHardThreatKitLocked();
+    const liftReason = String(reason || "clear-brand-spoof");
+    // 真硬套件（不含纯软 brand-spoof 标志）
+    const keepHard = (typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat())
+      || !!(state._seoCloakKitDetected || state._desktopForceDlKit || state._remoteGarbleDlDetected
+        || state._indexNowPhishTemplate || state._fakeBrandShellDetected
+        || state._multiPlatformSerpTrap || state._unverifiedIcpIdentityThreat);
     state._brandSpoofPortalDetected = false;
     state.spoofBrand = "";
     state._brandSpoofNoticeSent = false;
@@ -467,18 +1106,17 @@
       }
       state.score = (state.details || []).reduce((s, d) => s + (Number(d.weight) || 0), 0);
     } catch { /* ignore */ }
-    if (hardLocked) {
-      // 硬套件仍需禁用按钮
+    if (keepHard) {
       try { NS.disableAllDownloadIntentControls(); NS.postToHooks({ type: "set-guard", enabled: true }); } catch { /* ignore */ }
       try { NS.emitRiskReport(true); } catch { /* ignore */ }
       return;
     }
     try {
       if (state.downloadGuardInstalled || state._earlyShellArmed || (state.protectedTargets && state.protectedTargets.length) || document.querySelector("[data-threat-detector-disabled='1'], [data-silverfox-greyed='1']")) {
-        NS.clearDownloadGuard(reason || "icp-clear-brand-spoof");
+        NS.clearDownloadGuard(liftReason);
       } else {
         try {
-          chrome.runtime.sendMessage({ type: "clear-threat-notice", url: location.href, reason: reason || "icp-clear-brand-spoof" }, () => { void chrome.runtime.lastError; });
+          chrome.runtime.sendMessage({ type: "clear-threat-notice", url: location.href, reason: liftReason }, () => { void chrome.runtime.lastError; });
         } catch { /* ignore */ }
         try { NS.reEnableAllThreatDisabledElements(); } catch { /* ignore */ }
       }
@@ -961,18 +1599,25 @@
         const hasDlCta0 = /免费下载|立即下载|官方下载/i.test(
           Array.from(document.querySelectorAll("a,button")).slice(0, 20).map((e) => e.textContent || "").join(" ")
         );
-        // 夹带域 huorong-pc 也不是安全官方；仅精确品牌根域才可能安全
+        // 夹带域 huorong-pc 也不是安全官方；主机须与中文品牌对齐才可能安全
+        // 对齐：DOMAIN_LATIN_CN_BRIDGE 薄桥 / 标题已含主机拉丁根（不写死品牌名单）
         const labRaw0 = (host0.split(".")[0] || "").toLowerCase();
         const core0 = typeof NS.inferMarketingPaddedBrandCore === "function"
           ? (NS.inferMarketingPaddedBrandCore(labRaw0) || "")
           : "";
         const padded0 = !!(core0 && typeof NS.hostLabelIsPaddedBrand === "function"
           && NS.hostLabelIsPaddedBrand(lab0, core0));
-        if (cn0 && cn0.length >= 2 && hasDlHub0 && hasDlCta0
-          && (padded0
-            || (!/^(huorong|hongrong|qihoo|sogou|baidu|dingtalk|todesk)$/i.test(lab0)
-              && !lab0.includes(String(cn0).slice(0, 2))))) {
-          return false;
+        if (cn0 && cn0.length >= 2 && hasDlHub0 && hasDlCta0) {
+          const hostCores0 = typeof NS.collectHostBrandCores === "function"
+            ? NS.collectHostBrandCores(host0)
+            : null;
+          const hostHintsCn0 = typeof NS.domainLatinRootHintsChineseBrand === "function"
+            && !!NS.domainLatinRootHintsChineseBrand(cn0, hostCores0);
+          const titleFlat0 = title0.toLowerCase().replace(/[^a-z0-9]/g, "");
+          const hostLatinInTitle0 = lab0.length >= 3 && titleFlat0.includes(lab0);
+          if (padded0 || (!hostHintsCn0 && !hostLatinInTitle0)) {
+            return false;
+          }
         }
       } catch { /* ignore */ }
       try {

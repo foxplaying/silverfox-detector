@@ -50,8 +50,23 @@
 
     static restoreAllDownloadButtonsInPage() {
       try {
-        document.querySelectorAll("a, button, [role='button'], [data-silverfox-greyed='1']").forEach((el) => {
+        document.querySelectorAll("a, button, [role='button'], [data-silverfox-greyed='1'], a[data-threat-original-href]").forEach((el) => {
+          try {
+            const orig = el.getAttribute && el.getAttribute("data-threat-original-href");
+            if (el.tagName === "A" && orig && orig !== "js-download" && !/^javascript:/i.test(orig)) {
+              el.setAttribute("href", orig);
+              try { el.href = orig; } catch { /* ignore */ }
+              el.removeAttribute("data-threat-original-href");
+            }
+          } catch { /* ignore */ }
           if (el.dataset.silverfoxGreyed === "1" || DownloadUi.isDownloadIntentText(el)) DownloadUi.restoreGreyed(el);
+          else {
+            // href setter 直接写入的半拦截状态没有 greyed dataset，也必须恢复交互样式。
+            try {
+              el.style.removeProperty("pointer-events");
+              el.style.removeProperty("opacity");
+            } catch { /* ignore */ }
+          }
         });
       } catch { /* ignore */ }
     }
