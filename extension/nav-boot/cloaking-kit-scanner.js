@@ -53,6 +53,11 @@
     scanForCloakingKit(force) {
       if (this.cloakingKit) return true;
       if (PageShellDetector.looksLikeSearchPageShape()) return false; // SERP 永不扫描
+      // 干净 /download 路径：永不扫脚本 blob（勿用品牌根首页——仿冒站漏扫）
+      try {
+        if (typeof PageShellDetector.looksLikeCleanOfficialDownloadHostPathEarly === "function"
+          && PageShellDetector.looksLikeCleanOfficialDownloadHostPathEarly()) return false;
+      } catch { /* ignore */ }
       if (PageShellDetector.pageLooksLikeOfficialDownloadPayload()) return false;
       const now = Date.now();
       if (!force && now - this.kitScanAt < 250) return this.cloakingKit;

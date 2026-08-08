@@ -4,22 +4,58 @@
 ;(function () {
   "use strict";
 
-  const VT_TRUST_POLICY_VERSION = 3;
+  const VT_TRUST_POLICY_VERSION = 4;
   const VT_STATS_POLICY_VERSION = 2;
-  const VT_TRUSTED_ENGINE_RULES = [
-    ["BitDefender", /^BitDefender(?:Falx)?$/i],
-    ["ESET", /^ESET(?:-NOD32)?$/i],
-    ["Avast", /^Avast(?:-Mobile)?$/i],
-    ["Huorong", /^(?:Huorong|火绒)$/i],
-    ["Kaspersky", /^Kaspersky$/i]
+  /** 与 background pe-vt-bg 加权表一致：group 去重；Avast/AVG 同组 */
+  const VT_ENGINE_WEIGHT_TABLE = [
+    { id: "Kaspersky", group: "kaspersky", weight: 3, re: /^Kaspersky(?:\s|$|\.)/i },
+    { id: "ESET", group: "eset", weight: 2.75, re: /^ESET(?:-NOD32)?$/i },
+    { id: "Sophos", group: "sophos", weight: 2.5, re: /^Sophos$/i },
+    { id: "BitDefender", group: "bitdefender", weight: 2.25, re: /^BitDefender(?:Falx)?$/i },
+    { id: "Avast", group: "avast", weight: 2, re: /^(?:Avast(?:-Mobile)?|AVG)$/i },
+    { id: "Huorong", group: "huorong", weight: 2, re: /^(?:Huorong|火绒)$/i },
+    { id: "Elastic", group: "elastic", weight: 2, re: /^Elastic$/i },
+    { id: "Cynet", group: "cynet", weight: 2, re: /^Cynet$/i },
+    { id: "Avira", group: "avira", weight: 1.5, re: /^Avira$/i },
+    { id: "WithSecure", group: "withsecure", weight: 1.25, re: /^(?:WithSecure|F-Secure)$/i },
+    { id: "Sangfor", group: "sangfor", weight: 1, re: /^(?:Sangfor|深信服)$/i },
+    { id: "Rising", group: "rising", weight: 0.75, re: /^(?:Rising|瑞星)$/i }
   ];
+  const VT_TRUSTED_ENGINE_RULES = VT_ENGINE_WEIGHT_TABLE.map((r) => [r.id, r.re]);
+  const VT_HARD_BLOCK_MIN_SCORE = 5;
+  const VT_HARD_BLOCK_MIN_FAMILIES = 2;
+  const VT_HARD_BLOCK_STRONG_SCORE = 6.5;
+
+  function matchPopupVtWeightRule(engineName) {
+    const raw = String(engineName || "").trim();
+    if (!raw) return null;
+    for (const rule of VT_ENGINE_WEIGHT_TABLE) {
+      if (rule.re.test(raw)) return rule;
+    }
+    return null;
+  }
 
   function popupTrustedVtEngine(engineName) {
-    const raw = String(engineName || "").trim();
-    for (const [canonical, rule] of VT_TRUSTED_ENGINE_RULES) {
-      if (rule.test(raw)) return canonical;
-    }
-    return "";
+    const rule = matchPopupVtWeightRule(engineName);
+    return rule ? rule.id : "";
+  }
+
+  function popupVtScoreIsHardBlock(score, familyCount) {
+    const s = Number(score) || 0;
+    const n = Number(familyCount) || 0;
+    if (n < VT_HARD_BLOCK_MIN_FAMILIES) return false;
+    if (s >= VT_HARD_BLOCK_STRONG_SCORE) return true;
+    return s >= VT_HARD_BLOCK_MIN_SCORE;
+  }
+
+  /** 展示用：引擎 + 家族；票权仅内部判断，不写进文案 */
+  function formatPopupTrustedDetails(rows) {
+    return (Array.isArray(rows) ? rows : []).map((x) => {
+      const engine = String((x && x.engine) || "").trim();
+      if (!engine) return "";
+      const result = String((x && x.result) || "").replace(/\s+/g, " ").trim().slice(0, 48);
+      return result ? `${engine}（${result}）` : engine;
+    }).filter(Boolean);
   }
 
   /** 匹配等价 URL（路径尾斜杠归一；hash 对 SPA 重要）。 */
@@ -41,6 +77,82 @@
     }
   }
 
+  function sslValidationRank(infoOrValidation) {
+    const value = typeof infoOrValidation === "object"
+      ? infoOrValidation && infoOrValidation.validation
+      : infoOrValidation;
+    const validation = String(value || "").toUpperCase();
+    if (validation === "EV") return 3;
+    if (validation === "OV") return 2;
+    if (validation === "DV") return 1;
+    return 0;
+  }
+
+  function sslInfoHostKey(info) {
+    return String((info && (info.host || info.queriedHost)) || "")
+      .toLowerCase().replace(/\.$/, "").replace(/^www\./, "");
+  }
+
+  function isBogusSslOrganization(org) {
+    return /internet\s*widgits|some[-\s]?state|default\s+company/i.test(String(org || ""));
+  }
+
+  function usableSslOrganization(info) {
+    const org = String((info && info.organization) || "").trim();
+    if (!org || isBogusSslOrganization(org)) return "";
+    return org;
+  }
+
+  function effectiveSslValidationRank(info) {
+    const rank = sslValidationRank(info);
+    const org = String((info && info.organization) || "").trim();
+    return rank >= 2 && org && isBogusSslOrganization(org) ? 0 : rank;
+  }
+
+  function sslCertificateIdentity(info) {
+    const fingerprint = String((info && (info.fingerprintSha256 || info.fingerprint)) || "")
+      .toLowerCase().replace(/[^a-f0-9]/g, "");
+    if (fingerprint.length >= 32) return `fp:${fingerprint}`;
+    const certId = String((info && (info.certId || info.certificateId)) || "").trim();
+    return certId ? `id:${certId}` : "";
+  }
+
+  /** Popup 也执行单调升级，防止 runtime/storage 异步回调中的旧 DV 把 OV/EV 画回去。 */
+  function chooseStrongerSslInfo(previous, incoming) {
+    if (!previous) return incoming || null;
+    if (!incoming) return previous || null;
+    const previousHost = sslInfoHostKey(previous);
+    const incomingHost = sslInfoHostKey(incoming);
+    if (previousHost && incomingHost && previousHost !== incomingHost) return incoming;
+    const previousRank = effectiveSslValidationRank(previous);
+    const incomingRank = effectiveSslValidationRank(incoming);
+    if (previousRank !== incomingRank) return incomingRank > previousRank ? incoming : previous;
+    const quality = (info) => {
+      let score = 0;
+      if (usableSslOrganization(info)) score += 8;
+      if (info && info.sniChainVerified === true) score += 4;
+      if (info && info.liveTlsLeafVerified === true) score += 4;
+      if (info && info.unexpiredHostVerified === true) score += 2;
+      if (!/^(?:https-reachability|page-https|https-assumed)$/i.test(String((info && info.source) || ""))) score += 1;
+      return score;
+    };
+    const primary = quality(incoming) >= quality(previous) ? incoming : previous;
+    const secondary = primary === incoming ? previous : incoming;
+    const primaryIdentity = sslCertificateIdentity(primary);
+    const secondaryIdentity = sslCertificateIdentity(secondary);
+    if (primaryIdentity && primaryIdentity === secondaryIdentity) {
+      return {
+        ...secondary,
+        ...primary,
+        organization: usableSslOrganization(primary) || usableSslOrganization(secondary),
+        sniChainVerified: primary.sniChainVerified === true || secondary.sniChainVerified === true,
+        liveTlsLeafVerified: primary.liveTlsLeafVerified === true || secondary.liveTlsLeafVerified === true,
+        unexpiredHostVerified: primary.unexpiredHostVerified === true || secondary.unexpiredHostVerified === true
+      };
+    }
+    return { ...primary };
+  }
+
   class PopupRenderer {
     constructor(root) {
       this.root = root;
@@ -50,6 +162,7 @@
       this._lastCompletedByTab = new Map();
       this._vtDetailsRefreshes = new Set();
       this._nestedSignatureRefreshes = new Set();
+      this._renderRequestSeq = 0;
     }
 
     hostKeyFromUrl(u) {
@@ -66,8 +179,30 @@
       const tabId = this.activeTabId;
       const completed = this.isCompletedReport(data);
       if (completed) {
-        if (tabId != null) this._lastCompletedByTab.set(tabId, { ...data, url: data.url || tabUrl, analysisComplete: true });
-        return { ...data, analysisComplete: true };
+        let next = { ...data, url: data.url || tabUrl, analysisComplete: true };
+        const prev = tabId != null ? this._lastCompletedByTab.get(tabId) : null;
+        if (prev && this.isCompletedReport(prev)) {
+          const hNew = this.hostKeyFromUrl(next.url || tabUrl);
+          const hPrev = this.hostKeyFromUrl(prev.url || tabUrl);
+          if (hNew && hPrev && hNew === hPrev) {
+            const sslInfo = /^https:/i.test(String(next.url || tabUrl || ""))
+              ? chooseStrongerSslInfo(prev.sslInfo, next.sslInfo)
+              : (next.sslInfo || null);
+            const prevAt = Number(prev.timestamp) || 0;
+            const nextAt = Number(next.timestamp) || 0;
+            next = prevAt && nextAt && nextAt < prevAt
+              ? { ...prev, sslInfo }
+              : { ...next, sslInfo };
+            // 同主机的新完成报告仍明确是品牌仿冒时，禁止无名报告覆盖已有具名结论。
+            const nextHasBrandRisk = !!(next.brandSpoofPortal
+              || (Array.isArray(next.details) && next.details.some((d) => /仿冒品牌官网|主动探测仿冒/i.test(d?.name || ""))));
+            if (nextHasBrandRisk && !next.spoofBrand && prev.spoofBrand) {
+              next = { ...next, spoofBrand: prev.spoofBrand };
+            }
+          }
+        }
+        if (tabId != null) this._lastCompletedByTab.set(tabId, next);
+        return next;
       }
       const prev = tabId != null ? this._lastCompletedByTab.get(tabId) : null;
       if (!prev || !this.isCompletedReport(prev)) return data;
@@ -94,7 +229,9 @@
           analysisComplete: true,
           icpInfo: data.icpInfo || prev.icpInfo,
           whoisInfo: data.whoisInfo || prev.whoisInfo,
-          sslInfo: data.sslInfo || prev.sslInfo || null,
+          sslInfo: /^https:/i.test(String(tabUrl || data.url || prev.url || ""))
+            ? chooseStrongerSslInfo(prev.sslInfo, data.sslInfo)
+            : (data.sslInfo || null),
           score: Math.max(Number(prev.score) || 0, Number(data.score) || 0),
           riskLevel: (riskRank[nextRisk] || 0) >= (riskRank[prevRisk] || 0) ? nextRisk : prevRisk,
           downloadGuardInstalled: !!(prev.downloadGuardInstalled || data.downloadGuardInstalled),
@@ -144,7 +281,7 @@
       strong.textContent = "SSL证书: ";
       row.appendChild(strong);
       const span = document.createElement("span");
-      // 等级与组织字段分开：urlscan 可直接显示 OV/EV，tlsIssuer 不冒充组织名。
+      // 等级与组织字段分开：tlsIssuer 不冒充组织名。
       const org = this.isDisplayableOrganizationSsl(info)
         ? String(info.organization || "").trim()
         : "";
@@ -185,26 +322,35 @@
     }
 
     /**
-     * 安装包/压缩包 VT：优先按准确 tabId 展示；旧缓存缺 tabId 时再按页面主机回退。
-     * CDN/重定向域名不应隐藏当前标签页刚触发的文件检测。
+     * 安装包/压缩包 VT：须同时满足「标签页 + 浏览主机」归属。
+     * 禁止：同 tabId 换域名后仍显示源站下载的旧 VT。
+     * CDN 直链：允许 pageHost === 文件托管 host。
      */
     vtMatchesTab(vt, tabId, tabUrl) {
       if (!vt || typeof vt !== "object") return false;
       const at = Number(vt.timestamp) || 0;
       // 30 分钟内；过期不展示
       if (!at || Date.now() - at > 30 * 60 * 1000) return false;
-      // 新数据有准确来源 tabId 时以 tab 为准；下载 CDN/重定向域名不得把同 tab 的 VT 隐藏。
-      if (vt.tabId != null && tabId != null) return Number(vt.tabId) === Number(tabId);
       const pageHost = this.hostKeyFromUrl(tabUrl);
-      if (!pageHost) return false;
       const pageHostAt = this.hostKeyFromUrl(vt.pageUrl || "")
         || String(vt.pageHost || "").toLowerCase().replace(/^www\./, "");
       const dlHost = this.hostKeyFromUrl(vt.url || "");
-      // 必须：当前浏览主机 = 触发下载时的页面主机
+      // 换站：当前页主机 ≠ 触发下载时的页面主机，且文件也不是当前站托管 → 不展示
+      if (pageHost && pageHostAt && pageHost !== pageHostAt) {
+        if (!(dlHost && pageHost === dlHost)) return false;
+      }
+      // tabId 有则必须一致（跨标签全局 latestExeVt 不得串台）
+      if (vt.tabId != null && tabId != null && Number(vt.tabId) !== Number(tabId)) return false;
+      // 同 tab 且主机已对齐（或上面 CDN 例外）
+      if (vt.tabId != null && tabId != null && Number(vt.tabId) === Number(tabId)) {
+        // 无 pageHostAt 时仅信任较新记录，避免脏数据永久粘住
+        if (!pageHostAt && pageHost) return (Date.now() - at) < 5 * 60 * 1000;
+        return true;
+      }
+      // 缺 tabId 的旧缓存：严格按主机
+      if (!pageHost) return false;
       if (pageHostAt && pageHost === pageHostAt) return true;
-      // 或：文件就托管在当前站（同站直链）
       if (dlHost && pageHost === dlHost) return true;
-      // 禁止：仅 tabId 相同但已跳到别的网站仍显示
       return false;
     }
 
@@ -298,36 +444,62 @@
       const malN = vt ? (Number(vt.malicious) || 0) : 0;
       const susN = vt ? (Number(vt.suspicious) || 0) : 0;
       const totN = vt ? (Number(vt.total) || 0) : 0;
-      const trustedByFamily = new Map();
+      const trustedByGroup = new Map();
       for (const detection of (vt && Array.isArray(vt.trustedDetections) ? vt.trustedDetections : [])) {
-        const canonical = popupTrustedVtEngine(detection && detection.engine);
-        if (canonical && !trustedByFamily.has(canonical)) trustedByFamily.set(canonical, detection);
+        const rule = matchPopupVtWeightRule(detection && detection.engine)
+          || (detection && detection.engine ? matchPopupVtWeightRule(detection.engine) : null);
+        const canonical = (detection && detection.engine && popupTrustedVtEngine(detection.engine))
+          || (rule && rule.id) || "";
+        const group = (rule && rule.group)
+          || (detection && detection.group)
+          || String(canonical || "").toLowerCase();
+        if (!canonical || !group || trustedByGroup.has(group)) continue;
+        const weight = Number(detection && detection.weight) || (rule && rule.weight) || 0;
+        trustedByGroup.set(group, { ...detection, engine: canonical, weight, group });
       }
-      const trustedRows = Array.from(trustedByFamily, ([engine, detection]) => ({ ...detection, engine }));
+      const trustedRows = Array.from(trustedByGroup.values())
+        .sort((a, b) => (Number(b.weight) || 0) - (Number(a.weight) || 0));
       const trustedEngineCount = trustedRows.length;
+      const trustedScoreFromVt = Number(vt && vt.trustedScore) || 0;
+      const trustedScoreLocal = trustedRows.reduce((s, x) => s + (Number(x.weight) || 0), 0);
+      const trustedScore = trustedScoreFromVt > 0
+        ? trustedScoreFromVt
+        : Math.round(trustedScoreLocal * 100) / 100;
       const trustedEngineNames = trustedRows.map((x) => x.engine);
-      const trustedEngineDetails = trustedRows
-        .map((x) => {
-          const engine = String(x.engine || "").trim();
-          const result = String((x && x.result) || "").replace(/\s+/g, " ").trim().slice(0, 48);
-          return engine ? `${engine}${result ? `（${result}）` : ""}` : "";
-        }).filter(Boolean);
-      const trustedObservedByFamily = new Map();
+      const trustedEngineDetails = formatPopupTrustedDetails(trustedRows);
+      const trustedObservedByGroup = new Map();
       for (const result of (vt && Array.isArray(vt.trustedEngineResults) ? vt.trustedEngineResults : [])) {
-        const canonical = popupTrustedVtEngine(result && result.engine);
-        if (canonical && !trustedObservedByFamily.has(canonical)) trustedObservedByFamily.set(canonical, result);
+        const rule = matchPopupVtWeightRule(result && result.engine);
+        const canonical = popupTrustedVtEngine(result && result.engine) || (rule && rule.id) || "";
+        const group = (rule && rule.group) || String(canonical || "").toLowerCase();
+        if (canonical && group && !trustedObservedByGroup.has(group)) {
+          trustedObservedByGroup.set(group, { ...result, engine: canonical });
+        }
       }
-      const trustedObservedNames = Array.from(trustedObservedByFamily.keys());
+      const trustedObservedNames = Array.from(trustedObservedByGroup.values()).map((x) => x.engine);
       const trustedObservedCount = trustedObservedNames.length;
+      const trustedHard = !!(vt && vt.trustedScoreHardBlock)
+        || popupVtScoreIsHardBlock(trustedScore, trustedEngineCount);
       const unscopedVtSource = !!(vt
         && /^(?:vt-page-component|vt-dom)$/i.test(String(vt.source || "")));
       // softMiss / unknown 绝不当「VT: 无」
-      const vtNone = !!(vt && vt.notFound === true && vt.verifiedNotFound === true
+      const nestedHasVtHit = nested.some((n) => {
+        const nv = n && n.vt;
+        return !!(nv && nv.found === true && nv.notFound !== true && !nv.unknown
+          && ((Number(nv.malicious) || 0) + (Number(nv.suspicious) || 0) > 0 || Number(nv.total) > 0));
+      });
+      const isArchiveShellUi = (kind === "archive" || kind === "package" || /\.(?:zip|rar|7z|cab|iso)$/i.test(filename))
+        && kind !== "apk"
+        && !(peObj && peObj.isPe && !peObj.skipped);
+      // 压缩包外壳「无」：包内已有检出时不当主结论（灰鸽子 zip 外壳无记录、exe 高检出）
+      const rawVtNone = !!(vt && vt.notFound === true && vt.verifiedNotFound === true
         && !vt.softMiss && vt.unknown !== true);
+      const vtNone = rawVtNone && !(isArchiveShellUi && nestedHasVtHit)
+        && !(vt && vt.deferToNested && nestedHasVtHit);
       const unverifiedMiss = !!(vt && vt.notFound === true && vt.verifiedNotFound !== true);
       const vtHit = !!(vt && !unscopedVtSource && (vt.found === true
         || (vt.malicious != null && vt.notFound !== true && !vt.unknown && !vt.softMiss)));
-      const vtUnknown = !!(vt && !vtNone && !vtHit
+      const vtUnknown = !!(vt && !vtNone && !vtHit && !nestedHasVtHit
         && (vt.unknown || vt.softMiss || vt.found == null || vt.needApiKey || unverifiedMiss
           || unscopedVtSource));
       const isJunkVtSummary = /自动解析失败|未自动解析|查询未完成|查询异常|查询超时|仍被验证码|需配置免费 API/i.test(sumRaw);
@@ -439,7 +611,7 @@
             nestSigRow.appendChild(nestSp);
             this.root.appendChild(nestSigRow);
 
-            // 包内 VT 结果
+            // 包内 VT 结果（含指定权威引擎明细，若有）
             const nvt = n.vt || null;
             if (nvt) {
               const nestVtRow = this.el("div", "item sig-nested sig-nested-indent");
@@ -450,14 +622,25 @@
               const nMal = Number(nvt.malicious) || 0;
               const nSus = Number(nvt.suspicious) || 0;
               const nTot = Number(nvt.total) || 0;
+              const nTrusted = Number(nvt.trustedEngineCount) || Number(nvt.trustedMaliciousCount) || 0;
+              const nScore = Number(nvt.trustedScore) || 0;
+              const nTrustedDetails = formatPopupTrustedDetails(nvt.trustedDetections).slice(0, 5);
               if (nvt.notFound) {
                 nestVtSp.className = "vt-warn";
                 nestVtSp.textContent = "无";
               } else if (nvt.found === true) {
-                nestVtSp.className = nMal >= 3 ? "vt-bad" : (nMal > 0 ? "vt-warn" : "vt-ok");
-                nestVtSp.textContent = nTot > 0
+                const nHard = !!(nvt.trustedScoreHardBlock)
+                  || popupVtScoreIsHardBlock(nScore, nTrusted);
+                nestVtSp.className = nMal >= 3 || nHard || nTrusted >= 2 ? "vt-bad" : (nMal > 0 ? "vt-warn" : "vt-ok");
+                let line = nTot > 0
                   ? `检出 ${nMal + nSus}/${nTot}（恶意 ${nMal} / 可疑 ${nSus}）`
                   : `恶意 ${nMal} · 可疑 ${nSus}`;
+                if (nTrusted >= 1 && nTrustedDetails.length) {
+                  line += ` · 权威引擎 ${nTrusted} 家：${nTrustedDetails.join("、")}`;
+                } else if (nMal + nSus > 0 && nvt.engineDetailsAvailable !== true) {
+                  line += " · 未取到权威引擎逐条明细";
+                }
+                nestVtSp.textContent = line;
               } else {
                 nestVtSp.className = "vt-warn";
                 nestVtSp.textContent = "未取到结论";
@@ -493,9 +676,14 @@
           }
         }
 
-      // —— ③ VT 单独一行 ——
+      // —— ③ VT 单独一行（压缩包：包内已展示检出时，外壳只作次要说明）——
       let vtLine = "";
-      if (vtHit) {
+      let vtLineIsShellNote = false;
+      if (isArchiveShellUi && nestedHasVtHit && (rawVtNone || (vt && vt.deferToNested))) {
+        // 包内已有 19/69 等结论：外壳「无」降级，避免误读成整包干净
+        vtLine = "压缩包外壳无 VT 记录（以上方包内文件为准）";
+        vtLineIsShellNote = true;
+      } else if (vtHit) {
         if (sumRaw && !isJunkVtSummary && /检出|恶意|VT/i.test(sumRaw)) {
           vtLine = sumRaw.replace(/^VT:\s*/i, "VT: ");
         } else {
@@ -504,7 +692,11 @@
             : `VT 恶意 ${malN} · 可疑 ${susN}`;
         }
       } else if (vtNone) {
-        vtLine = /已自动上传|已自动提交|已提交文件|可手动提交|上传文件/i.test(sumRaw) ? sumRaw : "VT: 无";
+        vtLine = isArchiveShellUi
+          ? (/已自动上传|已自动提交|已提交文件/i.test(sumRaw)
+            ? sumRaw
+            : "压缩包外壳无 VT 记录")
+          : (/已自动上传|已自动提交|已提交文件|可手动提交|上传文件/i.test(sumRaw) ? sumRaw : "VT: 无");
       } else if (vtUnknown) {
         vtLine = unscopedVtSource
           ? "VT: 旧版页面比例未通过主报告校验，请重新检测"
@@ -517,12 +709,15 @@
       if (vtLine) {
         const vtRow = this.el("div", "item vt-block");
         const vtLabel = document.createElement("strong");
-        vtLabel.textContent = "VirusTotal: ";
+        vtLabel.textContent = vtLineIsShellNote || (isArchiveShellUi && (rawVtNone || vtNone))
+          ? "外壳VirusTotal: "
+          : "VirusTotal: ";
         vtRow.appendChild(vtLabel);
         const vtSp = document.createElement("span");
         vtSp.className = "vt-text";
-        if (unscopedVtSource) vtSp.className += " vt-warn";
-        else if (trustedEngineCount >= 2 || status === "blocked" || status === "flagged") vtSp.className += " vt-bad";
+        if (vtLineIsShellNote) vtSp.className += " vt-muted";
+        else if (unscopedVtSource) vtSp.className += " vt-warn";
+        else if (trustedHard || trustedEngineCount >= 2 || status === "blocked" || status === "flagged") vtSp.className += " vt-bad";
         else if (vtNone || (!peSigned && (kind === "pe" || (peObj && peObj.isPe)))) vtSp.className += " vt-warn";
         else if (mal > 0 || sus >= 3) vtSp.className += " vt-warn";
         else if (status === "allowed" || (vtHit && mal === 0)) vtSp.className += " vt-ok";
@@ -535,7 +730,7 @@
       if (sha) {
         const shaRow = this.el("div", "item sha-row");
         const shaLabel = document.createElement("strong");
-        shaLabel.textContent = "SHA256: ";
+        shaLabel.textContent = isArchiveShellUi ? "压缩包SHA256: " : "SHA256: ";
         shaRow.appendChild(shaLabel);
         const shaSp = document.createElement("span");
         shaSp.className = "sha-text";
@@ -548,7 +743,7 @@
       // —— 风险检测（始终尝试输出）——
       let risks = Array.isArray(vtInfo.risks)
         ? vtInfo.risks.filter((r) => r && r.text && !/^(?:签署者|发布者|数字签名):/i.test(r.text)
-          && !/^VT\s+(?:知名引擎共识|单个知名引擎检出|总检出|指定五家引擎|指定引擎未检出)/i.test(r.text)
+          && !/^VT\s+(?:知名引擎|权威引擎|单个知名|单个权威|总检出|指定五家|指定引擎未检出)/i.test(r.text)
           && !((vtHit || vtUnknown) && /VT 无此文件记录/i.test(r.text))
           && !(unscopedVtSource && /\bVT\b|VirusTotal/i.test(r.text))
           && !/未自动解析|自动解析失败|请点开链接确认|请点开链接或配置/i.test(r.text))
@@ -562,28 +757,33 @@
           const peN = nested.filter((n) => n.kind === "pe" || /\.exe|\.dll/i.test(n.name || ""));
           if (peN.length) risks.push({ level: "medium", text: "压缩包内可执行文件均未检测到数字签名" });
         }
-        if (vtHit && trustedEngineCount >= 2) {
+        if (vtHit && trustedHard) {
           risks.push({
             level: "high",
-            text: `VT 知名引擎共识 ${trustedEngineCount} 家：${trustedEngineDetails.join("、") || trustedEngineNames.join("、") || "已确认恶意"}`
+            text: `VT 权威引擎共识 ${trustedEngineCount} 家：${trustedEngineDetails.join("、") || trustedEngineNames.join("、") || "已确认恶意"}`
+          });
+        } else if (vtHit && trustedEngineCount >= 2) {
+          risks.push({
+            level: trustedScore >= 4.5 ? "high" : "medium",
+            text: `VT 权威引擎检出 ${trustedEngineCount} 家：${trustedEngineDetails.join("、") || trustedEngineNames.join("、") || "已确认"}`
           });
         } else if (vtHit && trustedEngineCount === 1) {
           risks.push({
             level: "medium",
-            text: `VT 单个知名引擎检出：${trustedEngineDetails[0] || trustedEngineNames[0] || "未知"}（尚未形成共识）`
+            text: `VT 单个权威引擎检出：${trustedEngineDetails[0] || trustedEngineNames[0] || "未知"}（尚未形成共识）`
           });
         } else if (vtHit && (mal >= 1 || sus >= 1) && vt.engineDetailsAvailable !== true) {
           risks.push({ level: "medium", text: `VT 总检出 ${mal + sus} 家；正在补取逐引擎检测结果` });
         } else if (vtHit && (mal >= 1 || sus >= 1)) {
-          if (trustedObservedCount >= VT_TRUSTED_ENGINE_RULES.length) {
-            risks.push({ level: "low", text: "VT 未见恶意检出" });
+          if (trustedObservedCount >= VT_ENGINE_WEIGHT_TABLE.length) {
+            risks.push({ level: "low", text: "VT 权威引擎均未检出（总表有检出，可能为低权重引擎）" });
           } else if (trustedObservedCount > 0) {
             risks.push({
               level: "medium",
-              text: `VT 指定引擎未检出（已取得 ${trustedObservedCount}/5 家：${trustedObservedNames.join("、")}）`
+              text: `VT 权威引擎未检出（已取得 ${trustedObservedCount}/${VT_ENGINE_WEIGHT_TABLE.length} 家明细：${trustedObservedNames.join("、")}）`
             });
           } else {
-            risks.push({ level: "medium", text: `VT 总检出 ${mal + sus} 家；尚未取得指定五家引擎结果` });
+            risks.push({ level: "medium", text: `VT 总检出 ${mal + sus} 家；尚未取得权威引擎明细` });
           }
         }
         else if (vtHit && mal === 0) risks.push({ level: "low", text: "VT 未见恶意检出" });
@@ -627,8 +827,10 @@
         this.root.appendChild(linkRow);
       }
       // VT 无结果 / 已真·文件上传
+      // 压缩包：包内已有检出时不提示「库中无此样本/上传外壳」（避免 zip 无盖过 exe 19/69）
       const feedSubmitted = !!(vt && (vt.feedSubmitted || vt.submitted));
-      if (vtNone || vtUnknown || feedSubmitted || (vt && vt.needCaptcha)) {
+      const suppressShellNoneTip = !!(isArchiveShellUi && nestedHasVtHit && (rawVtNone || (vt && vt.deferToNested)));
+      if (!suppressShellNoneTip && (vtNone || vtUnknown || feedSubmitted || (vt && vt.needCaptcha))) {
         const tip = this.el("div", "item");
         const tipSp = document.createElement("span");
         tipSp.className = feedSubmitted ? "vt-ok" : "vt-warn";
@@ -643,13 +845,13 @@
             tipSp.textContent = "VT 自动接口已限流（HTTP 429）；请稍后重试或配置 API Key";
           } else if (/已使用当前浏览器会话加载页面|页面已加载，但未抓到可解析/i.test(sumRaw)) {
             tipSp.textContent = "VT 页面已加载，但统计组件未被自动解析；可点开链接查看";
-          } else if (vt && vt.swCaptcha) {
-            tipSp.textContent = "VT 后台接口要求验证；已尝试使用当前浏览器会话实时读取页面";
           } else {
-            tipSp.textContent = "VT 自动取数未完成；可点开链接查看，或配置 API Key 稳定读取";
+            tipSp.textContent = "VT 自动取数未完成；可点开链接查看，或在设置中配置 API Key 稳定自动读取";
           }
         } else if (vtNone) {
-          tipSp.textContent = "VT 库中无此样本：可手动提交文件";
+          tipSp.textContent = isArchiveShellUi
+            ? "压缩包外壳无 VT 记录；若包内有可执行文件请以上方包内结果为准"
+            : "VT 库中无此样本：可手动提交文件";
         } else {
           tipSp.textContent = "可打开 VT 查看或手动提交文件";
         }
@@ -657,22 +859,25 @@
         this.root.appendChild(tip);
 
         // 用户点击才打开；已提交优先链到文件/分析页
-        const up = String(
-          (feedSubmitted && vt && vt.guiUrl)
-            || (vt && vt.uploadUrl)
-            || "https://www.virustotal.com/gui/home/upload"
-        );
-        const linkRow2 = this.el("div", "item vt-link");
-        const a2 = document.createElement("a");
-        a2.href = up;
-        a2.target = "_blank";
-        a2.rel = "noopener noreferrer";
-        a2.className = "vt-a";
-        a2.textContent = feedSubmitted && vt && vt.guiUrl
-          ? "在 VirusTotal 查看文件分析结果 →"
-          : "打开 VT 文件上传页 →";
-        linkRow2.appendChild(a2);
-        this.root.appendChild(linkRow2);
+        // 压缩包外壳「无」且无包内命中时才推上传页
+        if (!(isArchiveShellUi && rawVtNone && nestedHasVtHit)) {
+          const up = String(
+            (feedSubmitted && vt && vt.guiUrl)
+              || (vt && vt.uploadUrl)
+              || "https://www.virustotal.com/gui/home/upload"
+          );
+          const linkRow2 = this.el("div", "item vt-link");
+          const a2 = document.createElement("a");
+          a2.href = up;
+          a2.target = "_blank";
+          a2.rel = "noopener noreferrer";
+          a2.className = "vt-a";
+          a2.textContent = feedSubmitted && vt && vt.guiUrl
+            ? "在 VirusTotal 查看文件分析结果 →"
+            : "打开 VT 文件上传页 →";
+          linkRow2.appendChild(a2);
+          this.root.appendChild(linkRow2);
+        }
       }
     }
 
@@ -729,13 +934,74 @@
       return /^https?:\/\//i.test(s) && !this.looksLikePackageTarget(s);
     }
 
-    sanitizeSpoofBrandName(raw) {
+    sanitizeSpoofBrandName(raw, opts = {}) {
+      const confirmedIdentity = opts.confirmedIdentity === true;
       let s = String(raw || "")
         .trim()
         .replace(/(?:官方网站下载|官方网站|官网(?:下载)?|官方(?:下载)?|免费下载|下载)$/u, "")
         .trim();
       if (!s) return "";
       if (/^(?:品牌|产品|功能|特性|特色|方案|官网|官方)$/.test(s)) return "";
+      // 语言/地区/版本标签不是产品品牌；旧报告详情也不得把它回捞进标题。
+      if (/^(?:中文|英文|英语|汉语|简体|繁体|简体中文|繁体中文|国语|粤语|日文|日语|韩文|韩语|语言|版本|国际|国内|大陆|台湾|香港|海外)$/.test(s)) return "";
+      // 仅对 popup 自己从 host 猜出的候选做“域名碎片”过滤。
+      // content 已确认并写入 spoofBrand / 详情 / 通知的品牌不可在这里反向推翻：
+      // ToDesk @ to-desk、DingTalk @ ding-talk 的相等/近形本来就是仿冒域名证据。
+      if (!confirmedIdentity) try {
+        const host = String(this.activeTabUrl || "")
+          .replace(/^https?:\/\//i, "").split("/")[0].toLowerCase().replace(/^www\./, "");
+        const labelRaw = (host.split(".")[0] || "").toLowerCase();
+        const lab = labelRaw.replace(/[^a-z0-9]/g, "");
+        const flat = s.toLowerCase().replace(/[^a-z0-9]/g, "");
+        if (lab && flat) {
+          if (flat === lab) return "";
+          // 近形主机 flat（差 1～2 字母，如 Dingappsdingdin ≈ dingappsdingding）
+          if (flat.length >= 8 && lab.length >= 8 && Math.abs(flat.length - lab.length) <= 2) {
+            let diff = 0;
+            const a = flat.length <= lab.length ? flat : lab;
+            const b = flat.length <= lab.length ? lab : flat;
+            let i = 0;
+            let j = 0;
+            while (i < a.length && j < b.length) {
+              if (a[i] === b[j]) { i++; j++; }
+              else { diff++; j++; if (diff > 2) break; }
+            }
+            diff += a.length - i;
+            if (diff <= 2) return "";
+          }
+          if (flat.startsWith(lab)
+            && /^(?:lab|labs|soft|app|pro|vip|safe|pc|tech|site)$/i.test(flat.slice(lab.length))) {
+            return "";
+          }
+          // 多段连字符拼接影子：ding-apps-dingding → Dingappsdingding
+          if (/-/.test(labelRaw)) {
+            const segs = labelRaw.split("-").map((x) => x.replace(/[^a-z0-9]/g, "")).filter(Boolean);
+            const joined = segs.join("");
+            if (joined && (flat === joined || (flat.length >= 8 && joined.includes(flat) && flat.length >= joined.length - 2))) {
+              return "";
+            }
+            const head = (segs[0] || "");
+            if (head.length >= 4 && flat === head + "lab") return "";
+            if (head.length >= 4 && flat === head + "labs") return "";
+            // 有 apps 中缀时剥出最长品牌段作展示
+            if (segs.some((p) => /^(?:apps?)$/i.test(p))) {
+              const brandish = segs.filter((p) => p.length >= 4 && !/^(?:apps?|soft|pc|lab|labs)$/i.test(p));
+              brandish.sort((a, b) => b.length - a.length);
+              if (brandish[0] && (flat.includes(brandish[0]) || joined.includes(flat))) {
+                const core = brandish[0];
+                return core.charAt(0).toUpperCase() + core.slice(1);
+              }
+            }
+          }
+          if (flat.length > 6 && /(?:lab|labs)$/i.test(flat)) {
+            const stem = flat.replace(/(?:lab|labs)$/i, "");
+            if (stem.length >= 4 && (lab === stem || lab.startsWith(stem) || lab.includes(stem))) {
+              s = stem.charAt(0).toUpperCase() + stem.slice(1);
+              return s;
+            }
+          }
+        }
+      } catch { /* ignore */ }
 
       // 旧报告可能在扩展刷新期间被短暂复用。这里按语言结构再守一次 UI 边界，
       // 避免旧版误抽出的功能标签重新出现在「仿冒某某官网」里。
@@ -748,7 +1014,7 @@
         if (year >= currentYear - 5 && year <= currentYear + 2) return "";
       }
       if (/^(?:pc|win(?:dows)?|mac(?:os)?|linux|android|ios|iphone|ipad|web|x86|x64|arm(?:32|64)?|32bit|64bit|32位|64位)(?:端|平台)?(?:版|版本|客户端|下载)?$/i.test(compact)) return "";
-      if (/^(?:电脑|桌面|手机|移动|网页|安卓|苹果|鸿蒙|通用|绿色|便携|免安装|安装|免费|正式|官方|最新|新版|旧版|专业|企业|个人|家庭|教育|国际|中文|测试|开发|稳定|会员)(?:版|版本)$/u.test(compact)) return "";
+      if (/^(?:电脑|桌面|手机|移动|网页|安卓|苹果|鸿蒙|通用|绿色|便携|免安装|安装|免费|正式|官方|最新|新|旧|专业|企业|个人|家庭|教育|国际|中文|测试|开发|稳定|会员)(?:版|版本)$/u.test(compact)) return "";
 
       const mediaCore = compact
         .replace(/^(?:(?:hi|ultra|full)?(?:res|hd|uhd|hdr|hifi)|dolby|dts)/i, "")
@@ -779,18 +1045,80 @@
       const modeLead = /^(?:智能|自动|一键|在线|离线|实时|快速|极速|精准|批量|免费|专业|高效|便捷|云端|本地|远程|桌面|移动|跨端|跨平台|多端|多人|团队)/;
       const capabilityTail = /(?:重?命名|改名|编辑|推荐|生成|识别|分析|检测|搜索|翻译|创作|剪辑|修复|转换|处理|管理|优化|加速|同步|备份|清理|压缩|解压|录制|播放|下载|安装|截图|桌面|控制|协助|协作|连接|访问|办公|会议|教育|助手|运维|操作|服务)$/;
       if (modeLead.test(compact) && capabilityTail.test(compact)) return "";
+      if (compact.length >= 4 && modeLead.test(compact)
+        && /(?:远程)?(?:控|协|连|访|运)$/.test(compact)) return "";
       return s;
     }
 
     brandSpoofFromData(data) {
       if (!data) return "";
       if (data.spoofBrand) {
-        const direct = this.sanitizeSpoofBrandName(data.spoofBrand);
+        const direct = this.sanitizeSpoofBrandName(data.spoofBrand, { confirmedIdentity: true });
         if (direct) return direct;
       }
-      // 详情是说明文本，不是可信身份字段。不得从 reason 反向解析品牌，
-      // 否则内容侧已拒绝的域名核或功能词会在 Popup 再次复活。
+      // 内容侧早期 arm 可能未写入 spoofBrand，但信号详情已有「标题/正文品牌「xxx」」
+      // 仅在 brandSpoofPortal 或仿冒信号存在时回捞，且经 sanitize 过滤功能词。
+      try {
+        const portal = !!(data.brandSpoofPortal
+          || (Array.isArray(data.details) && data.details.some((d) => /仿冒品牌官网/i.test(d?.name || ""))));
+        if (portal && Array.isArray(data.details)) {
+          for (const d of data.details) {
+            const r = String(d?.reason || d?.name || "");
+            const m = r.match(/品牌「([^」]{2,24})」/)
+              || r.match(/仿冒「([^」]{2,24})」/);
+            if (!m || !m[1]) continue;
+            const got = this.sanitizeSpoofBrandName(m[1], { confirmedIdentity: true });
+            if (got) return got;
+          }
+        }
+        // 详情仍中性时：从主机夹带结构回推展示名（j-dingtalk → DingTalk）
+        // popup 无 content 命名空间，只做结构剥前缀，不发明品牌字典
+        if (portal) {
+          const host = String(data.host || data.hostname || "").toLowerCase().replace(/^www\./, "");
+          const label = (host.split(".")[0] || "");
+          if (label && /-/.test(label)) {
+            const parts = label.split("-").filter(Boolean);
+            if (parts.length >= 2) {
+              const first = parts[0];
+              const rest = parts.slice(1).join("");
+              if (rest.length >= 4 && (first.length === 1 || first.length <= 4)
+                && /^(?:j|v|x|z|e|a|s|im|ie|pr|ca|pc|app|get|ott|qq|wx|dl)?$/i.test(first)) {
+                const camel = rest.charAt(0).toUpperCase() + rest.slice(1).toLowerCase();
+                // desk/talk 形态粗分：dingtalk → DingTalk（末 4 字母大写）
+                let disp = camel;
+                if (/talk$/i.test(rest) && rest.length >= 6) {
+                  disp = rest.slice(0, -4).charAt(0).toUpperCase()
+                    + rest.slice(1, -4).toLowerCase()
+                    + "Talk";
+                } else if (/desk$/i.test(rest) && rest.length >= 6) {
+                  disp = rest.slice(0, -4).charAt(0).toUpperCase()
+                    + rest.slice(1, -4).toLowerCase()
+                    + "Desk";
+                }
+                const got = this.sanitizeSpoofBrandName(disp);
+                if (got) return got;
+              }
+            }
+          }
+        }
+      } catch { /* ignore */ }
       return "";
+    }
+
+    /** 同页品牌通知已定稿、风险报告仍处于极短竞态时，用通知补齐 popup 展示名。 */
+    brandSpoofFromNotice(notice) {
+      try {
+        if (!notice) return "";
+        const blob = `${notice.title || ""} ${notice.message || ""}`;
+        if (notice.guardKind !== "brand-spoof" && !/仿冒「[^」]+」官网|品牌「[^」]+」/.test(blob)) return "";
+        const m = blob.match(/仿冒「([^」]{2,28})」官网/)
+          || blob.match(/品牌「([^」]{2,28})」/);
+        return m && m[1]
+          ? this.sanitizeSpoofBrandName(m[1], { confirmedIdentity: true })
+          : "";
+      } catch {
+        return "";
+      }
     }
 
     /** 通知仅对当前页面 URL 有效；永不回退到 tabId-only。 */
@@ -798,7 +1126,12 @@
       if (!latestNotice) return false;
       if (latestNotice.tabId != null && latestNotice.tabId !== tabId) return false;
       if (!tabUrl || !latestNotice.url) return false;
-      return urlsMatch(latestNotice.url, tabUrl);
+      if (urlsMatch(latestNotice.url, tabUrl)) return true;
+      // 品牌/身份通知在同站 SPA 改 path/hash 后仍属于当前结论；普通文件通知仍须精确 URL。
+      if (latestNotice.guardKind === "brand-spoof" || latestNotice.guardKind === "identity") {
+        return this.hostKeyFromUrl(latestNotice.url) === this.hostKeyFromUrl(tabUrl);
+      }
+      return false;
     }
 
     dataMatchesTab(data, tabUrl) {
@@ -872,7 +1205,8 @@
       const clean = this.isCleanSafeReport(matchedData);
       const showNotice = !clean && this.noticeMatchesTab(latestNotice, this.activeTabId, url);
       const protectedActive = this.hasActiveProtection(matchedData, showNotice ? latestNotice : null, this.activeTabId, url);
-      const brandName = this.brandSpoofFromData(matchedData);
+      let brandName = this.brandSpoofFromData(matchedData);
+      if (!brandName && showNotice) brandName = this.brandSpoofFromNotice(latestNotice);
       const brandSpoof = !!(matchedData?.brandSpoofPortal || brandName);
       const detailsEarly = Array.isArray(matchedData?.details) ? matchedData.details : [];
       const multiSerp = detailsEarly.some((d) => /多平台下载指向搜索引擎/i.test(d.name || ""));
@@ -988,18 +1322,32 @@
     refresh(currentTabUrl, vtOverride = null) {
       if (this.activeTabId == null) return;
       if (currentTabUrl) this.activeTabUrl = currentTabUrl;
-      const vtTabKey = `latestExeVt_${this.activeTabId}`;
-      chrome.storage.local.get([`risk_${this.activeTabId}`, "risk_latest", "latestNotice", "latestExeVt", vtTabKey], (result) => {
+      const requestTabId = this.activeTabId;
+      const requestUrl = this.activeTabUrl || currentTabUrl || "";
+      const requestHost = this.hostKeyFromUrl(requestUrl);
+      const requestSeq = ++this._renderRequestSeq;
+      const vtTabKey = `latestExeVt_${requestTabId}`;
+      chrome.storage.local.get([`risk_${requestTabId}`, "risk_latest", "latestNotice", "latestExeVt", vtTabKey], (result) => {
+        if (requestSeq !== this._renderRequestSeq || this.activeTabId !== requestTabId) return;
+        const activeHost = this.hostKeyFromUrl(this.activeTabUrl || requestUrl);
+        if (requestHost && activeHost && requestHost !== activeHost) return;
         if (chrome.runtime.lastError) { this.clearRoot(); this.root.appendChild(this.el("div", "item", "读取扩展数据失败。")); return; }
-        const tabUrl = this.activeTabUrl || currentTabUrl || "";
-        const localRaw = result[`risk_${this.activeTabId}`] || null;
+        const tabUrl = this.activeTabUrl || requestUrl;
+        const localRaw = result[`risk_${requestTabId}`] || null;
         const localData = this.dataMatchesTab(localRaw, tabUrl) ? localRaw : null;
         const latestData = result.risk_latest && this.dataMatchesTab(result.risk_latest, tabUrl) ? result.risk_latest : null;
         const data = localData || latestData || null;
         const notice = result.latestNotice || null;
-        const vtInfo = (vtOverride && this.vtMatchesTab(vtOverride, this.activeTabId, tabUrl))
-          ? vtOverride
-          : (result[vtTabKey] || result.latestExeVt || null);
+        // 优先本 tab 键；全局 latestExeVt 必须再过 vtMatchesTab（防换站/串台）
+        let vtInfo = null;
+        if (vtOverride && this.vtMatchesTab(vtOverride, this.activeTabId, tabUrl)) {
+          vtInfo = vtOverride;
+        } else {
+          const tabVt = result[vtTabKey] || null;
+          const globalVt = result.latestExeVt || null;
+          if (tabVt && this.vtMatchesTab(tabVt, this.activeTabId, tabUrl)) vtInfo = tabVt;
+          else if (globalVt && this.vtMatchesTab(globalVt, this.activeTabId, tabUrl)) vtInfo = globalVt;
+        }
         this.renderRisk(data, notice, tabUrl, vtInfo);
         this.maybeRefreshVtEngineDetails(vtInfo);
         this.maybeRefreshNestedSignatures(vtInfo);
@@ -1024,13 +1372,36 @@
             return;
           }
           // 保留 latestExeVt：直接 render 不带 vt 会冲掉安装包检测区
-          const vtTabKey = `latestExeVt_${this.activeTabId}`;
-          chrome.storage.local.get(["latestExeVt", vtTabKey, "latestNotice"], (extra) => {
+          const requestTabId = this.activeTabId;
+          const requestUrl = this.activeTabUrl || msg.url || "";
+          const requestHost = this.hostKeyFromUrl(requestUrl);
+          const requestSeq = ++this._renderRequestSeq;
+          const vtTabKey = `latestExeVt_${requestTabId}`;
+          chrome.storage.local.get([
+            "latestExeVt", vtTabKey, "latestNotice", `risk_${requestTabId}`, "risk_latest"
+          ], (extra) => {
+            if (requestSeq !== this._renderRequestSeq || this.activeTabId !== requestTabId) return;
+            const activeHost = this.hostKeyFromUrl(this.activeTabUrl || requestUrl);
+            if (requestHost && activeHost && requestHost !== activeHost) return;
+            // Popup 初次打开时，runtime 消息可能先于初始 storage.get 返回；先吸收已落盘强证书，
+            // 再渲染实时消息，避免初始 OV 读取被取消后短暂画成 DV。
+            const storedRaw = extra && (extra[`risk_${requestTabId}`] || extra.risk_latest);
+            if (storedRaw && this.dataMatchesTab(storedRaw, requestUrl)) {
+              this.coalesceReport(storedRaw, requestUrl);
+            }
+            // 先吸收落盘报告，再合并 runtime 报告；不能前面合并、后面却仍渲染原始 msg。
+            const reportForRender = this.coalesceReport(msg, requestUrl) || msg;
+            const tabVt = (extra && extra[vtTabKey]) || null;
+            const globalVt = (extra && extra.latestExeVt) || null;
+            const tabUrlNow = this.activeTabUrl || msg.url;
+            let vtPick = null;
+            if (tabVt && this.vtMatchesTab(tabVt, this.activeTabId, tabUrlNow)) vtPick = tabVt;
+            else if (globalVt && this.vtMatchesTab(globalVt, this.activeTabId, tabUrlNow)) vtPick = globalVt;
             this.renderRisk(
-              msg,
+              reportForRender,
               (extra && extra.latestNotice) || null,
-              this.activeTabUrl || msg.url,
-              (extra && (extra[vtTabKey] || extra.latestExeVt)) || null
+              tabUrlNow,
+              vtPick
             );
           });
           return;
@@ -1095,5 +1466,7 @@
     new PopupRenderer(root).init();
     initSettingsLink();
   });
-  if (typeof module !== "undefined" && module.exports) module.exports = { PopupRenderer, urlsMatch };
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = { PopupRenderer, urlsMatch, chooseStrongerSslInfo };
+  }
 })();

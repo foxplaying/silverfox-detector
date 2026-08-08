@@ -15,6 +15,35 @@
     if (p !== "http:" && p !== "https:") return;
   } catch { return; }
 
+  // 本机/局域网：不装 fetch/DOM 原型 wrap（AdGuard Home 等 SPA 敏感）
+  function isPrivateOrLocalHost() {
+    try {
+      const h = String(location.hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+      if (!h) return false;
+      if (h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "0.0.0.0") return true;
+      if (h.endsWith(".localhost") || h.endsWith(".local") || h.endsWith(".home.arpa")) return true;
+      if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+      if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+      if (/^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+      if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+      if (/^fe80:/i.test(h) || /^f[cd][0-9a-f]{0,2}:/i.test(h)) return true;
+      return false;
+    } catch { return false; }
+  }
+  if (isPrivateOrLocalHost() || window.__silverfoxPrivateLocalLight) {
+    window.__silverfoxPageHooksInstalled = true;
+    window.__silverfoxPrivateLocalLight = true;
+    try {
+      window.addEventListener("message", (event) => {
+        if (event.source !== window) return;
+        const data = event.data;
+        if (!data || data.source !== "silverfox-detector-content") return;
+      });
+    } catch { /* ignore */ }
+    try { window.postMessage({ source: "silverfox-detector-hooks", type: "hooks-ready" }, "*"); } catch { /* ignore */ }
+    return;
+  }
+
   const { PackageHeuristics, PageContext, DownloadUi, DomGuard, NavPolicy } = NS;
   const CONTENT_SOURCE = "silverfox-detector-content";
 
@@ -369,6 +398,7 @@
             if (type === "search" || name === "q" || name === "wd" || name === "word" || name === "query" || name === "search" || name === "text"
               || t.getAttribute("aria-autocomplete") || role === "searchbox" || role === "combobox") {
               policy.markLightPage();
+              try { DomGuard.restoreNativeDomProtos(this.restoreList); } catch { /* ignore */ }
             }
           } catch { /* ignore */ }
         };
@@ -382,11 +412,16 @@
       const applySetGuard = (enabled) => {
         if (policy.officialSafe && enabled) {
           policy.guardEnabled = false;
+          try { DomGuard.restoreFetchInspection(); } catch { /* ignore */ }
           try { if (window.__silverfoxNavApi && typeof window.__silverfoxNavApi.setGuard === "function") window.__silverfoxNavApi.setGuard(false); } catch { /* ignore */ }
           DownloadUi.restoreAllDownloadButtonsInPage();
           return;
         }
         policy.guardEnabled = !!enabled;
+        try {
+          if (policy.guardEnabled) DomGuard.enableFetchInspection(policy);
+          else DomGuard.restoreFetchInspection();
+        } catch { /* ignore */ }
         try { if (window.__silverfoxNavApi && typeof window.__silverfoxNavApi.setGuard === "function") window.__silverfoxNavApi.setGuard(policy.guardEnabled); } catch { /* ignore */ }
         policy.syncNavBoot();
         if (policy.guardEnabled) {
@@ -450,6 +485,13 @@
           }
           if (policy.lightPage || policy.officialSafe) {
             try { DomGuard.restoreNativeDomProtos(this.restoreList); } catch { /* ignore */ }
+            // MixedContentQuiet 故意不在 DomGuard restoreList：light 时显式拆掉，
+            // 否则 Image.src wrap + 全树 MO 会在钉钉等 SPA 上拖死主线程
+            try {
+              if (NS.MixedContentQuiet && typeof NS.MixedContentQuiet.uninstall === "function") {
+                NS.MixedContentQuiet.uninstall(data.type || "light");
+              }
+            } catch { /* ignore */ }
           }
           return;
         }
@@ -463,10 +505,17 @@
   NS.PageHooks = PageHooks;
 
   const hooks = new PageHooks();
-  // 搜索 / densitydpi 等 document_start 行为信号：不装重型 wrap；其余先装，再按 DOM 结构 promote light
+  // 搜索 / densitydpi / 干净 /download 路径：document_start 不装重型 wrap
   if (PageContext.isSearchUrlShapeEarly()
     || (typeof PageContext.shouldUseLightHooksEarly === "function" && PageContext.shouldUseLightHooksEarly())) {
     try { hooks.policy.lightPage = true; } catch { /* ignore */ }
+    try { hooks.policy.officialSafe = true; } catch { /* ignore */ }
+    // mixed-content 若已装（理论上 shouldUseLight 时会跳过），再兜底拆掉
+    try {
+      if (NS.MixedContentQuiet && typeof NS.MixedContentQuiet.uninstall === "function") {
+        NS.MixedContentQuiet.uninstall("boot-light-early");
+      }
+    } catch { /* ignore */ }
     hooks.installSearchLight();
   } else {
     hooks.install();

@@ -32,6 +32,31 @@
   }
   NS.isHttpOrHttpsPage = isHttpOrHttpsPage;
 
+  /**
+   * 本机 / 局域网管理页（AdGuard Home、路由器、NAS、Pi-hole 等）。
+   * 绝非公网银狐落地页；MAIN 重型钩子与全量扫描应跳过，避免干扰 SPA hydrate。
+   */
+  NS.isPrivateOrLocalNetworkHost = function (hostnameOpt) {
+    try {
+      const h = String(hostnameOpt != null ? hostnameOpt : (location.hostname || ""))
+        .toLowerCase()
+        .replace(/^\[|\]$/g, "");
+      if (!h) return false;
+      if (h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "0.0.0.0") return true;
+      if (h.endsWith(".localhost") || h.endsWith(".local") || h.endsWith(".home.arpa")) return true;
+      // IPv4 私网 / 链路本地
+      if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+      if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+      if (/^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+      if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+      // IPv6 ULA / link-local
+      if (h === "::1" || /^fe80:/i.test(h) || /^f[cd][0-9a-f]{0,2}:/i.test(h)) return true;
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
   /** 全局分析状态。 */
   NS.state = {
     score: 0,
@@ -51,7 +76,18 @@
     _icpPageMismatch: false, _unverifiedPageIcpClaim: false, _unverifiedIcpIdentityThreat: false,
     _brandSpoofNoticeSent: false, _brandSpoofNoticeKey: "",
     _lastGuardNoticeKind: "", _lastGuardNoticeKey: "",
-    _spoofBrandReconciledAt: 0, _guardArmedAt: 0, _softLiftGeneration: 0,
+    _spoofBrandReconciledAt: 0, _spoofPinyinUpgradeScheduled: false, _spoofPinyinUpgradeDone: false,
+    _spoofBrandChineseLocked: false,
+    _brandSpoofFinalPresented: false, _brandSpoofFinalizeScheduled: false,
+    _brandSpoofPresentationDeferred: false,
+    // 情报管道收口后才为 true：未确认官网前禁止软仿冒 toast
+    _softBrandIdentityReady: false, _softBrandIdentityUrl: "",
+    _brandSpoofLatinOnly: false,
+    _brandSpoofDecisionGeneration: 0, _brandSpoofDecisionUrl: "",
+    _trustedBrandIdentityUrl: "", _trustedBrandIdentityAt: 0,
+    _sslIdentityUrl: "", _sslIdentityStartedAt: 0,
+    _sslIdentityObserved: false, _sslIdentitySettled: false,
+    _guardArmedAt: 0, _softLiftGeneration: 0,
     _pageBootAt: Date.now(),
     _pendingEncryptedSpa: false, _encryptedSpaRescanArmed: false,
     _proactiveProbeAt: 0, _proactiveProbeBusy: false
@@ -128,6 +164,32 @@
 
   NS.markAnalysisComplete = function (reason) {
     try { if (typeof NS.isTopFrame === "function" && !NS.isTopFrame()) return; } catch { /* ignore */ }
+    // 品牌终选尚未完成时只能发送中间态。首屏 DOM 早扫不得写 sticky complete，
+    // 否则 ICP/WHOIS 回来后会跳过完整标签选举，必须刷新第二次才命中。
+    try {
+      const needsBrandElection = typeof NS.pageNeedsFinalBrandElection === "function"
+        && NS.pageNeedsFinalBrandElection();
+      const identitySettled = typeof NS.isBrandSpoofIdentityVerificationSettled === "function"
+        && NS.isBrandSpoofIdentityVerificationSettled();
+      if (needsBrandElection && identitySettled
+        && typeof NS.runFinalBrandElectionAfterIdentity === "function") {
+        NS.runFinalBrandElectionAfterIdentity(reason || "before-analysis-complete");
+      }
+      const brandFinalizePending = (needsBrandElection && !identitySettled)
+        || !!NS.state._brandElectionAwaitingDom
+        || !!NS.state._brandElectionRetryPending
+        || !!(NS.state._brandSpoofFinalizeScheduled && !NS.state._brandSpoofFinalPresented);
+      if (brandFinalizePending) {
+        NS.state._analysisCompletionDeferredForBrand = true;
+        NS.state._analysisDone = false;
+        NS.state._stickyComplete = false;
+        NS.state._stickyCompleteHost = "";
+        NS.silverfoxLog("analysis-defer", "brand-election", reason || "");
+        NS.emitRiskReport(true);
+        return false;
+      }
+    } catch { /* fall through */ }
+    NS.state._analysisCompletionDeferredForBrand = false;
     NS.silverfoxLog("analysis-complete", reason || "", "score=", NS.state.score, "guard=", !!NS.state.downloadGuardInstalled);
     try {
       const hostKey = String(location.hostname || "").toLowerCase().replace(/^www\./, "");
@@ -139,6 +201,7 @@
     NS.state._analysisDoneAt = Date.now();
     NS.state._scanBusy = false;
     NS.emitRiskReport(true);
+    return true;
   };
 
   NS.invalidateHtmlCache = function () {

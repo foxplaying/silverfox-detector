@@ -115,7 +115,10 @@
     if (!m) return false;
     const head = m[1] || "";
     if (/^(?:app|soft|proxy|intsoft|down|dl|file|pkg|client|setup|install|installer)$/i.test(head)) return false;
-    if (!/[a-zA-Z一-鿿]{4,}/.test(head)) return false;
+    // 短品牌缩写必须保留原始全大写形态；普通短词仍不放行。
+    const shortUpperBrand = /^[A-Z]{3}$/.test(head)
+      && !/^(?:APP|DLL|EXE|GET|MSI|NEW|PRO|RUN|SDK|TMP|VIP|WEB|WIN|ZIP)$/.test(head);
+    if (!shortUpperBrand && !/[a-zA-Z一-鿿]{4,}/.test(head)) return false;
     if (NS.hasGarbleDigitLetterSoup(head)) return false;
     return true;
   };
@@ -702,6 +705,85 @@
     return found;
   };
 
+  /**
+   * 从页面内联脚本读取全局下载地址（仿冒模板常用）：
+   * window.GLOBAL_DOWNLOAD_URL = 'https://…'
+   * content 在 isolated world，读不到页面 window，只能扫 script 文本。
+   */
+  NS.readPageDeclaredDownloadGlobals = function () {
+    const out = [];
+    const seen = new Set();
+    const push = (raw) => {
+      try {
+        const abs = new URL(String(raw || "").trim(), location.href).href;
+        if (!/^https?:\/\//i.test(abs) || seen.has(abs)) return;
+        seen.add(abs);
+        out.push(abs);
+      } catch { /* ignore */ }
+    };
+    const re = /(?:window\.)?(?:GLOBAL_DOWNLOAD_URL|DOWNLOAD_URL|download_url|downloadUrl|download_uri|DOWNLOAD_LINK|downloadLink)\s*=\s*['"](https?:\/\/[^'"]+|\/[^'"]{1,200})['"]/gi;
+    try {
+      const scripts = document.scripts || [];
+      for (let i = 0; i < Math.min(scripts.length, 48); i++) {
+        const t = String(scripts[i].textContent || "");
+        if (!t || t.length > 100000 || !/DOWNLOAD|download_uri|GLOBAL_/i.test(t)) continue;
+        re.lastIndex = 0;
+        let m;
+        while ((m = re.exec(t)) !== null) push(m[1]);
+      }
+    } catch { /* ignore */ }
+    try {
+      const html = typeof NS.getHtmlSlice === "function" ? String(NS.getHtmlSlice(40000) || "") : "";
+      if (html && /DOWNLOAD|download_uri|GLOBAL_/i.test(html)) {
+        re.lastIndex = 0;
+        let m;
+        while ((m = re.exec(html)) !== null) push(m[1]);
+      }
+    } catch { /* ignore */ }
+    return out;
+  };
+
+  /** 解析 onclick 里的任意跳转 URL，或 GLOBAL_DOWNLOAD_URL 变量名 */
+  NS.extractNavUrlFromHandlerText = function (text) {
+    if (!text || typeof text !== "string") return "";
+    const t = String(text);
+    // location.href = 'https://…' / location.assign('…')
+    let m = t.match(/(?:window\.)?location(?:\.href)?\s*=\s*['"](https?:\/\/[^'"]+|\/[^'"]{1,200})['"]/i);
+    if (m && m[1]) return m[1];
+    m = t.match(/(?:window\.)?location\.(?:assign|replace)\s*\(\s*['"](https?:\/\/[^'"]+|\/[^'"]{1,200})['"]\s*\)/i);
+    if (m && m[1]) return m[1];
+    m = t.match(/window\.open\s*\(\s*['"](https?:\/\/[^'"]+|\/[^'"]{1,200})['"]/i);
+    if (m && m[1]) return m[1];
+    // location.href = window.GLOBAL_DOWNLOAD_URL
+    m = t.match(/(?:window\.)?location(?:\.href)?\s*=\s*(?:window\.)?([A-Za-z_$][\w$]*)/i);
+    if (m && m[1] && !/^(?:location|window|document|this|href|self|top|parent)$/i.test(m[1])) {
+      const name = m[1];
+      try {
+        const re = new RegExp(
+          `(?:window\\.)?${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=\\s*['"](https?:\\/\\/[^'"]+|\\/[^'"]{1,200})['"]`,
+          "i"
+        );
+        const scripts = document.scripts || [];
+        for (let i = 0; i < Math.min(scripts.length, 48); i++) {
+          const body = String(scripts[i].textContent || "");
+          if (!body || body.length > 100000) continue;
+          const hit = body.match(re);
+          if (hit && hit[1]) return hit[1];
+        }
+        const html = typeof NS.getHtmlSlice === "function" ? String(NS.getHtmlSlice(40000) || "") : "";
+        const hit2 = html.match(re);
+        if (hit2 && hit2[1]) return hit2[1];
+      } catch { /* ignore */ }
+      // 变量名像全局下载链：退回已解析的 GLOBAL_* 列表
+      if (/download|DOWNLOAD|uri|URL|url|link|LINK/i.test(name)
+        && typeof NS.readPageDeclaredDownloadGlobals === "function") {
+        const g = NS.readPageDeclaredDownloadGlobals();
+        if (g && g[0]) return g[0];
+      }
+    }
+    return "";
+  };
+
   NS.collectAllPagePackageHrefs = function () {
     const set = new Set();
     const MAX = 80;
@@ -763,8 +845,26 @@
       for (const a of ["onclick", "onmousedown", "ondblclick"]) {
         const v = el.getAttribute && el.getAttribute(a);
         if (!v) continue;
+        // ① 安装包直链
         const found = NS.extractPackageUrlFromHandlerText(v);
         if (found.length) return found[0];
+        // ② 任意跳转 / GLOBAL_DOWNLOAD_URL（汽水仿冒页 button 无 href）
+        if (typeof NS.extractNavUrlFromHandlerText === "function") {
+          const nav = NS.extractNavUrlFromHandlerText(v);
+          if (nav) return nav;
+        }
+      }
+    } catch { /* ignore */ }
+    // ③ 下载意图按钮且无属性链：绑页面全局下载地址
+    try {
+      const cls = String(el.className || "") + " " + String(el.id || "");
+      const text = String(el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 64);
+      const looksDl = /btn-download|download-btn|download-uri|platform-btn/i.test(cls)
+        || (typeof NS.DOWNLOAD_TEXT === "object" && NS.DOWNLOAD_TEXT.test && NS.DOWNLOAD_TEXT.test(text))
+        || /下载|download|安装|客户端|Windows|macOS|Android|iOS|APK/i.test(text);
+      if (looksDl && typeof NS.readPageDeclaredDownloadGlobals === "function") {
+        const g = NS.readPageDeclaredDownloadGlobals();
+        if (g && g[0]) return g[0];
       }
     } catch { /* ignore */ }
     return "";

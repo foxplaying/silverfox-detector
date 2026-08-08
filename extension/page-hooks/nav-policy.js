@@ -205,6 +205,7 @@
       const first = !this.forceDesktopDlKit;
       this.forceDesktopDlKit = true;
       this.guardEnabled = true;
+      try { if (DomGuard && typeof DomGuard.enableFetchInspection === "function") DomGuard.enableFetchInspection(this); } catch { /* ignore */ }
       try {
         if (window.__silverfoxNavApi && typeof window.__silverfoxNavApi.setGuard === "function") window.__silverfoxNavApi.setGuard(true);
       } catch { /* ignore */ }

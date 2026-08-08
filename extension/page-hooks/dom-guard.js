@@ -22,10 +22,18 @@
     }
 
     static restoreNativeDomProtos(restoreList) {
+      DomGuard.restoreFetchInspection();
+      DomGuard.stopFetchUrlObserver();
       while (restoreList.length) {
         const item = restoreList.pop();
         try {
-          if (item && item.proto && item.property && item.descriptor) {
+          if (item && item.docMethod && item.orig) {
+            // document.createElement 等文档级方法（不在 prototype 上）
+            document[item.docMethod] = item.orig;
+            if (item.marker) {
+              try { delete document[item.marker]; } catch { /* ignore */ }
+            }
+          } else if (item && item.proto && item.property && item.descriptor) {
             Object.defineProperty(item.proto, item.property, item.descriptor);
             if (item.marker) {
               try { delete item.proto[item.marker]; } catch { /* ignore */ }
@@ -36,6 +44,7 @@
         } catch { /* ignore */ }
       }
       try { if (Element.prototype.__silverfoxSetAttr) delete Element.prototype.__silverfoxSetAttr; } catch { /* ignore */ }
+      try { if (document.__silverfoxCreateElement) delete document.__silverfoxCreateElement; } catch { /* ignore */ }
     }
 
     /** 清除页面中已存在的 dlp 套件 DOM/CSS、ld-wrap 全屏加载层与隐藏的自动下载 a/iframe。 */
@@ -113,6 +122,32 @@
       } catch { /* ignore */ }
     }
 
+    /**
+     * 锁死 iframe/embed，避免 about:blank + sandbox="" 组合。
+     * 空 sandbox 的 about:blank 会在控制台刷：
+     *   Blocked script execution in 'about:blank' because the document's frame is sandboxed…
+     * 改用空 srcdoc / 去 src，不写 sandbox、不导航 about:blank。
+     */
+    static neutralizeFrameEl(node) {
+      if (!node || node.nodeType !== 1) return;
+      const tag = (node.tagName || "").toUpperCase();
+      try {
+        if (tag === "IFRAME") {
+          try { node.removeAttribute("src"); } catch { /* ignore */ }
+          try { node.removeAttribute("sandbox"); } catch { /* ignore */ }
+          try { node.setAttribute("srcdoc", "<!--sf-blocked-->"); } catch { /* ignore */ }
+        } else if (tag === "EMBED" || tag === "OBJECT") {
+          try { node.removeAttribute("src"); } catch { /* ignore */ }
+          try { node.removeAttribute("data"); } catch { /* ignore */ }
+          try { node.removeAttribute("type"); } catch { /* ignore */ }
+        } else {
+          try { node.removeAttribute("src"); } catch { /* ignore */ }
+        }
+        try { node.setAttribute("data-silverfox-frame-locked", "1"); } catch { /* ignore */ }
+        try { node.style.setProperty("pointer-events", "none", "important"); } catch { /* ignore */ }
+      } catch { /* ignore */ }
+    }
+
     /** 注入节点是否应拒绝（dlp 套件 / 隐藏包 iframe）。 */
     static shouldRejectInjectedNode(node, policy) {
       if (!node || node.nodeType !== 1) return false;
@@ -167,13 +202,7 @@
           }
           // guard 开启：拒绝再注入 iframe/embed（盗版页常用晚加载 HTML 壳，非 .exe 直链）
           if (policy.guardEnabled && (tag === "IFRAME" || tag === "EMBED" || tag === "OBJECT")) {
-            try {
-              node.setAttribute("src", "about:blank");
-              node.removeAttribute("srcdoc");
-              if (tag === "IFRAME") node.setAttribute("sandbox", "");
-              node.style.setProperty("pointer-events", "none", "important");
-              node.setAttribute("data-silverfox-frame-locked", "1");
-            } catch { /* ignore */ }
+            DomGuard.neutralizeFrameEl(node);
             policy.post({ type: "signal", name: "保护模式拦截框架注入", weight: 0, reason: `guard 下拒绝 ${tag}` });
             return true;
           }
@@ -182,10 +211,10 @@
       return false;
     }
 
-    /** 安装所有 DOM 原型 wrap（fetch / createElement / href / click / src / setAttribute / insert*）。 */
+    /** 安装 DOM 原型 wrap；fetch 仅在 guard 真正启用后按需安装。 */
     static install(policy, restoreList) {
-      DomGuard._wrapFetch(policy);
-      DomGuard._wrapCreateElement(policy);
+      DomGuard.installFetchUrlObserver(policy);
+      DomGuard._wrapCreateElement(policy, restoreList);
       DomGuard._patchAnchorHrefProto(policy, restoreList);
       DomGuard._patchAnchorClickProto(policy, restoreList);
       DomGuard._patchIframeSrcProto(policy, restoreList);
@@ -193,25 +222,125 @@
       DomGuard._wrapInsertMethods(policy, restoreList);
     }
 
+    /** 仅按 Resource Timing 观察可疑下载 API URL，不替换页面 fetch，也不读取响应体。 */
+    static installFetchUrlObserver(policy) {
+      try {
+        if (!policy || policy.lightPage || policy.officialSafe
+          || typeof PerformanceObserver === "undefined" || DomGuard._fetchUrlObserver) return;
+        const observer = new PerformanceObserver((list) => {
+          try {
+            if (policy.lightPage || policy.officialSafe) {
+              DomGuard.stopFetchUrlObserver();
+              return;
+            }
+            const entries = list && typeof list.getEntries === "function" ? list.getEntries() : [];
+            for (const entry of entries) {
+              const initiator = String(entry && entry.initiatorType || "").toLowerCase();
+              if (initiator !== "fetch" && initiator !== "xmlhttprequest") continue;
+              DomGuard.noteDownloadDistributionApi(policy, String(entry && entry.name || ""), "resource");
+            }
+          } catch { /* ignore */ }
+        });
+        DomGuard._fetchUrlObserver = observer;
+        try { observer.observe({ type: "resource", buffered: true }); }
+        catch { observer.observe({ entryTypes: ["resource"] }); }
+      } catch {
+        DomGuard.stopFetchUrlObserver();
+      }
+    }
+
+    static stopFetchUrlObserver() {
+      try {
+        if (DomGuard._fetchUrlObserver) DomGuard._fetchUrlObserver.disconnect();
+      } catch { /* ignore */ }
+      DomGuard._fetchUrlObserver = null;
+    }
+
+    /** 与旧 fetch 前置检测同语义；去重后向 content 请求开启完整 guard。 */
+    static noteDownloadDistributionApi(policy, rawUrl, source) {
+      try {
+        if (!policy || policy.lightPage || policy.officialSafe) return false;
+        const urlStr = String(rawUrl || "");
+        if (!urlStr || PackageHeuristics.isPackageFileUrl(urlStr)
+          || PackageHeuristics.isClearOrStrongProductPackageUrl(urlStr)) return false;
+        const looksLikeVendorClientConfig = /\.(?:json|txt)(?:\?|#|$)/i.test(urlStr)
+          && (/(?:^|[/_-])(?:pc_app|app_config|version|client_config|package_info)(?:[._-]|\.|$)/i.test(urlStr)
+            || /\/official\//i.test(urlStr));
+        if (!/api\.php|page-admin|download[_-]?api|getdown|getlink/i.test(urlStr)
+          || looksLikeVendorClientConfig) return false;
+        policy._downloadApiSignalUrls ??= new Set();
+        const key = urlStr.slice(0, 500);
+        if (policy._downloadApiSignalUrls.has(key)) return true;
+        policy._downloadApiSignalUrls.add(key);
+        if (policy._downloadApiSignalUrls.size > 40) {
+          const first = policy._downloadApiSignalUrls.values().next().value;
+          if (first) policy._downloadApiSignalUrls.delete(first);
+        }
+        policy.post({
+          type: "signal",
+          name: "远程API动态绑定下载",
+          weight: 18,
+          reason: `${source === "resource" ? "资源请求" : "fetch"} 下载分发 API: ${urlStr.slice(0, 200)}`
+        });
+        policy.post({ type: "request-guard", reason: "远程 API 动态下载绑定" });
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    static enableFetchInspection(policy) {
+      if (!policy || policy.lightPage || policy.officialSafe || !policy.guardEnabled) return;
+      DomGuard._wrapFetch(policy);
+    }
+
+    static restoreFetchInspection() {
+      try {
+        const state = DomGuard._fetchInspection;
+        if (!state) return;
+        state.active = false;
+        // 页面若后来自行替换 fetch，不得用旧原生函数把页面的新 wrapper 覆盖掉。
+        if (window.fetch === state.installed) {
+          window.fetch = state.original;
+        }
+        // 即使页面在外层又包装/替换了 fetch，也丢弃这份失活状态；
+        // 下次启用时会以页面当前 fetch 为基底重新安装一层守卫。
+        DomGuard._fetchInspection = null;
+      } catch { /* ignore */ }
+    }
+
     static _wrapFetch(policy) {
       try {
-        const origFetch = window.fetch.bind(window);
-        window.fetch = function (...args) {
-          if (policy.officialSafe) return origFetch.apply(this, args);
+        if (!policy || policy.lightPage || policy.officialSafe || !policy.guardEnabled) return;
+        const existing = DomGuard._fetchInspection;
+        if (existing) {
+          if (window.fetch === existing.installed) {
+            existing.policy = policy;
+            existing.active = true;
+            return;
+          }
+          // 页面在安装后替换了 fetch。先让旧层变成透明转发，再包装当前函数；
+          // 即使页面的新 wrapper 调用了旧层，也只会有一个活跃检查层。
+          existing.active = false;
+          DomGuard._fetchInspection = null;
+        }
+        const origFetch = window.fetch;
+        if (typeof origFetch !== "function") return;
+        const callOriginal = (thisArg, args) => Reflect.apply(origFetch, thisArg || window, args);
+        const state = { original: origFetch, installed: null, policy, active: true };
+        const wrappedFetch = function (...args) {
+          const livePolicy = state.policy;
+          if (!state.active || !livePolicy || livePolicy.officialSafe || livePolicy.lightPage
+            || !livePolicy.guardEnabled) return callOriginal(this, args);
           const input = args[0];
           const url = typeof input === "string" ? input : input && input.url;
           const urlStr = String(url || "");
           try {
-            if (PackageHeuristics.isPackageFileUrl(urlStr) || PackageHeuristics.isClearOrStrongProductPackageUrl(urlStr)) return origFetch.apply(this, args);
-            const looksLikeVendorClientConfig = /\.(?:json|txt)(?:\?|#|$)/i.test(urlStr)
-              && (/(?:^|[/_-])(?:pc_app|app_config|version|client_config|package_info)(?:[._-]|\.|$)/i.test(urlStr) || /\/official\//i.test(urlStr));
-            if (url && !PackageHeuristics.isPackageFileUrl(urlStr) && /api\.php|page-admin|download[_-]?api|getdown|getlink/i.test(urlStr) && !looksLikeVendorClientConfig) {
-              policy.post({ type: "signal", name: "远程API动态绑定下载", weight: 18, reason: `fetch 下载分发 API: ${urlStr.slice(0, 200)}` });
-              policy.post({ type: "request-guard", reason: "远程 API 动态下载绑定" });
-            }
+            if (PackageHeuristics.isPackageFileUrl(urlStr) || PackageHeuristics.isClearOrStrongProductPackageUrl(urlStr)) return callOriginal(this, args);
+            if (url) DomGuard.noteDownloadDistributionApi(livePolicy, urlStr, "fetch");
           } catch { /* ignore */ }
 
-          const p = origFetch.apply(this, args);
+          const p = callOriginal(this, args);
           try {
             if (PackageHeuristics.isPackageFileUrl(urlStr) || PackageHeuristics.isClearOrStrongProductPackageUrl(urlStr)) return p;
             const looksLikeVendorClientConfig = /\.(?:json|txt)(?:\?|#|$)/i.test(urlStr)
@@ -221,7 +350,8 @@
             if (url && (looksLikeAdminApi || looksLikeVendorClientConfig)) {
               return p.then(async (response) => {
                 try {
-                  if (policy.officialSafe) return response;
+                  if (!state.active || !livePolicy || livePolicy.officialSafe || livePolicy.lightPage
+                    || !livePolicy.guardEnabled) return response;
                   const clone = response.clone();
                   const text = await clone.text();
                   let links = [];
@@ -239,10 +369,10 @@
                   const threatLinks = links.filter((l) => PackageHeuristics.isPackageFileUrl(l) && !PackageHeuristics.isClearOrStrongProductPackageUrl(l));
                   if (!threatLinks.length) return response;
                   for (const link of threatLinks) {
-                    policy._rememberHop(link);
-                    policy.post({ type: "signal", name: "远程下发下载地址", weight: 16, reason: `API 返回下载地址: ${String(link).slice(0, 200)}` });
-                    policy.post({ type: "blocked-download", href: link, reason: `api-download-link -> ${link}` });
-                    policy.post({ type: "request-guard", reason: `远程下发: ${link}` });
+                    livePolicy._rememberHop(link);
+                    livePolicy.post({ type: "signal", name: "远程下发下载地址", weight: 16, reason: `API 返回下载地址: ${String(link).slice(0, 200)}` });
+                    livePolicy.post({ type: "blocked-download", href: link, reason: `api-download-link -> ${link}` });
+                    livePolicy.post({ type: "request-guard", reason: `远程下发: ${link}` });
                     try {
                       document.querySelectorAll("a.download-btn, a.download-btn-nav, .download-btn, #mainDownloadBtn, a[href]").forEach((a) => {
                         const h = a.getAttribute("href") || "";
@@ -264,16 +394,32 @@
           } catch { /* ignore */ }
           return p;
         };
+        state.installed = wrappedFetch;
+        window.fetch = wrappedFetch;
+        DomGuard._fetchInspection = state;
       } catch { /* ignore */ }
     }
 
-    static _wrapCreateElement(policy) {
+    static _wrapCreateElement(policy, restoreList) {
       try {
+        if (document.__silverfoxCreateElement) return;
         const origCreate = document.createElement.bind(document);
+        // light/official 必须能还原：React SPA 每帧 create 大量 div，wrap 不拆会卡死
+        if (restoreList) {
+          restoreList.push({ docMethod: "createElement", orig: origCreate, marker: "__silverfoxCreateElement" });
+        }
+        document.__silverfoxCreateElement = true;
         document.createElement = function (tagName, ...args) {
+          // light/正站：直接原生，零额外属性劫持（钉钉等 SPA 依赖此路径）
+          if (policy.lightPage || policy.officialSafe) return origCreate(tagName, ...args);
+          const tag = String(tagName || "").toLowerCase();
+          // 未 arm 时：绝大多数 create（div/span）直通原生。
+          // 旧逻辑给每个 div 重定义 className，React 水合会直接卡死主线程。
+          const armed = !!(policy.guardEnabled || policy.forceDesktopDlKit);
+          if (!armed && tag !== "a" && tag !== "iframe" && tag !== "embed" && tag !== "style") {
+            return origCreate(tagName, ...args);
+          }
           const el = origCreate(tagName, ...args);
-          if (policy.officialSafe) return el;
-          const tag = String(tagName).toLowerCase();
           if (tag === "style") {
             try {
               const checkStyle = () => {
@@ -288,7 +434,7 @@
                   configurable: true, enumerable: true,
                   get() { return desc.get.call(this); },
                   set(v) {
-                    if (policy.officialSafe) return desc.set.call(this, v);
+                    if (policy.officialSafe || policy.lightPage) return desc.set.call(this, v);
                     if (CloakingKit.isDesktopForceDownloadKitBlob(v)) {
                       policy.armDesktopForceDownloadKit("style.textContent dlp CSS");
                       return desc.set.call(this, "");
@@ -297,7 +443,8 @@
                   }
                 });
               }
-              el.addEventListener("DOMNodeInserted", checkStyle, true);
+              // 不使用已废弃的 DOMNodeInserted（会额外拖慢插入）
+              try { checkStyle(); } catch { /* ignore */ }
             } catch { /* ignore */ }
           }
           if (tag === "a") {
@@ -305,7 +452,7 @@
             el.click = function (...clickArgs) {
               const href = el.getAttribute("href") || el.href || "";
               policy.noteTrustedDownloadIntent(href);
-              if (policy.officialSafe) return origClick(...clickArgs);
+              if (policy.officialSafe || policy.lightPage) return origClick(...clickArgs);
               if (policy.tryBlockNavigation(href, `dynamic-anchor-click -> ${href}`) || policy._tryBlock(href, `dynamic-anchor-click -> ${href}`)) return;
               if ((policy.forceDesktopDlKit || policy.guardEnabled) && href && PackageHeuristics.isPackageFileUrl(href) && !PackageHeuristics.isStrongProductInstallerUrl(href)) return;
               return origClick(...clickArgs);
@@ -318,7 +465,7 @@
                   get() { return desc.get.call(this); },
                   set(v) {
                     policy.noteTrustedDownloadIntent(v);
-                    if (policy.officialSafe) return desc.set.call(this, v);
+                    if (policy.officialSafe || policy.lightPage) return desc.set.call(this, v);
                     const val = String(v || "");
                     if (policy._shouldBlockUrl(val) || PackageHeuristics.looksLikeOpaqueDownloadHopUrl(val) || policy.blockedHops.has(val)
                       || PackageHeuristics.looksLikeObjectStoragePackageUrl(val)
@@ -344,13 +491,9 @@
           }
           if (tag === "iframe" || tag === "embed") {
             try {
-              // guard 下创建的框架直接锁死，防止晚插入下载壳
+              // guard 下创建的框架直接锁死，防止晚插入下载壳（勿 sandbox="" + about:blank）
               if (policy.guardEnabled) {
-                try {
-                  el.setAttribute("sandbox", "");
-                  el.setAttribute("data-silverfox-frame-locked", "1");
-                  el.style.setProperty("pointer-events", "none", "important");
-                } catch { /* ignore */ }
+                DomGuard.neutralizeFrameEl(el);
               }
               const desc = Object.getOwnPropertyDescriptor(tag === "iframe" ? HTMLIFrameElement.prototype : HTMLEmbedElement.prototype, "src");
               if (desc && desc.set) {
@@ -358,18 +501,20 @@
                   configurable: true, enumerable: true,
                   get() { return desc.get.call(this); },
                   set(v) {
-                    if (policy.officialSafe) return desc.set.call(this, v);
+                    if (policy.officialSafe || policy.lightPage) return desc.set.call(this, v);
                     const val = String(v || "");
                     if (policy.tryBlockNavigation(val, `${tag}.src-create -> ${val}`)) return;
                     if ((policy.forceDesktopDlKit || policy.guardEnabled) && PackageHeuristics.isPackageFileUrl(val) && !PackageHeuristics.isStrongProductInstallerUrl(val)) {
                       policy._rememberHop(val);
+                      DomGuard.neutralizeFrameEl(this);
                       return;
                     }
                     // guard：拦截一切非 blank 的框架导航（HTML 下载落地页也拦）
                     if (policy.guardEnabled && val && !/^about:blank$/i.test(val) && !/^javascript:/i.test(val)) {
                       policy._rememberHop(val);
                       policy.post({ type: "signal", name: "保护模式拦截框架加载", weight: 0, reason: `${tag}.src 被拦: ${val.slice(0, 160)}` });
-                      try { return desc.set.call(this, "about:blank"); } catch { return; }
+                      DomGuard.neutralizeFrameEl(this);
+                      return;
                     }
                     return desc.set.call(this, v);
                   }
@@ -377,7 +522,8 @@
               }
             } catch { /* ignore */ }
           }
-          if (tag === "div" || tag === "section" || tag === "span") {
+          // className 劫持仅在已 arm 时启用（dlp 弹层注入）；未 arm 时上面已对 div 直通
+          if (armed && (tag === "div" || tag === "section" || tag === "span")) {
             try {
               const cDesc = Object.getOwnPropertyDescriptor(Element.prototype, "className");
               if (cDesc && cDesc.set) {
@@ -385,7 +531,7 @@
                   configurable: true, enumerable: true,
                   get() { return cDesc.get.call(this); },
                   set(v) {
-                    if (policy.officialSafe) return cDesc.set.call(this, v);
+                    if (policy.officialSafe || policy.lightPage) return cDesc.set.call(this, v);
                     const s = String(v || "");
                     if (/\bdlp-(?:overlay|modal|topbar|btn|badge)\b/i.test(s)) {
                       policy.armDesktopForceDownloadKit(`className 注入 ${s.slice(0, 40)}`);
@@ -468,14 +614,16 @@
             if ((policy.forceDesktopDlKit || policy.guardEnabled) && PackageHeuristics.isPackageFileUrl(val)
               && !PackageHeuristics.isStrongProductInstallerUrl(val)) {
               policy._rememberHop(val);
-              try { return desc.set.call(this, "about:blank"); } catch { return; }
+              DomGuard.neutralizeFrameEl(this);
+              return;
             }
             // 盗版 guard：晚加载 HTML 下载壳（非 .exe）也必须拦
             if (policy.guardEnabled && val && !/^about:blank$/i.test(val) && !/^javascript:/i.test(val)
               && !policy.officialSafe) {
               policy._rememberHop(val);
               policy.post({ type: "signal", name: "保护模式拦截框架加载", weight: 0, reason: `${tag}.src 被拦: ${val.slice(0, 160)}` });
-              try { return desc.set.call(this, "about:blank"); } catch { return; }
+              DomGuard.neutralizeFrameEl(this);
+              return;
             }
             return desc.set.call(this, v);
           }
@@ -501,6 +649,10 @@
             if (policy.lightPage || policy.officialSafe) return origSetAttr.call(this, name, value);
             try {
               const n = String(name || "").toLowerCase();
+              if (n === "content" && NS.MixedContentQuiet
+                && typeof NS.MixedContentQuiet.sanitizeLegacyViewportContent === "function") {
+                value = NS.MixedContentQuiet.sanitizeLegacyViewportContent(this, n, value);
+              }
               if (n === "sandbox") return origSetAttr.call(this, name, value); // 永不碰沙箱
               // content/viewport 等：原样透传且不进入威胁分支（减少无关键堆栈）
               if (n === "content" || n === "name" || n === "http-equiv" || n === "charset" || n === "property") {
@@ -529,7 +681,8 @@
                   if (tag === "IFRAME" || tag === "EMBED" || tag === "OBJECT") {
                     policy._rememberHop(v);
                     policy.post({ type: "signal", name: "保护模式拦截框架加载", weight: 0, reason: `setAttribute(src) ${tag}: ${v.slice(0, 160)}` });
-                    return origSetAttr.call(this, name, "about:blank");
+                    DomGuard.neutralizeFrameEl(this);
+                    return;
                   }
                 }
               }
@@ -700,6 +853,7 @@
             policy.post({ type: "signal", name: "远程API动态绑定下载", weight: 18, reason: `download_uri -> ${downloadUriValue.slice(0, 160)}` });
             policy._rememberHop(downloadUriValue);
             policy.guardEnabled = true;
+            try { DomGuard.enableFetchInspection(policy); } catch { /* ignore */ }
             DownloadUi.disableAllDownloadButtonsInPage();
           }
         });

@@ -5,13 +5,14 @@
  * 方案：多源 CT/公开 API 拉叶子证书，仅根据 **叶子 Subject（使用者）** 与 **certificatePolicies** 分类。
  * 绝不根据 Issuer（颁发者）名称里的 “OV/EV CA” 字样定级（Issuer 仅用于优先下 DER / 禁止 DV 软截止）。
  *
- * ── 数据源（并行竞速，免 API Key；2026-07 实测）──
+ * ── 数据源（并行发出，先到先用；免 API Key；2026-07 实测）──
  *   1. Qualys SSL Labs  https://api.ssllabs.com/api/v3/analyze  ✓
  *   2. crt.sh           https://crt.sh/?q=&output=json + ?d=id  ✓（偶发 502）
  *   3. Cert Spotter     https://api.certspotter.com/v1/issuances ✓
  *   4. Shodan CT        https://ctl.shodan.io/api/v1/domain|cert ✓
- *   5. urlscan.io       https://urlscan.io/api/v1/search/?q=  ✓（page.tlsIssuer）
- *   6. NetworkCalc      https://networkcalc.com/api/security/certificate/ ✓（实时叶证书 PEM）
+ *   5. NetworkCalc      https://networkcalc.com/api/security/certificate/ ✓（实时叶证书 PEM）
+ *   6. MySSL report     https://myssl.com/{domain}               ✓（validation + org）
+ *   7. EdgeOne SSL      https://api.edgeone.ai/eo/tools/ssl?url=  ✓（实时 subject/issuer）
  *
  * 不可用/不适合「按域名即时查证」：
  *   - wss://certstream.calidog.io  仅实时 firehose，无 domain 查询；无法保证打开页时有新证
@@ -172,8 +173,9 @@
       if (h === "api.ssllabs.com") return "ssllabs";
       if (h === "crt.sh") return "crtsh";
       if (h === "ctl.shodan.io") return "shodan";
-      if (h === "urlscan.io") return "urlscan";
       if (h === "networkcalc.com") return "networkcalc";
+      if (h === "myssl.com" || h === "www.myssl.com") return "myssl";
+      if (h === "api.edgeone.ai") return "edgeone";
     } catch { /* ignore */ }
     return "";
   }
@@ -218,6 +220,53 @@
     return SSL_SOURCE_EMPTY_TTL_MS;
   }
 
+  function hasBoundSslOrganization(value) {
+    const org = String((value && value.organization) || "").trim();
+    if (!org || isBogusPlaceholderOrg(org)) return false;
+    return value.sniChainVerified === true || value.liveTlsLeafVerified === true
+      || value.unexpiredHostVerified === true;
+  }
+
+  function sourceSuccessTtl(provider, value) {
+    const rank = validationRank(value && value.validation);
+    // 只有机构名与当前/未过期匹配叶证书绑定后，OV/EV 才算完整结果。
+    if (rank >= 2 && hasBoundSslOrganization(value)) {
+      return SSL_SOURCE_SUCCESS_TTL_MS;
+    }
+    // 升级链只主动刷新 SSL Labs；其它公开源至少覆盖整轮 20s 重试，避免重复扇出与 429。
+    const weakTtl = provider === "ssllabs" ? 30 * 1000 : 3 * 60 * 1000;
+    if (rank >= 2) return weakTtl;
+    if (rank === 1) return canSoftFinishDv(value) ? 3 * 60 * 1000 : weakTtl;
+    return weakTtl;
+  }
+
+  /**
+   * 只失效指定来源、指定主机的空/弱结果。用于 SSL Labs IN_PROGRESS 后补查；
+   * 其它来源与 429 熔断保持不变，避免一次升级重试放大成全源请求风暴。
+   */
+  NS.invalidateWeakSslSourceCacheForHost = function (host, providers) {
+    const rawHost = rawHostname(host);
+    if (!rawHost) return 0;
+    const allowed = new Set((Array.isArray(providers) && providers.length ? providers : ["ssllabs"])
+      .map((provider) => String(provider || "").toLowerCase()).filter(Boolean));
+    let removed = 0;
+    for (const [key, entry] of NS._sslSourceCache.entries()) {
+      const splitAt = key.indexOf("|");
+      if (splitAt < 1) continue;
+      const provider = key.slice(0, splitAt).toLowerCase();
+      const cachedHost = key.slice(splitAt + 1);
+      if (!allowed.has(provider) || cachedHost !== rawHost) continue;
+      const value = entry && entry.value;
+      const rank = validationRank(value && value.validation);
+      const complete = rank >= 2 && hasBoundSslOrganization(value);
+      if (complete) continue;
+      NS._sslSourceCache.delete(key);
+      removed += 1;
+    }
+    if (removed) persistSslStateSoon(false);
+    return removed;
+  };
+
   async function runCachedSslSource(provider, host, runner) {
     await ensureSslPersistentStateLoaded();
     const key = `${provider}|${rawHostname(host)}`;
@@ -234,7 +283,7 @@
       if (value || !providerCoolingDown(provider)) {
         NS._sslSourceCache.set(key, {
           at: Date.now(),
-          ttl: value ? SSL_SOURCE_SUCCESS_TTL_MS : sourceEmptyTtl(provider),
+          ttl: value ? sourceSuccessTtl(provider, value) : sourceEmptyTtl(provider),
           value: value || null
         });
         persistSslStateSoon(false);
@@ -1003,7 +1052,7 @@
       cache: "no-store",
       redirect: "follow",
       signal: controller ? controller.signal : undefined,
-      headers: { Accept: "application/json,text/plain,*/*" }
+      headers: { Accept: "application/json,text/html,text/plain,*/*" }
     }).then(async (r) => {
       if (timer) clearTimeout(timer);
       const text = await r.text();
@@ -1278,7 +1327,7 @@
     const ta = Number(a.notBefore) || 0;
     const tb = Number(b.notBefore) || 0;
     if (tb !== ta) return tb > ta ? b : a;
-    const rich = (s) => /^(?:ssllabs|ssllabs\+crt\.sh|shodan-ct|urlscan|networkcalc)$/i.test(String(s || ""));
+    const rich = (s) => /^(?:ssllabs|ssllabs\+crt\.sh|shodan-ct|networkcalc|myssl|edgeone)$/i.test(String(s || ""));
     if (rich(a.source) && !rich(b.source)) return a;
     if (rich(b.source) && !rich(a.source)) return b;
     return a;
@@ -2460,52 +2509,7 @@
   }
 
   /**
-   * 源 5: urlscan.io Search API（免 Key 有配额；返回 page.tlsIssuer）
-   * GET https://urlscan.io/api/v1/search/?q=domain:host&size=N
-   * domain 查询会命中页面请求过的任意域；结果必须再用 page.domain 与当前 host 精确匹配。
-   */
-  async function sourceUrlscan(host) {
-    const q = `domain:${host}`;
-    const url = `https://urlscan.io/api/v1/search/?q=${encodeURIComponent(q)}&size=15`;
-    const res = await fetchText(url, 4500);
-    if (!res.ok || !res.text) return null;
-    let data;
-    try {
-      data = JSON.parse(res.text);
-    } catch {
-      return null;
-    }
-    const results = Array.isArray(data && data.results) ? data.results : [];
-    if (!results.length) return null;
-
-    let best = null;
-    for (const row of results) {
-      const page = row && row.page;
-      if (!page) continue;
-      const pageDomain = rawHostname(page.domain);
-      // domain: 查询也会返回“仅加载过该域”的页面，必须是当前页面主域精确命中。
-      if (!pageDomain || pageDomain !== host) continue;
-      const issuer = String(page.tlsIssuer || "").trim();
-      if (!issuer) continue;
-      const notBefore = page.tlsValidFrom ? parseCrtDate(page.tlsValidFrom) : 0;
-      // 无 Subject.O，但有 issuer 产品线 → applyIssuerEvUpgrade 可升 OV/EV
-      const hit = applyIssuerEvUpgrade({
-        validation: "DV",
-        organization: "",
-        commonName: pageDomain || host,
-        source: "urlscan",
-        issuer,
-        leafOk: true,
-        notBefore: Number.isFinite(notBefore) ? notBefore : 0
-      }, issuer);
-      if (hit) best = betterResult(best, hit);
-      if (best && validationRank(best.validation) >= 2) return best;
-    }
-    return best;
-  }
-
-  /**
-   * 源 6: NetworkCalc 实时 TLS 叶证书（公开 API，无需 Key）。
+   * 源 5: NetworkCalc 实时 TLS 叶证书（公开 API，无需 Key）。
    * API 不返回完整链/noSni 字段，因此单独标记 liveTlsLeafVerified；只有响应 host 精确归属、
    * 且 PEM 的 CN/SAN 覆盖当前 host 时，才允许用 Subject.O 补组织字段。
    */
@@ -2559,8 +2563,199 @@
   }
 
   /**
+   * 源 6: MySSL report
+   * GET https://myssl.com/{host}
+   * 叶证表字段：cc-tableTit + cc-tableCel（通用名称 / 证书类型 / 组织机构 / 颁发者 / 开始时间 / 备用名称）
+   * 取第一张 CN/SAN 覆盖查询主机的叶证。
+   */
+  async function sourceMyssl(host) {
+    const h = rawHostname(host);
+    if (!h || !h.includes(".")) return null;
+
+    const url = "https://myssl.com/" + encodeURIComponent(h);
+    const res = await fetchText(url, needsCarefulSslProbe(h) ? 10000 : 8000);
+    if (!res.ok || !res.text) return null;
+    return decodeMysslReportPayload(res.text, h);
+  }
+
+  /** cc-tableTit / cc-tableCel 单元格纯文本 */
+  function mysslCellText(raw) {
+    return String(raw || "")
+      .replace(/\x3c[^\x3e]*\x3e/g, " ")
+      .replace(/&\w+;|&#\d+;/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  /**
+   * 解析 MySSL 报告：按 tr 表对 (cc-tableTit → cc-tableCel) 取字段。
+   * 叶证以「信任状态」起块（在通用名称之前）；跳过域名不匹配 / data-code≠0 的次要证。
+   *
+   * 不匹配示例：
+   *   cc-trust-status data-code="4" → 域名不匹配 …
+   *   通用名称 → *.ias.tencent-cloud.net (不匹配)
+   */
+  function decodeMysslReportPayload(payload, queryHost) {
+    const h = rawHostname(queryHost);
+    if (!h || !payload) return null;
+    const body = String(payload);
+
+    // <td class="cc-tableTit">…</td> … <td class="cc-tableCel cc-trust-status" data-code="N">…</td>
+    // m1=title, m2=cel open-tag attrs (含 data-code), m3=cel body
+    const pairRe =
+      /class\s*=\s*["']cc-tableTit["'][^>]*>([\s\S]*?)<\/td>[\s\S]{0,1200}?class\s*=\s*["']cc-tableCel[^"']*["']([^>]*)>([\s\S]*?)<\/td>/gi;
+    const pairs = [];
+    let m;
+    while ((m = pairRe.exec(body))) {
+      const title = mysslCellText(m[1]);
+      const celAttrs = String(m[2] || "");
+      const rawCel = m[3];
+      const cell = mysslCellText(rawCel);
+      if (!title) continue;
+      // data-code="0" 可信；"4" 域名不匹配（cc-nosni-status / 无 SNI 默认证）
+      const codeM = celAttrs.match(/data-code\s*=\s*["']?(\d+)/i)
+        || String(rawCel).match(/data-code\s*=\s*["']?(\d+)/i);
+      const dataCode = codeM ? codeM[1] : "";
+      pairs.push({ title, cell, dataCode, celAttrs });
+    }
+    if (!pairs.length) return null;
+
+    // 「信任状态」在通用名称之前 → 以信任状态开叶；否则遇通用名称兜底开叶
+    const leaves = [];
+    let cur = null;
+    for (const row of pairs) {
+      const { title, cell, dataCode, celAttrs } = row;
+      if (title === "信任状态") {
+        if (cur) leaves.push(cur);
+        cur = Object.create(null);
+        cur["信任状态"] = cell;
+        cur._trustCode = dataCode;
+        cur._trustAttrs = celAttrs;
+        continue;
+      }
+      if (!cur) {
+        if (title !== "通用名称") continue;
+        cur = Object.create(null);
+      }
+      // 同名字段只记第一次（证书链区会重复 颁发者 等）
+      if (cur[title] == null || cur[title] === "") cur[title] = cell;
+    }
+    if (cur) leaves.push(cur);
+
+    let best = null;
+    for (const leaf of leaves) {
+      const trust = String(leaf["信任状态"] || "");
+      const cnRaw = String(leaf["通用名称"] || "");
+      // 跳过域名不匹配：data-code=4 / cc-nosni-status / 文案 / CN 后缀 (不匹配)
+      if (String(leaf._trustCode || "") === "4") continue;
+      if (/域名不匹配/.test(trust)) continue;
+      if (/不匹配/.test(cnRaw)) continue;
+      if (/cc-nosni-status/i.test(String(leaf._trustAttrs || "")) || /cc-nosni-status/i.test(trust)) continue;
+
+      let commonName = cnRaw
+        .replace(/\s*[(\uFF08][^)\uFF09]*[)\uFF09]\s*$/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!commonName) continue;
+
+      const altNames = String(leaf["备用名称"] || "")
+        .replace(/\s+/g, "\n")
+        .trim();
+      if (!leafMatchesQueryHost(commonName, altNames, h)) continue;
+
+      const typeRaw = String(leaf["证书类型"] || "").toUpperCase();
+      let validation = "";
+      if (/\bEV\b/.test(typeRaw)) validation = "EV";
+      else if (/\bOV\b/.test(typeRaw)) validation = "OV";
+      else if (/\bDV\b/.test(typeRaw)) validation = "DV";
+
+      const issuer = String(leaf["颁发者"] || "").trim();
+      let organization = String(leaf["组织机构"] || "").trim();
+      if (organization === "--" || organization === "-" || organization === "—") organization = "";
+      organization = sanitizeLeafOrganization(organization, issuer);
+
+      if (!validation) validation = organization ? "OV" : "DV";
+      if (validationRank(validation) >= 2 && !organization) continue;
+      if (validation === "DV") organization = "";
+
+      if (isLikelyFreeDvIssuer(issuer) && !/\bOV\b|\bEV\b/i.test(issuer)) {
+        validation = "DV";
+        organization = "";
+      }
+
+      const notBefore = parseCrtDate(leaf["开始时间"]) || 0;
+      const hit = {
+        validation,
+        organization: validation === "DV" ? "" : organization,
+        commonName: commonName || h,
+        source: "myssl",
+        issuer,
+        leafOk: true,
+        liveTlsLeafVerified: true,
+        notBefore: notBefore > 0 ? notBefore : Date.now()
+      };
+
+      if (!best || validationRank(hit.validation) > validationRank(best.validation)) {
+        best = hit;
+        if (validationRank(hit.validation) >= 2) break;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * 源 7: EdgeOne 实时 SSL 查询
+   * GET https://api.edgeone.ai/eo/tools/ssl?url=HOST
+   * JSON: data.subject.{O,CN} / data.issuer / data.subjectaltname / valid_from
+   */
+  async function sourceEdgeOne(host) {
+    const h = rawHostname(host);
+    if (!h || !h.includes(".")) return null;
+    // 文档参数为 url=域名；带 https:// 亦可
+    const url = "https://api.edgeone.ai/eo/tools/ssl?url=" + encodeURIComponent(h);
+    const res = await fetchText(url, needsCarefulSslProbe(h) ? 7000 : 5500);
+    if (!res.ok || !res.text) return null;
+    let data;
+    try { data = JSON.parse(res.text); } catch { return null; }
+    if (!data || Number(data.code) !== 0) return null;
+    const cert = data.data;
+    if (!cert || typeof cert !== "object" || Number(cert.code) !== 0) return null;
+    if (cert.ca === true) return null; // 不要 CA 证书
+
+    const sub = cert.subject && typeof cert.subject === "object" ? cert.subject : {};
+    const iss = cert.issuer && typeof cert.issuer === "object" ? cert.issuer : {};
+    const commonName = String(sub.CN || sub.cn || "").trim();
+    const altNames = String(cert.subjectaltname || cert.subjectAltName || "")
+      .replace(/DNS:/gi, "")
+      .replace(/,/g, "\n");
+    if (!leafMatchesQueryHost(commonName, altNames, h)) return null;
+
+    const issuer = [iss.O || iss.o, iss.CN || iss.cn].filter(Boolean).join(" / ").trim()
+      || String(iss.CN || iss.cn || iss.O || "").trim();
+    let organization = sanitizeLeafOrganization(String(sub.O || sub.o || "").trim(), issuer);
+    let validation = organization ? "OV" : "DV";
+    if (isLikelyFreeDvIssuer(issuer) && !/\bOV\b|\bEV\b/i.test(issuer)) {
+      validation = "DV";
+      organization = "";
+    }
+    // issuer CN 含 EV 且有 O= 时由 applyIssuerEvUpgrade 升 EV
+    if (!organization && validationRank(validation) >= 2) return null;
+
+    return applyIssuerEvUpgrade({
+      validation,
+      organization: validation === "DV" ? "" : organization,
+      commonName: commonName || h,
+      source: "edgeone",
+      issuer,
+      leafOk: true,
+      liveTlsLeafVerified: true,
+      notBefore: parseCrtDate(cert.valid_from) || Date.now()
+    }, issuer);
+  }
+
+  /**
    * OV/EV 无组织名时补 Subject.O。
-   * 场景：urlscan/issuer 先升到 OV，叶子 O= 要靠 DER（xinhuanet / 12306 / gov.cn）。
+   * 场景：issuer 先升到 OV，叶子 O= 要靠 DER（xinhuanet / 12306 / gov.cn）。
    * 顺序：Labs certs PEM → 指纹 → Cert Spotter DER → Shodan 域 → crt.sh。
    */
   async function enrichOrganizationFromCrt(host, hit) {
@@ -2896,124 +3091,91 @@
   }
 
   /**
-   * 单 host 并行竞速（多源）：
-   * - EV/OV：立刻返回
-   * - 免费 DV：短软截止
-   * - .cn：必须等 Labs（或 CT/urlscan 给出 OV）再结束，防 CT 空结果锁 DV
+   * 单 host 多源并行轮询：先到先用（第一个可用结果即采用，不再 betterResult 合并竞速）。
+   * 可用：有 validation；OV/EV 须带机构名（半成品 OV 继续等下一源）。
    *
-   * 源：SSL Labs · Cert Spotter · crt.sh · Shodan CT · urlscan.io · NetworkCalc
+   * 源：SSL Labs · Cert Spotter · crt.sh · Shodan CT · NetworkCalc · MySSL · EdgeOne
    */
   async function probeSslCertOnce(queryHost, allowCurrentHostSources) {
     const host = rawHostname(queryHost);
     if (!host || host === "localhost" || /^\d+\.\d+\.\d+\.\d+$/.test(host)) return null;
 
     const careful = needsCarefulSslProbe(host);
-    // Labs 常是唯一能拿到 O= 的源（dpm CT 空；xinhuanet Labs 后 READY 才有 PEM）
-    // 总时限 ≥ Labs（含 IN_PROGRESS 二次拉取 + 大包下载），避免被 HARD 掐死 → 假 DV / 空机构
     const HARD_MS = careful ? 22000 : 20000;
-    const DV_SOFT_MS = 400;
     const CS_MS = careful ? 6500 : 4500;
     const CRT_MS = careful ? 6000 : 4000;
     const LABS_MS = careful ? 19000 : 17000;
     const SHODAN_MS = careful ? 5000 : 4000;
-    const URLSCAN_MS = careful ? 4500 : 3500;
     const NETWORKCALC_MS = careful ? 7500 : 6000;
+    const MYSSL_MS = careful ? 11000 : 9000;
+    const EDGEONE_MS = careful ? 7000 : 5500;
+
+    /** 是否可作为「先到先用」的终态结果 */
+    function isUsableFirstHit(r) {
+      if (!r || !r.validation) return false;
+      // OV/EV 无机构名：不可用，继续等其它源
+      if (validationRank(r.validation) >= 2 && !String(r.organization || "").trim()) return false;
+      return true;
+    }
 
     const raced = await new Promise((resolve) => {
-      let best = null;
-      let pending = 6;
+      let pending = 7;
       let settled = false;
-      let labsDone = false;
-      let dvTimer = null;
-      let orgWaitTimer = null;
-      const timers = [];
-
-      const clearAllTimers = () => {
-        for (const t of timers) {
-          try { clearTimeout(t); } catch { /* ignore */ }
-        }
-        timers.length = 0;
-        dvTimer = null;
-        orgWaitTimer = null;
-      };
-
-      const arm = (fn, ms) => {
-        const id = setTimeout(fn, ms);
-        timers.push(id);
-        return id;
-      };
+      let fallbackBest = null; // 全无可用时，退回 betterResult 最强半成品
+      let hardTimer = null;
 
       const finish = (hit) => {
         if (settled) return;
         settled = true;
-        clearAllTimers();
+        try { if (hardTimer) clearTimeout(hardTimer); } catch { /* ignore */ }
         resolve(hit);
       };
 
-      const onOne = (r, which) => {
+      const onOne = (r) => {
         if (settled) return;
-        if (which === "labs") labsDone = true;
-        if (r && r.validation) best = betterResult(best, r);
         pending -= 1;
-
-        // EV/OV 且已有组织名：立刻展示
-        if (best && validationRank(best.validation) >= 2 && best.organization
-          && (String(best.validation || "").toUpperCase() !== "OV" || isLiveBoundOv(best))) {
-          finish(normalizeProbeHit(host, best));
-          return;
+        if (r && r.validation) {
+          fallbackBest = betterResult(fallbackBest, r);
+          // 谁最先给出可用结果就用谁
+          if (isUsableFirstHit(r)) {
+            finish(normalizeProbeHit(host, r));
+            return;
+          }
         }
-        // EV/OV 无 org：再等其它源 / Labs certs PEM 补 Subject.O（issuer 升格常先到，如 xinhuanet）
-        // 给 Labs 大包下载 + 二次拉取留足时间，勿过早以「半成品 OV」结算
-        if (best && validationRank(best.validation) >= 2 && !best.organization && !orgWaitTimer) {
-          orgWaitTimer = arm(() => {
-            if (!settled && best && validationRank(best.validation) >= 2) {
-              finish(normalizeProbeHit(host, best));
-            }
-          }, careful ? 8000 : 7000);
-        }
-
-        // 国内站：Labs 前禁止纯 DV 提前结束
-        if (careful && best && best.validation === "DV" && !labsDone) {
-          if (pending <= 0) finish(normalizeProbeHit(host, best));
-          return;
-        }
-
-        if (best && best.validation === "DV" && canSoftFinishDv(best) && !dvTimer
-          && !careful) {
-          dvTimer = arm(() => {
-            if (!settled && best && canSoftFinishDv(best)
-              && validationRank(best.validation) < 2) {
-              finish(normalizeProbeHit(host, best));
-            }
-          }, DV_SOFT_MS);
-        }
-
-        if (pending <= 0) finish(normalizeProbeHit(host, best));
+        if (pending <= 0) finish(normalizeProbeHit(host, fallbackBest));
       };
 
-      arm(() => {
-        if (!settled) finish(normalizeProbeHit(host, best));
+      hardTimer = setTimeout(() => {
+        if (!settled) finish(normalizeProbeHit(host, fallbackBest));
       }, HARD_MS);
 
       withTimeout(runCachedSslSource("ssllabs", host, () => sourceSslLabs(host)), LABS_MS)
-        .then((r) => onOne(r, "labs"));
+        .then((r) => onOne(r))
+        .catch(() => onOne(null));
       withTimeout(runCachedSslSource("certspotter", host, () => sourceCertSpotter(host)), CS_MS)
-        .then((r) => onOne(r, "cs"));
+        .then((r) => onOne(r))
+        .catch(() => onOne(null));
       withTimeout(runCachedSslSource("crtsh", host, () => sourceCrtSh(host)), CRT_MS)
-        .then((r) => onOne(r, "crt"));
+        .then((r) => onOne(r))
+        .catch(() => onOne(null));
       withTimeout(runCachedSslSource("shodan", host, () => sourceShodanCt(host)), SHODAN_MS)
-        .then((r) => onOne(r, "shodan"));
-      const urlscanProbe = allowCurrentHostSources === false
-        ? Promise.resolve(null)
-        : runCachedSslSource("urlscan", host, () => sourceUrlscan(host));
-      withTimeout(urlscanProbe, URLSCAN_MS).then((r) => onOne(r, "urlscan"));
+        .then((r) => onOne(r))
+        .catch(() => onOne(null));
       const networkCalcProbe = allowCurrentHostSources === false
         ? Promise.resolve(null)
         : runCachedSslSource("networkcalc", host, () => sourceNetworkCalc(host));
-      withTimeout(networkCalcProbe, NETWORKCALC_MS).then((r) => onOne(r, "networkcalc"));
+      withTimeout(networkCalcProbe, NETWORKCALC_MS)
+        .then((r) => onOne(r))
+        .catch(() => onOne(null));
+      withTimeout(runCachedSslSource("myssl", host, () => sourceMyssl(host)), MYSSL_MS)
+        .then((r) => onOne(r))
+        .catch(() => onOne(null));
+      withTimeout(runCachedSslSource("edgeone", host, () => sourceEdgeOne(host)), EDGEONE_MS)
+        .then((r) => onOne(r))
+        .catch(() => onOne(null));
     });
 
-    // OV/EV 无机构名 → 再专程下 DER 补 O=（12306 / digicert 等）
+    // 若最终仍是 OV/EV 无机构名（半成品）→ 再专程下 DER 补 O=
     if (raced && validationRank(raced.validation) >= 2 && !String(raced.organization || "").trim()) {
       try {
         const enriched = await enrichOrganizationFromCrt(host, raced);
@@ -3046,7 +3208,7 @@
       const q = list[i];
       let hit = null;
       try {
-        // urlscan/NetworkCalc 只允许查询当前页面 host；上层证书回退不得复用其实时结果。
+        // NetworkCalc 只允许查询当前页面 host；上层证书回退不得复用其实时结果。
         hit = await probeSslCertOnce(q, q === currentHost);
       } catch {
         hit = null;

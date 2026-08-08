@@ -10,6 +10,8 @@
       const state = NS.state;
       if (state._fakeSpaDetected || state.downloadGuardInstalled) return false;
       if (NS.pageLooksLikeSearchEngineResultsPage()) return false;
+      // 仅有 JS 提示的空 SPA：不是「待 hydrate 的加密下载页」
+      if (typeof NS.pageLooksLikeBareJsAppShell === "function" && NS.pageLooksLikeBareJsAppShell()) return false;
       if (state._intelLightMode || NS.looksLikeUltraMatureWhoisDomain() || NS.looksLikeUltraMatureIcpDomain()) return false;
       if (NS.hasValidIcpRecord() && !state._seoCloakKitDetected) return false;
 

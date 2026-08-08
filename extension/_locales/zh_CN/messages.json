@@ -1,0 +1,8 @@
+{
+  "extensionName": {
+    "message": "SilverFox Detector"
+  },
+  "extensionDescription": {
+    "message": "检测可疑下载落地页、仿冒网站、异常跳转与安装包风险。"
+  }
+}
