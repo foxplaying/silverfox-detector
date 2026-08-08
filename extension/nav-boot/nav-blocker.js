@@ -50,6 +50,13 @@
     /** 是否应阻断该 URL。 */
     shouldBlock(url) {
       if (this.officialSafe) return false;
+      // 干净 /download 路径：永不进 DOM 扫描（勿用品牌根首页 light——仿冒站会漏拦）
+      try {
+        if (typeof PageShellDetector.looksLikeCleanOfficialDownloadHostPathEarly === "function"
+          && PageShellDetector.looksLikeCleanOfficialDownloadHostPathEarly()) {
+          return false;
+        }
+      } catch { /* ignore */ }
       const h = PackageClassifier.hrefOf(url).trim();
       if (!h || h.charAt(0) === "#") return false;
 
@@ -70,10 +77,14 @@
       }
 
       const noGesture = !this.gesture.hasGesture();
-      // 决策前再扫一次套件（脚本可能刚解析完）
+      // 决策前再扫一次套件（脚本可能刚解析完）；节流在 scanner 内
       this.kitScanner.scanForCloakingKit(false);
-      const phishShell = PageShellDetector.pageLooksLikeDownloadPhishShell();
       const cloakingKit = this.kitScanner.cloakingKit;
+      // 仅在「可能敌意」时才做钓鱼空壳 DOM 判定，避免每次 location 赋值都扫 DOM
+      let phishShell = false;
+      if (this.guard || cloakingKit || noGesture) {
+        phishShell = PageShellDetector.pageLooksLikeDownloadPhishShell();
+      }
       const hostileStrong = this.guard || cloakingKit || phishShell;
 
       // Guard / 确认套件：阻断所有安装包（强产品除外，模态自动下载）

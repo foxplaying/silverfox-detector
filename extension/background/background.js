@@ -174,20 +174,19 @@
     }
   }
 
-  if (chrome.downloads && chrome.downloads.onCreated) {
-    chrome.downloads.onCreated.addListener((item) => {
-      enqueueOrHandleDownload(item, "onCreated");
-    });
-  }
-  // 文件名在 onCreated 时常为空；确定文件名后再检一次
+  // 不在 onCreated 中运行可取消下载的判定。Edge 可能随后才调用
+  // onDeterminingFilename；若此处先 cancel，后续 suggest() 会产生
+  // "Download must be in progress"。确定文件名后再开始检测，onChanged
+  // 则保留为极少数未触发 filename 事件时的兜底。
   if (chrome.downloads && chrome.downloads.onDeterminingFilename) {
     chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
       try {
-        enqueueOrHandleDownload(item, "onDeterminingFilename");
+        // 必须先提交文件名；若启发式处理先 cancel，Edge 的 suggest 会报
+        // "Download must be in progress"，并被记为扩展 runtime 错误。
+        if (typeof suggest === "function") suggest();
       } catch { /* ignore */ }
       try {
-        // 必须调用 suggest，否则下载会卡住
-        if (typeof suggest === "function") suggest();
+        setTimeout(() => enqueueOrHandleDownload(item, "onDeterminingFilename"), 0);
       } catch { /* ignore */ }
     });
   }
@@ -215,6 +214,8 @@
   importScripts("./notification-bg.js");
   importScripts("./nav-protection-bg.js");
   importScripts("./download-verdict-bg.js");
+  // 拼音仅 SW 加载（按消息懒 init），绝不注入网页
+  importScripts("./brand-pinyin-bg.js");
   importScripts("./message-handler-bg.js");
 
   // 模块就绪：处理排队中的下载
@@ -438,7 +439,7 @@
             console.warn("download cancel failed", chrome.runtime.lastError.message);
             return;
           }
-          try { chrome.downloads.erase({ id: item.id }); } catch { /* ignore */ }
+          try { chrome.downloads.erase({ id: item.id }, () => { void chrome.runtime.lastError; }); } catch { /* ignore */ }
           if (tabId != null) NS.safeSetBadge(tabId, "!", "#d93025");
           const cancelLabel = verdict.label || "可疑安装包";
           // 系统通知有冷却且下载可能来自隐藏 iframe；每次实际取消都把页内提示送到顶层 frame。
@@ -504,7 +505,7 @@
           if (chrome.runtime.lastError) {
             console.warn("vt-gate cancel failed", chrome.runtime.lastError.message);
           }
-          try { chrome.downloads.erase({ id: item.id }); } catch { /* ignore */ }
+          try { chrome.downloads.erase({ id: item.id }, () => { void chrome.runtime.lastError; }); } catch { /* ignore */ }
           if (tabId != null) NS.safeSetBadge(tabId, "…", "#f59e0b");
           try {
             if (typeof NS.probeDownloadExecutableAsync === "function") {

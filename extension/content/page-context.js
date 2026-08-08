@@ -93,6 +93,108 @@
   };
 
   /**
+   * 纯前端 SPA 挂载壳：正文几乎只有
+   * 「You need to enable JavaScript to run this app.」
+   * （Create React App / Vite / Angular 默认 noscript 文案）。
+   * 扩展 document_start 采样时 #root/#app 仍空，看起来像「薄落地页」，
+   * 但绝不是下载壳——勿当仿冒官网/加密 SPA。
+   */
+  NS.pageLooksLikeBareJsAppShell = function () {
+    try {
+      // 本机/局域网管理台（AdGuard Home 等）一律当挂载壳，不做下载落地判断
+      if (typeof NS.isPrivateOrLocalNetworkHost === "function" && NS.isPrivateOrLocalNetworkHost()) {
+        return true;
+      }
+      const title = String(document.title || "");
+      // 已知家用/自托管管理台标题（即使已 hydrate 也不当软件下载落地）
+      if (/^AdGuard\s*Home\b/i.test(title)
+        || /\bPi-?hole\b/i.test(title)
+        || /\bHome\s*Assistant\b/i.test(title)
+        || /\bOpenWrt\b|\bRouterOS\b|\bOPNsense\b|\bpfSense\b/i.test(title)) {
+        // 仍排除已有真实安装包下载壳
+        try {
+          if (typeof NS.collectAllPagePackageHrefs === "function"
+            && (NS.collectAllPagePackageHrefs() || []).length >= 1) return false;
+        } catch { /* ignore */ }
+        return true;
+      }
+
+      const raw = String(
+        (document.body && (document.body.innerText || document.body.textContent)) || ""
+      ).replace(/\s+/g, " ").trim();
+
+      // noscript 节点（JS 开启时 innerText 常为空，textContent/noscript 仍有文案）
+      let noscriptHit = false;
+      let noscriptText = "";
+      try {
+        const ns = document.querySelectorAll("noscript");
+        for (let i = 0; i < Math.min(ns.length, 6); i++) {
+          const t = String(ns[i].textContent || "");
+          if (/enable JavaScript|启用\s*JavaScript|JavaScript/i.test(t)) {
+            noscriptHit = true;
+            noscriptText = t;
+            break;
+          }
+        }
+      } catch { /* ignore */ }
+
+      const probe = (raw || noscriptText).replace(/\s+/g, " ").trim();
+      const jsPrompt = /You need to enable JavaScript to run this app\.?/i.test(probe)
+        || /Please enable JavaScript to (?:continue|view|run)/i.test(probe)
+        || /(?:请|需要)?启用\s*JavaScript|请开启\s*JavaScript|需要.*JavaScript.*才能/i.test(probe)
+        || /JavaScript\s*(?:is\s*)?(?:required|disabled)/i.test(probe);
+
+      // SPA 挂载点是否几乎为空（AdGuard: #root > .wrapper 空）
+      let spaRootEmpty = false;
+      try {
+        const root = document.querySelector(
+          "#root, #app, #__next, #__nuxt, #__NUXT__, [data-v-app], [data-reactroot], app-root"
+        );
+        if (root) {
+          const rt = String(root.innerText || root.textContent || "").replace(/\s+/g, " ").trim();
+          spaRootEmpty = rt.length < 48;
+        }
+      } catch { spaRootEmpty = false; }
+
+      // 有打包后的主脚本（defer main.*.js）+ 空 root + noscript → 典型 CRA/AdGuard 壳
+      let hasAppBundle = false;
+      try {
+        hasAppBundle = !!document.querySelector(
+          'script[src*="main."][src$=".js"], script[defer][src$=".js"], script[src*="chunk"][src$=".js"]'
+        );
+      } catch { /* ignore */ }
+
+      if (!jsPrompt && !noscriptHit) {
+        // 无 JS 提示时：仅空 root + 主包 且正文极短 也认（部分构建去掉 noscript 可见性）
+        if (!(spaRootEmpty && hasAppBundle && raw.length < 40)) return false;
+      } else {
+        // 去掉提示后几乎没有其它可读正文
+        const rest = probe
+          .replace(/You need to enable JavaScript to run this app\.?/gi, "")
+          .replace(/Please enable JavaScript to (?:continue|view|run)[^.。]{0,40}[.。]?/gi, "")
+          .replace(/(?:请|需要)?启用\s*JavaScript[^.。]{0,40}[.。]?/gi, "")
+          .replace(/请开启\s*JavaScript[^.。]{0,40}[.。]?/gi, "")
+          .trim();
+        if (rest.length > 120 && !spaRootEmpty) return false;
+        if (!spaRootEmpty && !noscriptHit && raw.length > 80) return false;
+      }
+
+      // 已有明确下载壳痕迹则不是「纯挂载壳」
+      try {
+        if (typeof NS.getAllDownloadIntentElements === "function"
+          && NS.getAllDownloadIntentElements().length >= 1) return false;
+      } catch { /* ignore */ }
+      try {
+        if (typeof NS.collectAllPagePackageHrefs === "function"
+          && (NS.collectAllPagePackageHrefs() || []).length >= 1) return false;
+      } catch { /* ignore */ }
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
    * 科技博客 / 资讯文章页（评测、开源推荐、B 站安利等）。
    * 标题会提第三方软件名，但页面是文章而非「该软件仿冒官网下载壳」。
    * 例：xiaoyi.vc「这么牛逼，初中生开发杀毒软件：西瓜杀毒…」
@@ -182,6 +284,10 @@
       if (typeof NS.pageLooksLikeSoftwareCatalogPortal === "function" && NS.pageLooksLikeSoftwareCatalogPortal()) {
         return { ...empty, reasons: ["software-catalog"] };
       }
+      // CRA/Vite 空挂载壳：不是软件下载落地
+      if (typeof NS.pageLooksLikeBareJsAppShell === "function" && NS.pageLooksLikeBareJsAppShell()) {
+        return { ...empty, reasons: ["js-app-shell"] };
+      }
 
       const title = (document.title || "").trim();
       const path = (location.pathname || "").toLowerCase();
@@ -246,14 +352,16 @@
           const text = (el.textContent || "").replace(/\s+/g, " ").trim();
           if (text.length > 80) continue;
           const cls = String(el.className || "");
+          // 注意：「立即使用」单独出现是 Web 工具入口（证书查看/格式转换），不是软件下载 CTA
           let isCta = dlText.test(text)
-            || /立即下载|免费下载|立即免费下载|立即使用|前往\s*App\s*Store|Windows\s*版|查看其他平台|下载中心|获取客户端|个人版下载/i.test(text)
+            || /立即下载|免费下载|立即免费下载|前往\s*App\s*Store|Windows\s*版|查看其他平台|下载中心|获取客户端|个人版下载|安装客户端|下载客户端/i.test(text)
+            || (/立即使用/i.test(text) && /下载|安装|客户端|安装包|\.exe|电脑版|桌面/i.test(text))
             || /download\.php|download\.html|\/download/i.test(href)
             || (typeof NS.isPackageFileUrl === "function" && NS.isPackageFileUrl(href))
             || /startDownload\s*\(|openDownloadModal|showDownloadModal/i.test(el.getAttribute("onclick") || "")
             // btn-header / btn-primary / btn-sm 是仿冒首页典型 CTA（勿只认 download-btn）
             || (/download-btn|btn-download|platform-btn|btn-header|btn-primary|btn-lg|btn-sm/i.test(cls)
-              && text.length >= 1 && text.length < 48 && /下载|免费|官方|客户端|个人版/i.test(text));
+              && text.length >= 1 && text.length < 48 && /下载|安装|客户端|个人版|官方下载|免费下载/i.test(text));
           if (!isCta) continue;
           ctaCount++;
           if (!href || href === "#" || /^javascript:/i.test(href)) hrefless++;
@@ -263,12 +371,14 @@
             if (href && typeof NS.looksLikeSameOriginLandingPageUrl === "function" && NS.looksLikeSameOriginLandingPageUrl(href)) {
               hasHub = true;
               hubLinkCount++;
-            } else if (/download\.html|download\.php|(?:^|\/)download(?:\/|$|\?)/i.test(href)) {
+            } else if (/(?:^|\/)(?:download|downloads|down)(?:\/|\.html?|\.php|$|\?)/i.test(href)
+              && !/\/tools?\//i.test(href)) {
               hasHub = true;
               hubLinkCount++;
             }
           } catch {
-            if (/download\.html|download\.php|(?:^|\/)download(?:\/|$|\?)/i.test(href)) {
+            if (/(?:^|\/)(?:download|downloads|down)(?:\/|\.html?|\.php|$|\?)/i.test(href)
+              && !/\/tools?\//i.test(href)) {
               hasHub = true;
               hubLinkCount++;
             }
@@ -313,11 +423,16 @@
       const seoTemplate = /seo[_-]?templates?/i.test(html);
       const encryptedDl = typeof NS.hasEncryptedNuxtDownloadConfig === "function"
         && NS.hasEncryptedNuxtDownloadConfig(html);
+      // 仅「有 downloadUrl/桌面 OS」的 SoftwareApplication 算下载壳；Web Browser 在线工具不算
       const schemaApp = /"@type"\s*:\s*"SoftwareApplication"/i.test(html)
-        && /downloadUrl|installUrl|operatingSystem/i.test(html);
-      // pageClaimsBrandDownloadLanding 可能偏松：仅当已有 CTA/包时采信
+        && (/downloadUrl|installUrl/i.test(html)
+          || (/operatingSystem/i.test(html) && /Windows|macOS|Android|iOS|Linux/i.test(html)
+            && !/"operatingSystem"\s*:\s*"[^"]*Web\s*Browser[^"]*"/i.test(html)));
+      // pageClaimsBrandDownloadLanding 可能偏松：须有真实下载壳痕迹（包/hub/多平台/下载文案 CTA）
+      // 勿仅凭「立即使用」+ JSON-LD SoftwareApplication 把证书工具站抬成下载落地
       if (!pitch && typeof NS.pageClaimsBrandDownloadLanding === "function" && NS.pageClaimsBrandDownloadLanding()
-        && (ctaCount >= 1 || pkgCount >= 1 || multiPlatform || hasHub)) {
+        && (pkgCount >= 1 || hasHub || multiPlatform
+          || (ctaCount >= 1 && /下载|安装|客户端|安装包/i.test(ctaTextBlob + claim)))) {
         pitch = true;
       }
 
@@ -393,6 +508,24 @@
       }
       if (paddedMktHost && ctaCount >= 1) softPitch = true;
 
+      // 纯 Web 证书/SSL/运维查询工具页：无安装包、无 download hub → 不当软件下载落地
+      // 覆盖：letsssl tools、uptimepro …/tools/ssl-lookup、证书查询/检查 等
+      const toolPathBlob = `${path} ${title} ${desc}`;
+      const webSslToolPage = pkgCount === 0 && !hasHub && !encryptedDl && !cloudDriveQr && !seoTemplate
+        && !/客户端下载|官方下载|安装包|免费下载|电脑版|桌面端|正版下载|官方客户端/i.test(claim)
+        && (
+          /\/tools?(?:\/|$)|ssl[-_]?lookup|ssl[-_]?check|ssl[-_]?query|ssl[-_]?test|cert[-_]?check|证书查询|证书检测|证书检查|SSL\s*查找|SSL\s*检查|SSL\s*查询|证书工具|SSL\s*工具|格式转换|私钥|CSR|在线工具|工具合集|工具箱/i.test(toolPathBlob)
+          || (/证书|SSL|TLS|私钥|CSR|HTTPS/i.test(`${title} ${desc}`)
+            && /工具|查看|转换|校验|解析|查询|检测|检查|lookup|checker/i.test(`${title} ${desc} ${path}`))
+        );
+      if (webSslToolPage) {
+        return {
+          ok: false, pitch: false, softPitch: false, shellScore, hardShell: false,
+          ctaCount: 0, pkgCount, hrefless, multiPlatform, hasHub, editorial: !!editorial,
+          reasons: reasons.concat(["web-ssl-tool"])
+        };
+      }
+
       // 与下载页检测绑死：话术 + 壳，或硬壳 + 弱话术/包，或首页→download.html 导流
       let ok = false;
       if (hardShell && (pitch || softPitch || pkgCount >= 1)) ok = true;
@@ -441,6 +574,10 @@
    */
   NS.pageLooksLikeSoftwareCatalogPortal = function () {
     try {
+      // 品牌夹字或品牌子域挂第三方软件下载主域时，不能用“软件门户”身份
+      // 跳过仿冒检测（huorong-m.softw.com.cn）。
+      if (typeof NS.hostNeedsAuthoritativeBrandIdentity === "function"
+        && NS.hostNeedsAuthoritativeBrandIdentity()) return false;
       const title = (document.title || "").trim();
       const path = (location.pathname || "").toLowerCase();
       const host = (location.hostname || "").toLowerCase().replace(/^www\./, "");
@@ -779,6 +916,15 @@
     const state = NS.state;
     if (state.downloadGuardInstalled || state.remoteDownloadDispatchDetected) return false;
     if (state._fakeSpaDetected || state._brandSpoofPortalDetected || state._seoCloakKitDetected) return false;
+    // _perfBenign 只是性能判断，不是网站身份。品牌核被 docs/help/soft 等结构
+    // 夹带时必须等 ICP/WHOIS 后复核，不能以“页面排版正常”提前定性为成熟站。
+    if (typeof NS.hostNeedsAuthoritativeBrandIdentity === "function"
+      && NS.hostNeedsAuthoritativeBrandIdentity()) return false;
+    // 纯 SPA noscript 挂载壳：不是下载页，避免「薄页面」误报
+    if (typeof NS.pageLooksLikeBareJsAppShell === "function" && NS.pageLooksLikeBareJsAppShell()) {
+      state._perfBenign = true; state._perfBenignAt = Date.now();
+      return true;
+    }
     if (NS.pageLooksLikeSearchEngineResultsPage()) { state._perfBenign = true; state._perfBenignAt = Date.now(); return true; }
     // 天气/资讯内容门户（可有附属 APK 广告）→ benign
     if (typeof NS.pageLooksLikeContentInfoPortal === "function" && NS.pageLooksLikeContentInfoPortal()) {

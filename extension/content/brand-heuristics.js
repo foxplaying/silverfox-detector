@@ -18,11 +18,9 @@
   };
 
   /**
-   * 粗略 eTLD+1，处理多段公共后缀（*.com.cn / *.co.uk）。
-   * .cn 除行业二级域外还有省级公共后缀（hl.cn / bj.cn 等）；若把 hl.cn
-   * 误当成可注册品牌根，cn-powertoys.hl.cn 会被错误放行为“官方产品子域”。
+   * 粗略 eTLD+1 回退（无 tldts 时）。处理 *.com.cn / *.co.uk 及 .cn 省级后缀。
    */
-  NS.getRegistrableDomain = function (domain) {
+  NS.getRegistrableDomainFallback = function (domain) {
     const d = NS.normalizeDomain(domain);
     const parts = d.split(".").filter(Boolean);
     if (parts.length === 0) return "";
@@ -36,6 +34,20 @@
       return parts.slice(-3).join(".");
     }
     return parts.slice(-2).join(".");
+  };
+
+  /**
+   * 注册域名（eTLD+1）：优先 tldts Public Suffix List，否则回退启发。
+   * example.com.cn / example.co.uk / example.github.io 均正确。
+   */
+  NS.getRegistrableDomain = function (domain) {
+    try {
+      if (typeof NS.parseHostWithTldts === "function") {
+        const info = NS.parseHostWithTldts(domain);
+        if (info && info.domain) return String(info.domain).toLowerCase();
+      }
+    } catch { /* ignore */ }
+    return NS.getRegistrableDomainFallback(domain);
   };
 
   /** 是否纯营销/频道主机标签（不可当品牌核） */
@@ -67,11 +79,16 @@
         const st = NS.stripMarketingHostPrefixFromToken(flat) || "";
         if (st.length >= 4 && flat !== st && flat.includes(st)) return true;
       }
-      // qq-musics / xx-music(s) 连字符仿冒
+      // qq-musics / xx-music(s) 连字符仿冒；huorong-lab / brand-soft 营销垫
       if (/^(?:qq|wx|weixin|netease|wy)[-_]?(?:music|musics|yinyue|yinle)/i.test(flat)) return true;
-      if (/[-_](?:music|musics|yinyue|yinle|pc|app|soft|safe|vip|pro|cn|win|download|client)$/i.test(raw)) {
+      if (/[-_](?:music|musics|yinyue|yinle|pc|app|soft|safe|vip|pro|cn|win|download|client|lab|labs|tech|site|official)$/i.test(raw)) {
         const head = raw.split(/[-_]/)[0] || "";
-        if (head.length >= 2 && head.length <= 12) return true;
+        if (head.length >= 2 && head.length <= 16) return true;
+      }
+      // qissmusic / xxxyinyue：拉丁前缀 + 中文产品品类尾（结构，非品牌词库）
+      if (typeof NS.parseHostChineseProductCategoryPad === "function"
+        && NS.parseHostChineseProductCategoryPad(raw || flat)) {
+        return true;
       }
       return false;
     } catch { return false; }
@@ -125,7 +142,7 @@
         if (!core) {
           const padded = (typeof NS.hostLabelIsMarketingPrefixedBrandShape === "function"
             && NS.hostLabelIsMarketingPrefixedBrandShape(lab))
-            || /[-_](?:pc|app|soft|safe|vip|pro|cn|win|download|client)$/i.test(lab)
+            || /[-_](?:pc|app|soft|safe|vip|pro|cn|win|download|client|lab|labs|tech|site)$/i.test(lab)
             || /^(?:v|x|z|aa|bb|cc|ca|im|ie|pr|ott)[-_]?/i.test(lab);
           if (!padded && flat.length >= 4 && !/^(?:com|net|org|gov|edu)$/i.test(flat)) {
             core = flat;
@@ -278,7 +295,7 @@
         || (apexLeftRaw && apexLeftRaw !== padCore && (
           (typeof NS.hostLabelIsMarketingPrefixedBrandShape === "function"
             && NS.hostLabelIsMarketingPrefixedBrandShape(apexLeftRaw))
-          || /[-_](?:pc|app|soft|safe|vip|pro|cn|win|download|client)$/i.test(apexLeftRaw)
+          || /[-_](?:pc|app|soft|safe|vip|pro|cn|win|download|client|lab|labs|tech|site)$/i.test(apexLeftRaw)
           || /^(?:v|x|z|aa|bb|cc|ca|im|ie|pr|ott|get|pc|app)[-_]/i.test(apexLeftRaw)
         ))
         || (typeof NS.isMarketingHostLabelOnly === "function" && NS.isMarketingHostLabelOnly(labelRaw)
@@ -344,32 +361,128 @@
       if (!host) return false;
       const labelRaw = (host.split(".")[0] || "").toLowerCase();
       const labFlat = labelRaw.replace(/-/g, "").replace(/[^a-z0-9]/g, "");
+      // 页面候选自身的 CamelCase 边界若与连字符 host 逐段一致，它是完整品牌，
+      // 不是域名拼接碎片：ToDesk ⇄ to-desk。CloudToDesk ⇄ cloud-todesk
+      // 因分段数量/边界不同，不会被此规则放行。
+      try {
+        const rawCand = String(cand || "").trim();
+        const hostParts = labelRaw.split(/[-_]+/).filter(Boolean);
+        const camelParts = rawCand.match(/[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+/g) || [];
+        if (hostParts.length >= 2 && camelParts.length === hostParts.length
+          && camelParts.every((part, i) => part.toLowerCase() === hostParts[i])) {
+          return false;
+        }
+      } catch { /* ignore */ }
       const apex = (typeof NS.getRegistrableDomain === "function" ? NS.getRegistrableDomain(host) : "") || host;
-      const apexFlat = (apex.split(".")[0] || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      const apexLeftRaw = (apex.split(".")[0] || "").toLowerCase();
+      const apexFlat = apexLeftRaw.replace(/[^a-z0-9]/g, "");
       const hostFlat = host.replace(/[^a-z0-9]/g, "");
       const cores = typeof NS.collectHostBrandCores === "function" ? NS.collectHostBrandCores(host) : null;
-      const padCore = (cores && cores.padCore) || "";
+      let padCore = (cores && cores.padCore) || "";
       const root = (cores && cores.root) || "";
-
-      // 完整连字符段是干净候选：cloud-todesk 中页面独立声明的 todesk
-      // 不应被后面的“任意短前缀切分”误判为主机碎片。
-      if (/-/.test(labelRaw)) {
-        const segments = labelRaw.split("-").map((x) => x.replace(/[^a-z0-9]/g, "")).filter(Boolean);
-        if (segments.includes(low)) return false;
+      // 无 padCore 时只尝试明确营销结构；字符污染由页面候选双向确认。
+      if (!padCore && typeof NS.inferMarketingPaddedBrandCore === "function") {
+        try {
+          padCore = String(NS.inferMarketingPaddedBrandCore(labelRaw) || NS.inferMarketingPaddedBrandCore(apexLeftRaw) || "")
+            .toLowerCase().replace(/[^a-z0-9]/g, "");
+        } catch { /* ignore */ }
       }
 
-      // 候选等于干净 apex 本身（dingtalk.com）不是碎片；只有等于夹带整段
-      // （pr-todesk → prtodesk）才拒绝。剥出的 core 是否可展示由页面身份票决定。
-      if (labFlat && low === labFlat) {
-        if (padCore && padCore === low && apexFlat === low) return false;
-        if (padCore && padCore !== low && low.includes(padCore)) return true;
-        if (/-/.test(labelRaw) && padCore && padCore !== low) return true;
+      // ★ 干净剥核本身绝不是碎片：huorong @ huorongr.com.cn 必须可展示 / 可写入 spoofBrand
+      // 旧逻辑 nearHostFlat 把「huorong ⊂ huorongr 且长度差≤3」判成碎片 → setSpoof 拒绝 → 空文案
+      if (padCore && padCore.length >= 4 && low === padCore) return false;
+      if (root && root.length >= 4 && low === root && padCore && labFlat.includes(padCore) && labFlat !== root) {
+        // root 若是整段夹带则仍可能是碎片；仅当 root===padCore 时放行
+        if (root === padCore) return false;
+      }
+
+      const mktSegOnly = /^(?:apps?|soft|safe|vip|pro|pc|cn|win|lab|labs|tech|site|download|client|free|official|online|tool|tools)$/i;
+      const hyphenSegs = (/-/.test(labelRaw) ? labelRaw : (/-/.test(apexLeftRaw) ? apexLeftRaw : ""))
+        .split(/[-_]/)
+        .map((x) => x.replace(/[^a-z0-9]/g, ""))
+        .filter((x) => x.length >= 2);
+
+      // 单段干净核（dingding / todesk）可展示；须先于「多段覆盖」判定，避免 dingding 含子串 ding 被误杀
+      if (hyphenSegs.length >= 2 && hyphenSegs.includes(low) && low !== labFlat && low !== apexFlat) {
+        if (mktSegOnly.test(low)) return true;
         return false;
       }
+
+      // 仅夹带/多段主机才做「近形 flat」碎片判定，避免 todesk.com + ToDesk 被误杀
+      const hostLooksCompound = hyphenSegs.length >= 2
+        || (typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
+          && (NS.apexLabelLooksLikeMarketingPaddedBrand(labelRaw)
+            || NS.apexLabelLooksLikeMarketingPaddedBrand(apexLeftRaw)))
+        || (padCore && padCore.length >= 4 && labFlat && labFlat !== padCore && labFlat.includes(padCore))
+        || (padCore && padCore.length >= 4 && apexFlat && apexFlat !== padCore && apexFlat.includes(padCore));
+
+      // 与主机 flat 近形（Dingappsdingdin ≈ dingappsdingding）
+      // 注意：low===padCore 已在上方放行，不会走到这里
+      const nearHostFlat = (flat) => {
+        if (!flat || flat.length < 5) return false;
+        if (low === flat) return true;
+        // 禁止：干净核 huorong 因是 huorongr 前缀被误杀（仅当 low 不是 padCore）
+        if (padCore && low === padCore) return false;
+        if (flat.includes(low) && low.length >= 6 && low.length >= flat.length - 3) return true;
+        if (low.includes(flat) && flat.length >= 6 && flat.length >= low.length - 3) return true;
+        if (typeof NS.editDistanceShort === "function" && Math.abs(low.length - flat.length) <= 3) {
+          const d = NS.editDistanceShort(low, flat);
+          if (d != null && d >= 0 && d <= 2 && Math.min(low.length, flat.length) >= 8) return true;
+        }
+        return false;
+      };
+      if (hostLooksCompound && (nearHostFlat(labFlat) || nearHostFlat(apexFlat))) return true;
+
+      // 候选 ≈ 多段连字符拼接影子（须比「单段干净核」更长/更碎）
+      if (hyphenSegs.length >= 2) {
+        const joined = hyphenSegs.join("");
+        if (nearHostFlat(joined) || low === joined) return true;
+        // 候选含 ≥2 个**互不包含**的主机段（ding+apps，而非 ding ⊂ dingding）
+        const hits = [];
+        for (let si = 0; si < hyphenSegs.length; si++) {
+          const seg = hyphenSegs[si];
+          if (seg.length >= 3 && low.includes(seg) && !mktSegOnly.test(seg)) hits.push(seg);
+        }
+        const independent = hits.filter((seg, idx) =>
+          !hits.some((other, j) => j !== idx && other !== seg && other.includes(seg))
+        );
+        if (independent.length >= 2 && low.length >= 10
+          && low.length >= Math.min(joined.length - 2, independent.join("").length)) {
+          return true;
+        }
+        // 营销段 + 品牌段粘在候选里：apps 与 dingding 同时出现
+        const hasMkt = hyphenSegs.some((seg) => mktSegOnly.test(seg) && low.includes(seg));
+        const hasBrandSeg = hyphenSegs.some((seg) => !mktSegOnly.test(seg) && seg.length >= 4 && low.includes(seg));
+        if (hasMkt && hasBrandSeg && low.length >= 8 && nearHostFlat(joined) === false) {
+          // Dingappsdingdin 含 apps+ding；即使 edit 距离已在 near 捕获，这里兜底
+          if (low.length >= joined.length - 2) return true;
+        }
+      }
+
+      // 候选等于主机标签整段 → 一律当碎片（禁止「仿冒「Huorongr」/「HuorongLab」」）
+      // 干净正站核（dingtalk）仅当 apex 干净且候选==apex 且无夹带时才放行
+      if (labFlat && low === labFlat) {
+        // 连字符标签整段（huorong-lab → HuorongLab）绝不当展示，优先于 padCore 误等于 flat
+        if (/-/.test(labelRaw)) return true;
+        if (padCore && padCore === low && apexFlat === low
+          && !(typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
+            && NS.apexLabelLooksLikeMarketingPaddedBrand(labelRaw))) {
+          return false;
+        }
+        if (padCore && padCore !== low && low.includes(padCore)) return true;
+        // 默认同名主机标签不当展示品牌
+        return true;
+      }
       if (apexFlat && low === apexFlat && low.length >= 5) {
+        // 连字符 apex 整段拼写（huorong-lab）一律碎片
+        if (/-/.test(String((cores && cores.apexLeftRaw) || labelRaw || ""))) return true;
         // apex 自身是干净品牌核（dingtalk.com）→ 不当碎片
-        if (padCore && padCore === low) return false;
-        // apex 是夹带整段（vdingtalk / iehuorong / huorongpc）
+        if (padCore && padCore === low
+          && !(typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
+            && NS.apexLabelLooksLikeMarketingPaddedBrand(apexFlat))) {
+          return false;
+        }
+        // apex 是夹带整段（vdingtalk / iehuorong / huorongpc / huorongr）
         if (padCore && padCore.length >= 4 && low !== padCore && low.includes(padCore)) return true;
         if (typeof NS.inferMarketingPaddedBrandCore === "function") {
           const c2 = NS.inferMarketingPaddedBrandCore(apexFlat) || NS.inferMarketingPaddedBrandCore(
@@ -378,10 +491,30 @@
           );
           if (c2 && c2.length >= 4 && c2 !== low && low.includes(c2)) return true;
         }
+        // 单字母尾缀：huorongr
+        if (low.length >= 6 && /^[a-z]{5,}[a-z0-9]$/i.test(low)) return true;
         // 单字母/短前缀粘连：v+dingtalk、x+todesk
         if (/^[vxz][a-z]{5,}$/i.test(low) || /^(?:aa|bb|cc|ca|im|ie|pr|gw|get|ott|seo|vip|my|dl)[a-z]{5,}$/i.test(low)) {
           return true;
         }
+        // 默认同名 apex 标签：仿冒 UI 不得用域名当「页内品牌」
+        if (typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
+          && NS.apexLabelLooksLikeMarketingPaddedBrand(apexFlat)) return true;
+      }
+      // HuorongLab / Huorong-Soft：主机核 + Lab/Soft 等营销尾，仍是域名衍生展示
+      if (labFlat && low.length > labFlat.length && low.startsWith(labFlat)
+        && /(?:lab|labs|soft|app|pro|vip|safe|pc|official|inc|ltd|tech|site)$/i.test(low.slice(labFlat.length))) {
+        return true;
+      }
+      if (apexFlat && low.length > apexFlat.length && low.startsWith(apexFlat)
+        && /(?:lab|labs|soft|app|pro|vip|safe|pc|official|inc|ltd|tech|site)$/i.test(low.slice(apexFlat.length))) {
+        return true;
+      }
+      // 候选 = 主机核 + Lab（核为单字母尾缀剥除后）：huorong + lab on huorongr.com.cn
+      if (padCore && padCore.length >= 5 && low.startsWith(padCore)
+        && low.length > padCore.length
+        && /^(?:lab|labs|soft|app|pro|vip|safe|pc|official|inc|ltd|tech|site)$/i.test(low.slice(padCore.length))) {
+        return true;
       }
       if (root && low === root && padCore && padCore !== low && low.includes(padCore)) return true;
       if (hostFlat && low === hostFlat) return true;
@@ -429,10 +562,24 @@
    */
   NS.stripMarketingHostPrefixFromToken = function (token) {
     try {
-      const low = String(token || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      const raw = String(token || "").toLowerCase();
+      // 连字符：j-dingtalk / v-dingtalk → dingtalk
+      if (/-/.test(raw)) {
+        const parts = raw.split("-").filter(Boolean).map((p) => p.replace(/[^a-z0-9]/g, ""));
+        if (parts.length >= 2) {
+          const first = parts[0] || "";
+          const rest = parts.slice(1).join("");
+          if (rest.length >= 4
+            && (first.length === 1 || (typeof NS.isMarketingHostPrefixToken === "function"
+              && NS.isMarketingHostPrefixToken(first)))) {
+            return rest.toLowerCase();
+          }
+        }
+      }
+      const low = raw.replace(/[^a-z0-9]/g, "");
       if (!low || low.length < 6) return "";
-      // 已知短前缀表（含单字母 v/x/z）
-      const m = low.match(/^(v|x|z|aa|bb|cc|ca|im|ie|pr|gw|get|ott|seo|cdn|vip|pro|my|pc|app|dl|qq|wx|hd|tv)([a-z][a-z0-9]{4,18})$/i);
+      // 已知短前缀表（含单字母 v/x/z/j/e/a/s）
+      const m = low.match(/^(v|x|z|j|e|a|s|aa|bb|cc|ca|im|ie|pr|gw|get|ott|seo|cdn|vip|pro|my|pc|app|dl|qq|wx|hd|tv)([a-z][a-z0-9]{4,18})$/i);
       if (m && m[2] && m[2].length >= 5) return m[2].toLowerCase();
       if (typeof NS.inferMarketingPaddedBrandCore === "function") {
         const c = NS.inferMarketingPaddedBrandCore(low);
@@ -440,6 +587,81 @@
       }
       return "";
     } catch { return ""; }
+  };
+
+  /**
+   * 仿冒 UI 展示名：夹带主机剥核后格式化（j-dingtalk → DingTalk）。
+   * 仅作页内选举失败时的兜底，不替代 collectPrimaryBrandKeywords 冠军。
+   */
+  NS.formatSpoofDisplayFromHostCore = function (hostOpt) {
+    try {
+      const host = NS.normalizeDomain(hostOpt || (typeof location !== "undefined" ? location.hostname : ""));
+      if (!host) return "";
+      let core = "";
+      if (typeof NS.resolveHostBrandCore === "function") core = NS.resolveHostBrandCore(host) || "";
+      if (!core && typeof NS.collectHostBrandCores === "function") {
+        const cores = NS.collectHostBrandCores(host);
+        core = (cores && (cores.padCore || (cores.voteLatin && cores.voteLatin[0]))) || "";
+      }
+      if (!core) {
+        const labelRaw = (host.split(".")[0] || "").toLowerCase();
+        if (typeof NS.stripMarketingHostPrefixFromToken === "function") {
+          core = NS.stripMarketingHostPrefixFromToken(labelRaw) || "";
+        }
+      }
+      core = String(core || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (!core || core.length < 4) return "";
+      const labFlat = (host.split(".")[0] || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      // 整段主机标签不能直接当品牌展示；只有明确营销结构剥核成功才使用。
+      // 中文/拉丁页面候选的污染尾确认由双向 matcher 完成。
+      if (core === labFlat) {
+        if (typeof NS.inferMarketingPaddedBrandCore === "function") {
+          const peeled = NS.inferMarketingPaddedBrandCore(labFlat) || "";
+          if (peeled && peeled.length >= 4 && peeled !== core) core = peeled;
+          else return "";
+        } else return "";
+      }
+      // 整段主机拼写核（huoronglab）不当展示——再剥营销尾 lab/pc 等
+      try {
+        const labelRaw0 = (host.split(".")[0] || "").toLowerCase();
+        if (typeof NS.inferMarketingPaddedBrandCore === "function") {
+          const peeled2 = NS.inferMarketingPaddedBrandCore(labelRaw0)
+            || NS.inferMarketingPaddedBrandCore(labFlat) || "";
+          if (peeled2 && peeled2.length >= 4 && peeled2 !== labFlat
+            && (core === labFlat || !core || core.includes(peeled2))) {
+            core = peeled2;
+          }
+        }
+        // 残片仍带 lab 尾：huoronglab → huorong
+        if (core && /(?:lab|labs)$/i.test(core) && core.length >= 7) {
+          const stem = core.replace(/(?:lab|labs)$/i, "");
+          if (stem.length >= 4) core = stem;
+        }
+      } catch { /* ignore */ }
+      if (typeof NS.isHostShapedCompoundBrandToken === "function"
+        && NS.isHostShapedCompoundBrandToken(core, host)) return "";
+      // ★ 轻量：标题壳中文（钉钉应用中心→钉钉），禁止 resolveChinese/pinyin 重计算（全站卡死）
+      try {
+        if (typeof NS.extractChineseBrandFromPageTitle === "function") {
+          const tb = NS.extractChineseBrandFromPageTitle();
+          if (tb && /[一-鿿]{2,}/.test(tb)) return tb;
+        }
+      } catch { /* ignore */ }
+      try {
+        if (typeof NS.pickChineseBrandFromPageSurface === "function") {
+          const title = String(document.title || "");
+          const cn = NS.pickChineseBrandFromPageSurface(title)
+            || NS.pickChineseBrandFromPageSurface(String(document.querySelector("h1")?.textContent || ""));
+          if (cn && /[一-鿿]{2,}/.test(cn)) return cn;
+        }
+      } catch { /* ignore */ }
+      if (typeof NS.formatBrandTokenForDisplay === "function") {
+        return NS.formatBrandTokenForDisplay(core) || "";
+      }
+      return core.charAt(0).toUpperCase() + core.slice(1);
+    } catch {
+      return "";
+    }
   };
 
   /**
@@ -502,41 +724,527 @@
         }
         return 0;
       }
-      // 中文：域名拉丁根 bridge（须页内已有该中文；bridge 只定对齐强度）
-      if (/[一-鿿]/.test(c0) && typeof NS.domainLatinRootHintsChineseBrand === "function") {
-        if (NS.domainLatinRootHintsChineseBrand(c0, cores)) return 2;
+      // 中文：选举热路径禁止 pinyin。仅 title 含中文 + padCore → 弱/强对齐
+      if (/[一-鿿]/.test(c0)) {
+        try {
+          const pad = String(cores.padCore || "").toLowerCase();
+          const title = String((typeof document !== "undefined" ? document.title : "") || "");
+          if (pad.length >= 4 && title.includes(c0)) return 2;
+          if (title.includes(c0) && (cores.padded || /-/.test(String(cores.labelRaw || "")))) return 1;
+        } catch { /* ignore */ }
       }
       return 0;
     } catch { return 0; }
   };
 
   /**
-   * 域名拉丁根是否提示该中文品牌（薄桥，非全量拼音表）。
-   * 仅当主机核命中已知根且候选中文匹配时返回 true——配合页内真实出现才加 domain 票。
-   * 例：www.huorong.cn + 火绒；可扩展。
+   * 中文 → 无调拼音：委托 pinyin-pro（brand-domain-match.js / brandPinyin）。
+   * 不再维护自建汉字表。需先 npm install && npm run vendor:libs。
    */
-  NS.DOMAIN_LATIN_CN_BRIDGE = {
-    huorong: ["火绒", "火绒安全"],
-    hongrong: ["火绒", "火绒安全"],
-    dingtalk: ["钉钉"],
-    qihoo: ["360", "360安全卫士"],
-    sogou: ["搜狗"],
-    baidu: ["百度"],
-    tencent: ["腾讯"],
-    // 仿冒拼音/英文夹带：qqyinle / qqmusics / qq-musics → 页内 QQ音乐
-    yinle: ["QQ音乐", "QQ音乐官网"],
-    yinyue: ["QQ音乐", "QQ音乐官网"],
-    musics: ["QQ音乐", "QQ音乐官网"],
-    music: ["QQ音乐", "QQ音乐官网"],
-    alibaba: ["阿里", "阿里巴巴"],
-    huawei: ["华为"],
-    xiaomi: ["小米"],
-    netease: ["网易"],
-    youku: ["优酷"],
-    bilibili: ["哔哩哔哩", "B站"],
-    kuaishou: ["快手"]
+  NS.chineseToPinyinFlat = function (text) {
+    try {
+      if (typeof NS.brandPinyin === "function") {
+        const py = NS.brandPinyin(text);
+        if (py) return py;
+      }
+      // 兼容：直接读 globalThis.pinyinPro
+      const api = (typeof globalThis !== "undefined" && (globalThis.__silverfoxPinyinPro || globalThis.pinyinPro)) || null;
+      if (api && typeof api.pinyin === "function") {
+        const r = api.pinyin(String(text || ""), {
+          toneType: "none",
+          type: "array",
+          nonZh: "consecutive",
+          v: true
+        });
+        const joined = Array.isArray(r) ? r.join("") : String(r || "");
+        return String(joined).toLowerCase().replace(/[^a-z0-9]/g, "");
+      }
+      return "";
+    } catch {
+      return "";
+    }
   };
 
+  // pickChineseBrandMatchingLatinCore：防重入 + 短缓存（避免扫描路径连环调用卡死主线程）
+  let _cnPyMatchBusy = false;
+  const _cnPyMatchCache = new Map();
+  const _CN_PY_MATCH_CACHE_MAX = 32;
+
+  /** 拼音库晚到时清缓存，避免把「未加载时的空结果」永久钉死 */
+  NS.clearChinesePinyinMatchCache = function () {
+    try { _cnPyMatchCache.clear(); } catch { /* ignore */ }
+  };
+
+  /**
+   * 用 pinyin-pro 把拉丁主机核（dingding / huorong）对齐到页内中文（钉钉 / 火绒）。
+   * 拼音库只做 中文→拼音，不能反查；须从页面抽中文再比拼音。
+   *
+   * 性能约束：
+   * - 禁止调用 collectPrimaryBrandKeywords
+   * - 短身份槽 + 有限 2 字窗；命中全等拼音立即返回
+   * - 拼音未加载时返回 "" 且不缓存
+   *
+   * @param {string} latinCore 已剥夹带的拉丁核，如 dingding
+   * @param {string} [blobOpt] 可选短文本
+   * @returns {string} 匹配的中文展示名，或 ""
+   */
+  NS.pickChineseBrandMatchingLatinCore = function (latinCore, blobOpt) {
+    try {
+      const core = String(latinCore || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (!core || core.length < 4 || core.length > 24) return "";
+      if (_cnPyMatchBusy) return "";
+
+      const hostKey = (() => {
+        try {
+          return String((typeof location !== "undefined" ? location.hostname : "") || "");
+        } catch { return ""; }
+      })();
+      const titleKey = (() => {
+        try { return String(document.title || "").slice(0, 80); } catch { return ""; }
+      })();
+      const cacheKey = `${core}|${hostKey}|${titleKey}`;
+      if (_cnPyMatchCache.has(cacheKey)) return _cnPyMatchCache.get(cacheKey);
+      const cachePut = (val) => {
+        if (_cnPyMatchCache.size >= _CN_PY_MATCH_CACHE_MAX) {
+          const first = _cnPyMatchCache.keys().next().value;
+          if (first != null) _cnPyMatchCache.delete(first);
+        }
+        _cnPyMatchCache.set(cacheKey, val);
+        return val;
+      };
+
+      const pyOf = (cn) => {
+        try {
+          if (typeof NS.chineseToPinyinFlat === "function") {
+            const p = NS.chineseToPinyinFlat(cn);
+            if (p) return p;
+          }
+          if (typeof NS.brandPinyin === "function") {
+            const p = NS.brandPinyin(cn);
+            if (p) return p;
+          }
+        } catch { /* ignore */ }
+        return "";
+      };
+      // 未加载：不缓存空结果（否则拼音晚到永远钉死 Dingding）
+      if (!pyOf("火") && !pyOf("安") && !pyOf("钉")) return "";
+
+      _cnPyMatchBusy = true;
+      try {
+        // ★ 优先 pinyin-pro.match：在 title/正文中直接定位「钉钉」↔ dingding
+        try {
+          if (typeof NS.findChineseBrandByPinyinInText === "function") {
+            const hit = NS.findChineseBrandByPinyinInText(core, blobOpt || "");
+            if (hit && /^[一-鿿]{2,8}$/.test(hit)) return cachePut(hit);
+          }
+        } catch { /* fall through */ }
+
+        // 对齐主机全形态（ding-apps-dingding → dingding），勿只比单一 core
+        const hostForms = (() => {
+          try {
+            if (typeof NS.collectHostLatinFormsForPinyin === "function") {
+              return NS.collectHostLatinFormsForPinyin();
+            }
+          } catch { /* ignore */ }
+          return core ? [core] : [];
+        })();
+        const pyMatchesCore = (py) => {
+          if (!py || py.length < 3) return false;
+          if (py === core) return true;
+          if (hostForms.some((f) => f === py)) return true;
+          if (py.startsWith(core) && py.length - core.length <= 10) return true;
+          if (core.startsWith(py) && core.length - py.length <= 8 && py.length >= 4) return true;
+          // dingappsdingding 含 dingding；huorongr 以 huorong 为前缀
+          if (hostForms.some((f) => f && (
+            (f.startsWith(py) && f.length - py.length <= 8)
+            || (f.includes(py) && py.length >= 4 && f.length - py.length <= 12)
+          ))) return true;
+          return false;
+        };
+
+        const isBadCn = (cn) => {
+          const s = String(cn || "").trim();
+          if (!s || s.length < 2 || s.length > 8) return true;
+          if (!/^[一-鿿]{2,8}$/.test(s)) return true;
+          if (typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(s)) return true;
+          if (typeof NS.looksLikeFunctionalClaimBrandToken === "function" && NS.looksLikeFunctionalClaimBrandToken(s)) return true;
+          if (/^(?:音乐|安全|杀毒|卫士|软件|下载|官网|官方|客户端|浏览器|技术|支持|关于|首页|中心|系统)$/.test(s)) return true;
+          return false;
+        };
+
+        const candidates = [];
+        const seen = Object.create(null);
+        const push = (raw) => {
+          if (candidates.length >= 16) return;
+          let s = String(raw || "").trim();
+          if (!s || !/[一-鿿]/.test(s)) return;
+          s = s.replace(/(?:官方网站|官网|官方|免费下载|下载|客户端|正版).*$/u, "").trim();
+          const onlyCn = s.replace(/[^\u4e00-\u9fff]/g, "");
+          if (onlyCn.length >= 2 && onlyCn.length <= 8) s = onlyCn;
+          if (typeof NS.normalizeChineseBrandToken === "function") {
+            const n = NS.normalizeChineseBrandToken(s);
+            if (n && /^[一-鿿]{2,8}$/.test(n)) s = n;
+          }
+          if (isBadCn(s) || seen[s]) return;
+          seen[s] = 1;
+          candidates.push(s);
+        };
+
+        // 短身份槽（含 logo 文案，钉钉常出现在 logo/span）
+        let blob = String(blobOpt || "").slice(0, 480);
+        if (!blob) {
+          try {
+            blob = [
+              String(document.title || "").slice(0, 140),
+              String(document.querySelector("h1")?.textContent || "").slice(0, 100),
+              String(document.querySelector('meta[property="og:site_name"]')?.getAttribute("content") || "").slice(0, 60),
+              String(document.querySelector('meta[property="og:title"]')?.getAttribute("content") || "").slice(0, 80),
+              String(document.querySelector('meta[name="keywords"]')?.getAttribute("content") || "").slice(0, 140),
+              String(document.querySelector(".logo, [class*='logo']")?.textContent || "").slice(0, 40)
+            ].filter(Boolean).join(" ").slice(0, 480);
+          } catch {
+            blob = String(document.title || "").slice(0, 140);
+          }
+        }
+
+        try {
+          if (typeof NS.pickChineseBrandFromPageSurface === "function") {
+            push(NS.pickChineseBrandFromPageSurface(String(document.title || "").slice(0, 140)));
+            push(NS.pickChineseBrandFromPageSurface(String(document.querySelector("h1")?.textContent || "").slice(0, 100)));
+            push(NS.pickChineseBrandFromPageSurface(blob));
+          }
+        } catch { /* ignore */ }
+
+        // 中文 run：整段 + 2 字窗（钉钉嵌在「官方钉钉客户端」中间）
+        const runs = String(blob).match(/[一-鿿]{2,10}/g) || [];
+        for (let ri = 0; ri < Math.min(runs.length, 14); ri++) {
+          const run = runs[ri];
+          push(run);
+          // 2 字窗优先：钉钉 / 火绒 全拼常整等于 core
+          const maxStart = Math.min(run.length - 2, 6);
+          for (let i = 0; i <= maxStart; i++) {
+            const pair = run.slice(i, i + 2);
+            // 先直接拼音全等 → 立刻返回（Dingding→钉钉）
+            if (!isBadCn(pair)) {
+              const pyFast = pyOf(pair);
+              if (pyFast === core) return cachePut(pair);
+            }
+            push(pair);
+          }
+          if (run.length >= 3) {
+            push(run.slice(0, 3));
+            push(run.slice(0, 4));
+          }
+        }
+
+        let best = "";
+        let bestScore = -1;
+        const limit = Math.min(candidates.length, 16);
+        for (let i = 0; i < limit; i++) {
+          const cn = candidates[i];
+          const py = pyOf(cn);
+          if (!pyMatchesCore(py)) continue;
+          let score = 0;
+          if (py === core) score = 100 + (10 - Math.min(cn.length, 10));
+          else if (py.startsWith(core)) score = 80 - (py.length - core.length);
+          else score = 50;
+          if (cn.length === 2) score += 8;
+          if (score > bestScore) {
+            bestScore = score;
+            best = cn;
+          }
+          // 全等 2 字专名足够好
+          if (py === core && cn.length === 2) break;
+        }
+        return cachePut(best);
+      } finally {
+        _cnPyMatchBusy = false;
+      }
+    } catch {
+      _cnPyMatchBusy = false;
+      return "";
+    }
+  };
+
+  /** @deprecated 已移除自建拼音表；保留空实现以免旧调用抛错 */
+  NS._ensureHanziPinyin = function () {
+    return Object.create(null);
+  };
+
+  /**
+   * 从中文品牌抽出「品类尾」候选（算法：取尾部 2～6 字，长优先；非固定品类名单）。
+   * 会跳过纯弱/功能词；优先保留含产品意味的尾段。
+   */
+  NS.extractChineseProductMorphSuffixes = function (cnBrand) {
+    try {
+      let brand = String(cnBrand || "").replace(/\s+/g, "");
+      brand = brand
+        .replace(/(?:电脑版|手机版|官方网站|官方网站首页)$/g, "")
+        .replace(/(?:官网|官方|下载|客户端|正版|免费|首页|网站)$/g, "")
+        .trim();
+      if (!brand || !/[一-鿿]/.test(brand)) return [];
+      const onlyCn = brand.replace(/[^\u4e00-\u9fff]/g, "");
+      if (onlyCn.length < 2) return [];
+      const out = [];
+      const seen = Object.create(null);
+      // 长尾优先：音乐播放器 > 播放器 > 音乐
+      for (let len = Math.min(6, onlyCn.length); len >= 2; len--) {
+        const suf = onlyCn.slice(onlyCn.length - len);
+        if (seen[suf]) continue;
+        if (typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(suf)
+          && len <= 2) continue;
+        // 整段品牌本身也可作「全拼」候选（仅当较短）
+        seen[suf] = 1;
+        out.push(suf);
+      }
+      // 专名过长时：再补「去掉首 1～2 字后的尾段」已由 slice 覆盖
+      return out;
+    } catch {
+      return [];
+    }
+  };
+
+  /**
+   * 域名里常见的「软件品类英文尾」（结构垫词，不是品牌）。
+   * 与页内中文品类尾的语义对齐靠拼音主拼音节启发 + 共现，见 matchLatinPadToChineseMorph。
+   */
+  NS.isLatinSoftwareProductDomainPad = function (suf) {
+    const s = String(suf || "").toLowerCase().replace(/[^a-z]/g, "");
+    if (!s || s.length < 4 || s.length > 14) return false;
+    // 含拼音品类尾 yinyue/yinle：qqyinle / xxxyinyue 粘连
+    return /^(?:musics?|yinyue|yinle|yingyue|player|browser|client|security|secure|antivirus|antimalware|desktop|guard|office|cloud|input|setup|installer|download|soft|app)$/i.test(s);
+  };
+
+  /**
+   * 拉丁主机尾 是否对齐 中文品类尾（算法）：
+   * 1) 等于 chineseToPinyin(中文尾)
+   * 2) 与主拼编辑距离 ≤2（yingyue≈yinyue）
+   * 3) 是软件品类英文尾，且中文尾能转出拼音（表示页内确有产品形态）
+   */
+  NS.matchLatinPadToChineseMorph = function (latinSuffix, cnMorph) {
+    try {
+      const suf = String(latinSuffix || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      const morph = String(cnMorph || "").replace(/\s+/g, "");
+      if (!suf || suf.length < 3 || !morph || !/[一-鿿]/.test(morph)) return false;
+      const py = typeof NS.chineseToPinyinFlat === "function" ? NS.chineseToPinyinFlat(morph) : "";
+      if (py && py.length >= 3) {
+        if (suf === py) return true;
+        if (typeof NS.editDistanceShort === "function"
+          && Math.abs(suf.length - py.length) <= 2
+          && NS.editDistanceShort(suf, py) <= 2) return true;
+      }
+      // 英文品类垫：须与中文品类「同域」——用拼音音节启发（yin*↔music 不可靠）
+      // 改为：中文尾含典型产品字 + 拉丁为软件品类垫词
+      if (typeof NS.isLatinSoftwareProductDomainPad === "function"
+        && NS.isLatinSoftwareProductDomainPad(suf)) {
+        // 语义粗对齐：音乐类中文 ↔ music/player；安全类 ↔ security…
+        if (/音乐|播放|歌曲|听歌/.test(morph) && /^musics?|player|audio|song/i.test(suf)) return true;
+        if (/安全|杀毒|卫士|防护|杀软/.test(morph) && /security|secure|antivirus|antimalware|guard|protect/i.test(suf)) return true;
+        if (/浏览/.test(morph) && /browser/i.test(suf)) return true;
+        if (/客户端|客户/.test(morph) && /client|app/i.test(suf)) return true;
+        if (/桌面|远程/.test(morph) && /desktop|remote/i.test(suf)) return true;
+        if (/办公/.test(morph) && /office/i.test(suf)) return true;
+        if (/网盘|云盘|云/.test(morph) && /cloud|disk|drive/i.test(suf)) return true;
+        if (/输入/.test(morph) && /input|ime/i.test(suf)) return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
+  /** 品类前缀是否像营销壳而非品牌核 */
+  NS.isGenericProductCategoryHostPrefix = function (prefix) {
+    const p = String(prefix || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (!p || p.length < 2 || p.length > 18) return true;
+    return /^(?:free|best|top|new|my|the|get|app|web|online|china|chinese|cloud|smart|super|mega|mini|pro|vip|hot|cool|fast|safe|soft|down|download|official|client|mobile|android|ios|pc|win|www\d*|http|https|api|news|blog|forum)$/i.test(p);
+  };
+
+  /**
+   * 主机是否「拉丁前缀 + 中文产品品类拉丁尾」结构。
+   * 有 cnBrandOpt 时：用拼音算法把页内中文品类尾对齐到主机尾（qishuiyinyue / qishuimusic）。
+   * 无品牌时：仅识别「前缀 + 软件品类英文尾」结构垫（不发明中文品类名）。
+   *
+   * @returns {{ prefix: string, suffix: string, chineseSuffix: string }|null}
+   */
+  NS.parseHostChineseProductCategoryPad = function (hostLabel, cnBrandOpt) {
+    try {
+      const raw = String(hostLabel || "").toLowerCase().replace(/^www\./, "");
+      const lab = raw.replace(/[^a-z0-9]/g, "");
+      if (lab.length < 6) return null;
+
+      const brandRaw = String(cnBrandOpt || "").replace(/\s+/g, "");
+      const morphs = brandRaw && typeof NS.extractChineseProductMorphSuffixes === "function"
+        ? NS.extractChineseProductMorphSuffixes(brandRaw)
+        : [];
+
+      let best = null;
+      let bestSufLen = 0;
+
+      // A) 页内中文品类 → 拼音 / 英文对齐
+      if (morphs.length) {
+        for (let mi = 0; mi < morphs.length; mi++) {
+          const morph = morphs[mi];
+          const py = typeof NS.chineseToPinyinFlat === "function" ? NS.chineseToPinyinFlat(morph) : "";
+          const candidates = [];
+          if (py && py.length >= 3) candidates.push(py);
+          // 扫描主机所有合理尾长，用 matchLatinPadToChineseMorph 判定
+          const minLen = 3;
+          const maxLen = Math.min(lab.length - 2, Math.max(py.length + 2, 12));
+          for (let actualLen = maxLen; actualLen >= minLen; actualLen--) {
+            const actualSuffix = lab.slice(-actualLen);
+            const prefix = lab.slice(0, lab.length - actualLen);
+            if (typeof NS.isGenericProductCategoryHostPrefix === "function"
+              && NS.isGenericProductCategoryHostPrefix(prefix)) continue;
+            if (typeof NS.matchLatinPadToChineseMorph === "function"
+              && NS.matchLatinPadToChineseMorph(actualSuffix, morph)) {
+              if (actualLen > bestSufLen) {
+                bestSufLen = actualLen;
+                best = { prefix, suffix: actualSuffix, chineseSuffix: morph };
+              }
+              break; // 该 morph 已取最长命中
+            }
+          }
+          // 精确/近拼音快速路径
+          for (let ci = 0; ci < candidates.length; ci++) {
+            const form = candidates[ci];
+            if (lab.endsWith(form) && lab.length > form.length) {
+              const prefix = lab.slice(0, lab.length - form.length);
+              if (!NS.isGenericProductCategoryHostPrefix(prefix) && form.length > bestSufLen) {
+                bestSufLen = form.length;
+                best = { prefix, suffix: form, chineseSuffix: morph };
+              }
+            }
+            if (typeof NS.editDistanceShort === "function" && form.length >= 4) {
+              const minL = Math.max(3, form.length - 2);
+              const maxL = Math.min(lab.length - 2, form.length + 2);
+              for (let al = maxL; al >= minL; al--) {
+                const actual = lab.slice(-al);
+                const prefix = lab.slice(0, lab.length - al);
+                if (NS.isGenericProductCategoryHostPrefix(prefix)) continue;
+                const d = NS.editDistanceShort(actual, form);
+                if (d >= 1 && d <= 2 && al > bestSufLen) {
+                  bestSufLen = al;
+                  best = { prefix, suffix: actual, chineseSuffix: morph };
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // B) 无页内品牌：仅结构「前缀 + 软件品类英文尾」
+      if (!best) {
+        for (let len = 12; len >= 4; len--) {
+          if (lab.length <= len) continue;
+          const suf = lab.slice(-len);
+          const prefix = lab.slice(0, lab.length - len);
+          if (NS.isGenericProductCategoryHostPrefix(prefix)) continue;
+          if (typeof NS.isLatinSoftwareProductDomainPad === "function"
+            && NS.isLatinSoftwareProductDomainPad(suf)) {
+            best = { prefix, suffix: suf, chineseSuffix: "" };
+            break;
+          }
+        }
+      }
+      return best;
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * 页内中文产品品牌 vs 域名：结构仿冒。
+   * 优先走 checkBrandDomain（pinyin-pro 多候选 + tldts 拆域 + 分词/相似）。
+   * 展示品牌由调用方用页内抽词；此处不发明品牌名。
+   */
+  NS.detectChineseProductCategoryHostSquat = function (hostLabel, cnBrandOpt) {
+    try {
+      const brandRaw = String(cnBrandOpt || "").replace(/\s+/g, "");
+      const brand = brandRaw
+        .replace(/(?:电脑版|手机版|官方网站|官方网站首页)$/g, "")
+        .replace(/(?:官网|官方|下载|客户端|正版|免费|首页)$/g, "")
+        .trim();
+      if (!brand || !/[一-鿿]/.test(brand)) return null;
+
+      if (typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(brand)) return null;
+      if (typeof NS.looksLikeFunctionalClaimBrandToken === "function"
+        && NS.looksLikeFunctionalClaimBrandToken(brand)) return null;
+
+      // 1) checkBrandDomain / squatFromClaim：仅当 pinyin 已在页内（禁止热路径注入大库）
+      let pyReady = false;
+      try {
+        const g = typeof globalThis !== "undefined" ? globalThis : null;
+        const api = g && (g.__silverfoxPinyinPro || g.pinyinPro);
+        pyReady = !!(api && typeof api.pinyin === "function");
+      } catch { pyReady = false; }
+      if (pyReady) {
+        if (typeof NS.detectBrandDomainSquatFromClaim === "function") {
+          const host = String(hostLabel || (typeof location !== "undefined" ? location.hostname : "") || "");
+          const hit = NS.detectBrandDomainSquatFromClaim(brand, host);
+          if (hit) return hit;
+        }
+        if (typeof NS.checkBrandDomain === "function") {
+          const host = String(hostLabel || (typeof location !== "undefined" ? location.hostname : "") || "");
+          const rel = NS.checkBrandDomain({ brand, host });
+          if (rel && rel.score >= 45 && rel.score < 90
+            && (rel.reasons || []).some((r) => /分词|完全一致|包含|相似|子域名/.test(String(r)))) {
+            return {
+              brandToken: rel.rootLabel || "",
+              hostMatch: rel.score >= 65 ? "typo" : "partial",
+              prefix: rel.rootLabel || "",
+              suffix: "",
+              chineseSuffix: brand,
+              expectedHostLabel: rel.rootLabel || "",
+              score: rel.score,
+              level: rel.level,
+              brandForms: rel.brandForms
+            };
+          }
+        }
+      }
+
+      // 2) 回退：品类尾结构垫（无 pinyin 也可跑部分路径）
+      const pad = typeof NS.parseHostChineseProductCategoryPad === "function"
+        ? NS.parseHostChineseProductCategoryPad(hostLabel, brandRaw || brand)
+        : null;
+      if (!pad || !pad.prefix || !pad.suffix) return null;
+      if (!pad.chineseSuffix || !/[一-鿿]/.test(pad.chineseSuffix)) return null;
+
+      const brandHasCat = brand.endsWith(pad.chineseSuffix)
+        || brand.includes(pad.chineseSuffix)
+        || brandRaw.includes(pad.chineseSuffix);
+      if (!brandHasCat) return null;
+
+      try {
+        const lab = String(hostLabel || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        const blob = brandRaw.toLowerCase().replace(/[^a-z0-9]/g, "");
+        if (lab.length >= 5 && blob && blob.includes(lab)) return null;
+      } catch { /* ignore */ }
+
+      return {
+        brandToken: pad.prefix,
+        hostMatch: "typo",
+        prefix: pad.prefix,
+        suffix: pad.suffix,
+        chineseSuffix: pad.chineseSuffix,
+        expectedHostLabel: `${pad.prefix}${pad.suffix}`
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  /** 兼容旧调用名 */
+  NS.detectChineseMusicBrandDomainSquat = function (hostLabel, cnBrandOpt) {
+    return typeof NS.detectChineseProductCategoryHostSquat === "function"
+      ? NS.detectChineseProductCategoryHostSquat(hostLabel, cnBrandOpt)
+      : null;
+  };
+
+  /**
+   * 域名是否与页内中文品牌对齐（轻量结构，热路径禁用 pinyin）。
+   */
   NS.domainLatinRootHintsChineseBrand = function (cnBrand, coresOpt) {
     try {
       const cn = String(cnBrand || "").trim();
@@ -544,15 +1252,12 @@
       const cores = coresOpt || (typeof NS.collectHostBrandCores === "function"
         ? NS.collectHostBrandCores()
         : null);
-      if (!cores || !cores.latin || !cores.latin.length) return false;
-      const bridge = NS.DOMAIN_LATIN_CN_BRIDGE || {};
-      for (const root of cores.latin) {
-        const hints = bridge[root];
-        if (!hints || !hints.length) continue;
-        for (const h of hints) {
-          if (cn === h || cn.includes(h) || h.includes(cn)) return true;
-        }
-      }
+      if (!cores) return false;
+      const blob = String((typeof document !== "undefined" ? document.title : "") || "");
+      if (!blob.includes(cn)) return false;
+      const padCore = String(cores.padCore || cores.apexLabel || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (padCore.length >= 4) return true;
+      if (cores.padded || /-/.test(String(cores.labelRaw || ""))) return true;
       return false;
     } catch { return false; }
   };
@@ -566,6 +1271,10 @@
    */
   NS.hostIsProductSubdomainOfBrandApex = function (hostOpt) {
     try {
+      // 品牌子域挂在无关第三方 apex 时，不能把第三方主域的成熟度继承成
+      // “官方产品子域”身份（huorong-m.softw.com.cn）。
+      if (typeof NS.hostNeedsAuthoritativeBrandIdentity === "function"
+        && NS.hostNeedsAuthoritativeBrandIdentity(hostOpt)) return false;
       const host = NS.normalizeDomain(hostOpt || location.hostname);
       if (!host || host.split(".").length < 3) return false;
       const apex = NS.getRegistrableDomain(host);
@@ -611,12 +1320,22 @@
    */
   NS.hostLooksLikeOfficialProductSubdomain = function (hostOpt, kwOpt) {
     try {
+      if (typeof NS.hostNeedsAuthoritativeBrandIdentity === "function"
+        && NS.hostNeedsAuthoritativeBrandIdentity(hostOpt)) return false;
       if (typeof NS.hostIsProductSubdomainOfBrandApex !== "function"
         || !NS.hostIsProductSubdomainOfBrandApex(hostOpt)) return false;
       const host = NS.normalizeDomain(hostOpt || location.hostname);
       const apex = NS.getRegistrableDomain(host) || host;
       const apexLeft = (apex.split(".")[0] || "").toLowerCase().replace(/[^a-z0-9]/g, "");
       if (apexLeft.length < 2) return false;
+      // ★ 干净 2 字母品牌根上的产品子域（y.qq.com / music.qq.com / v.qq.com）：
+      // 攻击者拿不到 qq.com 下任意子域；不依赖 document_start 时仍为空的标题关键词。
+      // 曾误报：标题「QQ音乐」+ y.qq.com 在关键词未就绪时被判「域名与品牌无关」。
+      if (apexLeft.length === 2 && host !== apex && host.endsWith(`.${apex}`)) {
+        const padApex = typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
+          && NS.apexLabelLooksLikeMarketingPaddedBrand(apexLeft);
+        if (!padApex) return true;
+      }
       // 页内 blob 含 apex 品牌拉丁，或中文身份（QQ音乐含 QQ / 腾讯 场景）
       const kw = kwOpt || (typeof NS.collectPrimaryBrandKeywords === "function"
         ? NS.collectPrimaryBrandKeywords() : null);
@@ -687,6 +1406,10 @@
     return false;
   };
 
+  /**
+   * 采集标题文本。优先 textContent，避免 innerText 触发布局/样式计算，
+   * 从而把站点自身的 Mixed Content 自动升级日志堆栈误指到扩展。
+   */
   NS.collectHeadingText = function (maxLen = 4000) {
     const parts = [];
     let total = 0;
@@ -695,7 +1418,8 @@
       const n = Math.min(nodes.length, 80);
       for (let i = 0; i < n; i++) {
         try {
-          const t = (nodes[i].innerText || nodes[i].textContent || "").replace(/\s+/g, " ").trim();
+          // 勿用 innerText：会 force layout，Chrome 将 Mixed Content 升级日志挂到本栈
+          const t = String(nodes[i].textContent || "").replace(/\s+/g, " ").trim();
           if (!t || t.length < 2) continue;
           if (t.length > 200) { parts.push(t.slice(0, 200)); total += 200; }
           else { parts.push(t); total += t.length; }
@@ -720,14 +1444,14 @@
         + "[id*='copyright'], [id*='Copyright'], .copy, .copy-right"
       ).forEach((el) => {
         try {
-          const t = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+          const t = String(el.textContent || "").replace(/\s+/g, " ").trim();
           if (t.length >= 12 && t.length <= 800) chunks.push(t);
         } catch { /* ignore */ }
       });
     } catch { /* ignore */ }
     if (!chunks.length) {
       try {
-        const body = (document.body && (document.body.innerText || document.body.textContent)) || "";
+        const body = (document.body && document.body.textContent) || "";
         const tail = body.slice(-2500);
         const m = tail.match(/(?:Copyright|©|版权所有|All\s*Rights\s*Reserved)[^\n]{8,200}/gi);
         if (m) m.slice(0, 4).forEach((s) => chunks.push(s.replace(/\s+/g, " ").trim()));
@@ -761,9 +1485,11 @@
     }
   };
 
-  // 仅协议/扩展名/字面量——不维护业务词黑名单；品牌取舍靠域名相关度
-  const BRAND_TOKEN_STOP_RE = /^(https?|http|www|html|htm|com|net|org|css|js|png|jpg|jpeg|gif|svg|webp|json|xml|php|asp|aspx|true|false|null|undefined)$/i;
+  // 协议/扩展/通用技术缩写（仅拉丁）——绝不当仿冒展示品牌
+  // 中文品牌合法性不走本表；用 pinyin-pro 与主机双向校验（chinesePinyinAlignsHost）
+  const BRAND_TOKEN_STOP_RE = /^(?:https?|http|www|html|htm|com|net|org|css|js|png|jpg|jpeg|gif|svg|webp|json|xml|php|asp|aspx|true|false|null|undefined|ssl|tls|ftp|sftp|ssh|dns|cdn|api|vpn|tcp|udp|smtp|imap|pop3|sql|cpu|gpu|ram|ssd|hdd|usb|wifi|lan|wan|ip|ipv4|ipv6|url|uri|web|app|pc|os|id|ui|ux|seo|cms|sdk|ide|cli|gui|ocr|pdf|zip|rar|exe|dmg|msi|apk|iso|git|npm|cdn|tls1|ssl2|ssl3|http2|http3)$/i;
   NS.BRAND_TOKEN_STOP_RE = BRAND_TOKEN_STOP_RE;
+
   /**
    * 资源/图标/构建/CMS/版权垃圾 token（B1icon13、Cover、Reserved…）绝不当品牌。
    * Reserved 来自页脚 All Rights Reserved，曾抢占「火绒」展示名。
@@ -855,13 +1581,15 @@
 
   // 主机形态：短前缀/后缀（结构启发，非品牌词表）— im-todesk / ott-todesk / huorong-pc
   // ott = 常见营销/频道前缀（ott-todesk.com.cn），绝不当正站复合
+  // lab/labs：钓鱼站常用「品牌-lab」营销垫（huorong-lab），不当产品线正站
   const MKT_HOST_PREFIX = /^(?:get|aa|bb|cc|ca|pc|app|free|soft|down|download|safe|vip|pro|pr|my|the|best|new|top|go|use|try|win|cn|zh|en|www\d*|im|ie|qq|wx|dl|to|up|re|un|gw|seo|ott|cdn|tv|hd|4k|vip|x|z)$/i;
-  const MKT_HOST_SUFFIX = /^(?:app|desktop|client|soft|download|free|pro|vip|official|online|tool|tools|win|windows|setup|install|cn|hub|box|pc|mac|ios|android|mobile|desk)$/i;
+  const MKT_HOST_SUFFIX = /^(?:app|desktop|client|soft|download|free|pro|vip|official|online|tool|tools|win|windows|setup|install|cn|hub|box|pc|mac|ios|android|mobile|desk|lab|labs)$/i;
   // 产品线尾缀可拼正站；营销前缀拼域名一律 squat
-  const PRODUCT_LINE_HOST_TOKEN = /^(?:ai|gpt|ml|bot|llm|security|antivirus|av|lab|labs|linux|windows|macos|android|bsd)$/i;
+  // 注意：lab/labs 不在此列——huorong-lab 是夹带仿冒，非 pyas-security 类正站产品线
+  const PRODUCT_LINE_HOST_TOKEN = /^(?:ai|gpt|ml|bot|llm|security|antivirus|av|linux|windows|macos|android|bsd)$/i;
   // 产品线后缀（结构）：pyas-security = 品牌+品类；亦含 OS 发行版粘连、AI 产品线（todeskai）
-  // 与 brand-pc / im-todesk 营销夹带区分：品类尾缀表示正站产品线，非 squat
-  const BRAND_PRODUCT_CATEGORY_SUFFIX = /^(?:security|antivirus|antimalware|av|secure|protection|defender|endpoint|tech|systems?|network|lab|labs|studio|group|hq|linux|windows|macos|android|ai|gpt|ml|bot|llm)$/i;
+  // 与 brand-pc / im-todesk / huorong-lab 营销夹带区分：品类尾缀表示正站产品线，非 squat
+  const BRAND_PRODUCT_CATEGORY_SUFFIX = /^(?:security|antivirus|antimalware|av|secure|protection|defender|endpoint|tech|systems?|network|studio|group|hq|linux|windows|macos|android|ai|gpt|ml|bot|llm)$/i;
   NS.MKT_HOST_PREFIX = MKT_HOST_PREFIX;
   NS.MKT_HOST_SUFFIX = MKT_HOST_SUFFIX;
   NS.BRAND_PRODUCT_CATEGORY_SUFFIX = BRAND_PRODUCT_CATEGORY_SUFFIX;
@@ -879,16 +1607,19 @@
     if (/^(?:get|aa|bb|cc|ca|pc|app|im|ie|qq|wx|dl|gw|pr|seo|ott|cdn|tv|hd|vip|pro|my|free|soft|safe|down|download|www\d*)$/i.test(p)) {
       return true;
     }
-    // 单字母频道前缀：v-dingtalk / vdingtalk（strict 亦认，供无连字符扫描）
-    if (/^[vxz]$/i.test(p)) return true;
+    // 单字母频道前缀：v-dingtalk / j-dingtalk / vdingtalk（strict 亦认）
+    // j/e/a/s 等常见「单字母-品牌」仿冒夹带（www.j-dingtalk.com.cn）
+    if (/^[vxzjeas]$/i.test(p)) return true;
     if (opts && opts.strict) return false;
     // 宽松：连字符主机可用短前缀 to/go/up（to-desk 镜像另论）
     if (MKT_HOST_PREFIX.test(p)) return true;
+    // 任意单字母（连字符主机 j-dingtalk / m-todesk）
+    if (/^[a-z]$/i.test(p)) return true;
     return false;
   };
 
   /**
-   * 主机是否「营销前缀 + 品牌」夹带形态：ott-todesk / pr-todesk / imtodesk。
+   * 主机是否「营销前缀 + 品牌」夹带形态：ott-todesk / pr-todesk / j-dingtalk / imtodesk。
    * 此类绝不当 domain-keyword related 正站。
    */
   NS.hostLabelIsMarketingPrefixedBrandShape = function (rawLabel, brandTokenOpt) {
@@ -896,13 +1627,15 @@
       const raw = String(rawLabel || "").toLowerCase().replace(/^www\./, "");
       if (!raw || raw.length < 5) return false;
       const lab = raw.replace(/-/g, "").replace(/[^a-z0-9]/g, "");
-      // 连字符：ott-todesk（可用宽松前缀表）
+      // 连字符：ott-todesk / j-dingtalk（可用宽松前缀表 + 单字母）
       if (/-/.test(raw)) {
         const parts = raw.split("-").filter(Boolean).map((p) => p.replace(/[^a-z0-9]/g, ""));
         if (parts.length >= 2) {
           const first = parts[0];
           const rest = parts.slice(1).join("");
-          if (NS.isMarketingHostPrefixToken(first) && rest.length >= 4
+          const prefixOk = NS.isMarketingHostPrefixToken(first)
+            || (first.length === 1 && /^[a-z]$/i.test(first));
+          if (prefixOk && rest.length >= 4
             && !(typeof NS.hostLabelIsBrandProductCategoryDomain === "function"
               && NS.hostLabelIsBrandProductCategoryDomain(raw, rest))) {
             if (!brandTokenOpt) return true;
@@ -1124,12 +1857,13 @@
 
       fields.title = String(document.title || "").trim();
       try {
-        fields.h1 = String(document.querySelector("h1")?.innerText || document.querySelector("h1")?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 200);
+        // textContent：避免 innerText 触发布局导致 Mixed Content 日志挂到扩展栈
+        fields.h1 = String(document.querySelector("h1")?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 200);
       } catch { fields.h1 = ""; }
-      // h2 单独采集（综合共识用）；限长，避免功能卡堆砌
+      // h2 单独采集（综合共识用）；限长，避免功能卡堆砌。textContent 避免 Mixed Content 栈误归因
       try {
         fields.h2 = Array.from(document.querySelectorAll("h2"))
-          .map((el) => (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim())
+          .map((el) => String(el.textContent || "").replace(/\s+/g, " ").trim())
           .filter((t) => t.length >= 2 && t.length <= 80)
           .slice(0, 12)
           .join(" · ")
@@ -1313,7 +2047,7 @@
       const s = raw.replace(/[\s_\-–—|·:：/\\]+/g, "");
       if (!s) return false;
       if (/^(?:pc|win(?:dows)?|mac(?:os)?|linux|android|ios|iphone|ipad|web|x86|x64|arm(?:32|64)?|32bit|64bit|32位|64位)(?:端|平台)?(?:版|版本|客户端|下载)?$/i.test(s)) return true;
-      if (/^(?:电脑|桌面|手机|移动|网页|安卓|苹果|鸿蒙|通用|绿色|便携|免安装|安装|免费|正式|官方|最新|新版|旧版|专业|企业|个人|家庭|教育|国际|中文|测试|开发|稳定|会员)(?:版|版本)$/u.test(s)) return true;
+      if (/^(?:电脑|桌面|手机|移动|网页|安卓|苹果|鸿蒙|通用|绿色|便携|免安装|安装|免费|正式|官方|最新|新|旧|专业|企业|个人|家庭|教育|国际|中文|测试|开发|稳定|会员)(?:版|版本)$/u.test(s)) return true;
       // 短大写缩写 +「版」描述的是该缩写的发行版本；真正品牌应从其它身份字段提取。
       if (/^[A-Z0-9]{2,8}(?:版|版本)$/u.test(s)) return true;
       return false;
@@ -1354,16 +2088,19 @@
     if (CN_DIGIT_PRODUCT_RE.test(t)) return t;
     let guard = 0;
     while (guard++ < 6 && t.length > 1) {
-      // 仅剥分发/渠道尾巴；「…安全 / …杀毒 / …卫士」是产品名一部分，保留
+      // 仅剥分发/渠道/栏目尾巴；「…安全 / …杀毒 / …卫士」是产品名一部分，保留
+      // 「钉钉应用中心」→「钉钉」：应用中心是栏目壳不是品牌
       let next = t
         .replace(/(?:官网下载|官方下载|免费下载|立即下载|客户端下载|下载中心|电脑版|手机版)$/u, "")
+        .replace(/(?:应用中心|帮助中心|新闻中心|服务中心|支持中心)$/u, "")
         .replace(/(?:官网|官方网站|官方)$/u, "")
         .replace(/(?:软件|客户端)$/u, "") // 火绒安全软件 → 火绒安全
+        .replace(/(?:应用)$/u, "") // 钉钉应用 → 钉钉（须在「中心」之后剥）
         .replace(/(?:下载)$/u, "")
         .trim();
       // 勿把「火绒安全」剥成「火绒」；勿留下纯「安全」
       if (next && next !== t) {
-        if (/^(?:安全|杀毒|卫士|软件|客户端|官方|官网)$/.test(next)) break;
+        if (/^(?:安全|杀毒|卫士|软件|客户端|官方|官网|应用|中心)$/.test(next)) break;
         if (next.length < 2) break;
         t = next;
         continue;
@@ -1371,6 +2108,35 @@
       break;
     }
     return t;
+  };
+
+  /**
+   * 页面常把品牌与栏目/口号/功能说明粘在一个标签里：ToDesk博客、ToDesk快。
+   * 若拉丁前缀与当前 host 通过双向身份校验，只保留页面声明的拉丁品牌；
+   * 仅当中文尾部本身是完整产品品类（QQ音乐、UC浏览器）时保留混合产品名。
+   * 这是“品牌主体 + 中文尾部角色”判断，不依赖具体厂商品牌名单。
+   */
+  NS.normalizeHostAlignedLatinBrandWithNonIdentityTail = function (token, hostOpt) {
+    try {
+      const raw = String(token || "").replace(/[\u200b-\u200d\ufeff]/g, "").trim();
+      const m = raw.match(/^([A-Za-z][A-Za-z0-9]{1,24})[\s_\-–—]*([一-鿿]{1,10})$/u);
+      if (!m) return "";
+      const tail = String(m[2] || "").replace(/[\s_\-–—]/g, "");
+      if (typeof NS.resolveMutualLatinBrandIdentity !== "function") return "";
+      const mutual = NS.resolveMutualLatinBrandIdentity(
+        m[1],
+        hostOpt || (typeof location !== "undefined" ? location.hostname : "")
+      );
+      if (!(mutual && mutual.matched && mutual.displayBrand)) return "";
+      // 完整产品品类属于名称本体，不裁：QQ音乐、UC浏览器、QQ邮箱等。
+      // “博客/快/中文/远程桌面/官方服务”等栏目或描述不满足此形态，折叠回品牌主体。
+      if (/^(?:(?:云)?音乐|浏览器|播放器|输入法|客户端|安全卫士|杀毒软件|网盘|办公套件|助手|管家|邮箱|地图|视频|直播|阅读|游戏|空间)$/u.test(tail)) {
+        return "";
+      }
+      return String(mutual.displayBrand).trim();
+    } catch {
+      return "";
+    }
   };
 
   /**
@@ -1390,6 +2156,14 @@
       // 版权/法律词绝不当展示品牌（All Rights Reserved → Reserved）
       if (typeof NS.looksLikeAssetGarbageToken === "function" && NS.looksLikeAssetGarbageToken(t)) return "";
       if (/^(?:reserved|rights|copyright|all\s*rights(\s*reserved)?)$/i.test(t)) return "";
+      // “已确认拉丁品牌 + 中文栏目/产品描述”只展示页面品牌身份。
+      // tod​esk博客 / tod​esk云电脑 → ToDesk；QQ音乐仍保留完整产品名。
+      try {
+        const alignedLatin = typeof NS.normalizeHostAlignedLatinBrandWithNonIdentityTail === "function"
+          ? NS.normalizeHostAlignedLatinBrandWithNonIdentityTail(t)
+          : "";
+        if (alignedLatin) return alignedLatin;
+      } catch { /* ignore */ }
       // Flash 可作产品名：仅当既非域名对齐又非标题主宣称时，归一阶段才挡（collect 层会再判）
       // 此处不一律清空——避免真·Flash 站 display 被抹掉
       t = NS.trimChineseBrandTrail(t) || t;
@@ -1502,7 +2276,21 @@
       const latin = mixed ? mixed[1] : "";
       const cn = mixed ? mixed[2] : s;
       const productSuffix = /(?:音乐|浏览器|播放器|输入法|客户端|安全卫士|杀毒软件|网盘|办公套件|助手|管家)$/;
-      if (mixed && productSuffix.test(cn)) return false;
+      // 动作/卖点中心语（推荐/生成/智能…）：即使以「音乐」结尾也是功能，不是「QQ音乐」式产品
+      // 反例曾误报：仿冒「AI推荐音乐」官网（qishuihi 汽水仿冒页功能卡）
+      const actionLeadCn = /^(?:推荐|智能推荐|猜你|为你|个性|热门|精选|每日|生成|编辑|识别|分析|搜索|播放|下载|安装|转换|处理|创作|剪辑|智能)/;
+      if (actionLeadCn.test(cn) || actionLeadCn.test(s.replace(/[A-Za-z0-9]+/g, ""))) return true;
+      // 纯中文：推荐音乐 / 智能推荐歌单 / AI 前缀剥掉后仍功能
+      const cnOnly = s.replace(/[A-Za-z0-9]+/g, "");
+      if (/^(?:推荐|智能|猜你喜欢|为你推荐|个性推荐).{0,6}(?:音乐|歌曲|歌单|曲库|播单)$/.test(cnOnly)
+        || /^(?:AI|人工智能)?(?:推荐|智能).{0,4}(?:音乐|歌曲|歌单)$/.test(s)) return true;
+      // AI/GPT/PDF 等技术标签 + 中文：默认功能（域名对齐除外）
+      if (mixed && /^(?:AI|AIGC|GPT|LLM|ML|OCR|PDF|VPN|SDK|API|CPU|GPU|AR|VR|IoT)$/i.test(latin)) {
+        if (!(typeof NS.candidateDomainAligned === "function"
+          && NS.candidateDomainAligned(latin) >= 1)) return true;
+      }
+      // QQ音乐 / Firefox浏览器：拉丁产品核 + 品类尾缀 → 可保留为品牌
+      if (mixed && productSuffix.test(cn) && !actionLeadCn.test(cn)) return false;
       if (mixed && typeof NS.candidateDomainAligned === "function"
         && NS.candidateDomainAligned(latin) >= 1) return false;
 
@@ -1518,9 +2306,13 @@
       // 纯中文功能标题通常由“方式/范围 + 操作或通用品类”构成。
       // 这是语言结构分类，不是厂商品牌表：批量重命名、远程桌面、云端办公等
       // 即使被模板复制到 title/H1/OG，也不能因此变成品牌。
-      const modeLead = /^(?:智能|自动|一键|在线|离线|实时|快速|极速|精准|批量|免费|专业|高效|便捷|云端|本地|远程|桌面|移动|跨端|跨平台|多端|多人|团队)/;
-      const capabilityTail = /(?:重?命名|改名|编辑|推荐|生成|识别|分析|检测|搜索|翻译|创作|剪辑|修复|转换|处理|管理|优化|加速|同步|备份|清理|压缩|解压|录制|播放|下载|安装|截图|桌面|控制|协助|协作|连接|访问|办公|会议|教育|助手|运维|操作|服务)$/;
+      const modeLead = /^(?:智能|自动|一键|在线|离线|实时|快速|极速|精准|批量|免费|专业|高效|便捷|云端|本地|远程|桌面|移动|跨端|跨平台|多端|多人|团队|个性|每日|热门|精选)/;
+      const capabilityTail = /(?:重?命名|改名|编辑|推荐|生成|识别|分析|检测|搜索|翻译|创作|剪辑|修复|转换|处理|管理|优化|加速|同步|备份|清理|压缩|解压|录制|播放|下载|安装|截图|桌面|控制|协助|协作|连接|访问|办公|会议|教育|助手|运维|操作|服务|音乐|歌曲|歌单)$/;
       if (!mixed && modeLead.test(cn) && capabilityTail.test(cn)) return true;
+      // 滑窗候选可能把动作词截成「控/协/连/访/运」；它仍是功能句残片，
+      // 不能因为截断后的拼音碰巧贴近域名就升级为品牌。
+      if (!mixed && cn.length >= 4 && modeLead.test(cn)
+        && /(?:远程)?(?:控|协|连|访|运)$/.test(cn)) return true;
       return false;
     } catch {
       return false;
@@ -1531,10 +2323,184 @@
    * 是否「不可用」中文品牌 token（结构判断，无业务词表）。
    * 挡 UI/卖点残片与站点栏目：「可访问」「技术支持」「下载中心」等绝不当仿冒展示名。
    */
+  /**
+   * 禁止作为「仿冒「X」官网」展示的 X（语言壳/品类壳）。
+   * 所有 toast / spoofBrand 写入必须经此门禁——与 pinyin 无关。
+   */
+  NS.isForbiddenSpoofDisplayBrand = function (token) {
+    try {
+      const s = String(token || "").trim();
+      if (!s || s.length < 2) return true;
+      // 语言/地区壳（曾误 toast「仿冒「中文」官网」）
+      if (/^(?:中文|英文|英语|汉语|简体|繁体|简体中文|繁体中文|国语|粤语|日文|日语|韩文|韩语|语言|版本|国际|国内|大陆|台湾|香港|海外)$/.test(s)) {
+        return true;
+      }
+      // 版本、下载和安装服务话术只能描述页面功能，不能成为“仿冒「X」官网”的 X。
+      if (/^(?:电脑|电脑版|桌面|桌面版|PC版|客户端|官方|正版|免费|最新|新版|旧版|高速|安全).{0,6}(?:下载|安装|服务|软件|版本|客户端)?$/i.test(s)) return true;
+      if (typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(s)) return true;
+      if (typeof NS.looksLikeAssetGarbageToken === "function" && NS.looksLikeAssetGarbageToken(s)) return true;
+      return false;
+    } catch {
+      return true;
+    }
+  };
+
+  /**
+   * 页内拉丁品牌 ↔ 域名段对齐（无需 pinyin）。
+   * 例：app.wps-officce-wps.com.cn + 页内 WPS →「WPS」
+   * 这是仿冒展示首选：主机已夹带品牌拉丁核且页面声明同一核。
+   */
+  NS.pickHostAlignedLatinBrandFromPage = function (hostOpt) {
+    try {
+      const host = NS.normalizeDomain
+        ? NS.normalizeDomain(hostOpt || (typeof location !== "undefined" ? location.hostname : ""))
+        : String(hostOpt || "").toLowerCase().replace(/^www\./, "");
+      if (!host) return "";
+      const segs = [];
+      const seen = Object.create(null);
+      const addSeg = (s) => {
+        const t = String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        if (!t || t.length < 2 || t.length > 16 || seen[t]) return;
+        if (/^(?:www|com|net|org|app|web|www\d+|pc|cdn|api|m|mobile|download|dl|get|soft|safe|vip|pro|cn|win|lab|labs|tech|site|official|free|client)$/i.test(t)) return;
+        seen[t] = 1;
+        segs.push(t);
+      };
+      host.split(".").forEach((part) => {
+        String(part || "").split(/[-_]/).forEach(addSeg);
+      });
+      try {
+        if (typeof NS.resolveHostBrandCore === "function") addSeg(NS.resolveHostBrandCore(host));
+        if (typeof NS.inferMarketingPaddedBrandCore === "function") {
+          addSeg(NS.inferMarketingPaddedBrandCore((host.split(".")[0] || "")));
+        }
+      } catch { /* ignore */ }
+      if (!segs.length) return "";
+
+      // 页内身份槽（短，无 body）
+      let blob = "";
+      try {
+        blob = [
+          document.title || "",
+          document.querySelector("h1")?.textContent || "",
+          document.querySelector('meta[property="og:site_name"]')?.getAttribute("content") || "",
+          document.querySelector('meta[name="application-name"]')?.getAttribute("content") || "",
+          document.querySelector('meta[property="og:title"]')?.getAttribute("content") || "",
+          document.querySelector(".logo, [class*='logo']")?.textContent || ""
+        ].filter(Boolean).join(" ");
+      } catch {
+        blob = String(document.title || "");
+      }
+      // 选举拉丁榜
+      try {
+        const pk = NS.caches && NS.caches._primaryKw;
+        if (pk && pk.latin) blob += " " + pk.latin.join(" ");
+        if (pk && pk.display && /^[A-Za-z]/.test(pk.display)) blob += " " + pk.display;
+      } catch { /* ignore */ }
+      const blobLow = blob.toLowerCase();
+      if (!blobLow) return "";
+
+      // 页面身份槽里的完整拉丁品牌主动到 host 中匹配。to-desk、todek、todsk
+      // 都由页面候选 ToDesk(todesk) 引导命中；域名不会先自行生成展示品牌。
+      try {
+        const identityWords = blob.match(/[A-Za-z][A-Za-z0-9]{2,23}/g) || [];
+        let nearBest = null;
+        for (let wi = 0; wi < Math.min(identityWords.length, 80); wi++) {
+          const original = identityWords[wi];
+          const flat = original.toLowerCase().replace(/[^a-z0-9]/g, "");
+          const shortUpperAcronym = /^[A-Z][A-Z0-9]{2}$/.test(original);
+          if ((!shortUpperAcronym && flat.length < 5) || flat.length > 20 || BRAND_TOKEN_STOP_RE.test(flat)) continue;
+          const match = typeof NS.resolveMutualLatinBrandIdentity === "function"
+            ? NS.resolveMutualLatinBrandIdentity(original, host)
+            : { matched: false, displayBrand: "", pageForm: flat, hostForm: "", relation: "none" };
+          if (!match.matched) continue;
+          const score = match.relation === "exact" ? 120
+            : (match.relation === "typo" ? 105
+              : 80 - Math.abs(flat.length - String(match.hostForm || "").length));
+          if (!nearBest || score > nearBest.score
+            || (score === nearBest.score && flat.length > nearBest.flat.length)) {
+            nearBest = {
+              original,
+              displayBrand: match.displayBrand || original,
+              flat: match.pageForm || flat,
+              score,
+              relation: match.relation,
+              hostForm: match.hostForm
+            };
+          }
+        }
+        if (nearBest) {
+          try {
+            if (NS.caches) NS.caches._mutualLatinBrandIdentity = { ...nearBest, host };
+            NS.silverfoxLog && NS.silverfoxLog(
+              "brand-latin", "mutual-identity",
+              nearBest.original, nearBest.flat, "⇄", nearBest.hostForm, nearBest.relation
+            );
+          } catch { /* ignore */ }
+          if (nearBest.original === nearBest.original.toUpperCase() && nearBest.original.length <= 5) {
+            return nearBest.original;
+          }
+          return nearBest.displayBrand || nearBest.original;
+        }
+      } catch { /* ignore */ }
+
+      // 优先：段在页内整词出现，保留页内大小写（WPS 而非 Wps）
+      // 短核优先（wps 优于 officce 拼写噪声）
+      const ranked = segs.slice().sort((a, b) => {
+        // 页内命中优先
+        const aHit = blobLow.includes(a) ? 1 : 0;
+        const bHit = blobLow.includes(b) ? 1 : 0;
+        if (bHit !== aHit) return bHit - aHit;
+        // 3–6 字母品牌核优先于长噪声段
+        const aNice = a.length >= 2 && a.length <= 6 ? 1 : 0;
+        const bNice = b.length >= 2 && b.length <= 6 ? 1 : 0;
+        if (bNice !== aNice) return bNice - aNice;
+        return a.length - b.length;
+      });
+
+      for (let i = 0; i < ranked.length; i++) {
+        const seg = ranked[i];
+        if (!blobLow.includes(seg)) continue;
+        // 整词优先
+        const re = new RegExp(`(?:^|[^A-Za-z0-9])(${seg.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})(?=$|[^A-Za-z0-9])`, "i");
+        const m = blob.match(re);
+        if (m && m[1]) {
+          // 全大写短核保持（WPS / QQ）
+          if (/^[a-z0-9]{2,5}$/i.test(m[1]) && m[1] === m[1].toUpperCase()) return m[1];
+          if (/^[a-z]{2,5}$/i.test(seg) && new RegExp(`\\b${seg}\\b`, "i").test(blob)
+            && blob.match(new RegExp(`\\b${seg}\\b`, "gi"))?.some((x) => x === x.toUpperCase())) {
+            return seg.toUpperCase();
+          }
+          return m[1];
+        }
+        // 主机夹带粘连：wpsofficce 含 wps，页内有 WPS
+        if (seg.length >= 3 && blobLow.includes(seg)) {
+          const up = blob.match(new RegExp(seg, "i"));
+          if (up && up[0]) {
+            if (seg.length <= 5 && up[0] === up[0].toUpperCase()) return up[0];
+            return typeof NS.formatBrandTokenForDisplay === "function"
+              ? (NS.formatBrandTokenForDisplay(seg) || up[0])
+              : up[0];
+          }
+        }
+      }
+      return "";
+    } catch {
+      return "";
+    }
+  };
+
   NS.isWeakChineseBrandToken = function (token) {
     const s = String(token || "").trim();
     if (!s) return true;
     if (s.length < 2) return true;
+    // ★ 禁止在此调用 chinesePinyinAlignsHost：
+    // chinesePinyinAlignsHost 内部会再调 isWeak → 无限递归 → 页面白屏卡死。
+    // pinyin 主机对齐只在选举/展示定稿层做，本函数只做结构 weak。
+    // 纯拉丁协议垃圾：BRAND_TOKEN_STOP_RE（替代已删的 isGenericTech）
+    if (!/[一-鿿]/.test(s)) {
+      const flat = s.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (flat && BRAND_TOKEN_STOP_RE.test(flat)) return true;
+    }
     if (typeof NS.looksLikeYearMarketingBrandToken === "function"
       && NS.looksLikeYearMarketingBrandToken(s)) return true;
     if (typeof NS.looksLikePlatformEditionLabel === "function"
@@ -1553,18 +2519,23 @@
     }
     // 下载页标题前缀动作词（「下载 火狐浏览器」）绝不当品牌
     if (/^(?:下载|安装|获取|官方|官网|免费|最新|正版|立即|马上|关于)$/.test(s)) return true;
+    // 语言/地区壳词：曾误 toast「仿冒「中文」官网」
+    if (/^(?:中文|英文|英语|汉语|简体|繁体|简体中文|繁体中文|国语|粤语|日文|日语|韩文|韩语|语言|版本|国际|国内|大陆|台湾|香港|海外)$/.test(s)) return true;
     // 未裁净的「关于…」栏目整段（关于火绒杀毒）——应先 trimChineseBrandLead，残留整段仍弱
     if (/^关于/.test(s) && s.length >= 4) return true;
     // 纯品类词（无专名）——「安全」 alone 会在 火绒安全/终端安全 里到处命中抢票
-    if (/^(?:品牌|产品|功能|特性|特色|方案|浏览器|客户端|软件|应用|平台|工具|系统|服务|网站|主页|中心|频道|首页|杀毒|卫士|安全|终端|防护|防御|查杀|病毒|木马|广告|弹窗|音乐|歌曲|视频|办公|网盘|助手|管家)$/.test(s)) return true;
+    if (/^(?:品牌|产品|功能|特性|特色|方案|浏览器|客户端|软件|应用|平台|工具|系统|服务|网站|主页|中心|频道|首页|博客|新闻|资讯|社区|论坛|帮助|文档|教程|指南|专栏|杀毒|卫士|安全|终端|防护|防御|查杀|病毒|木马|广告|弹窗|音乐|歌曲|视频|办公|网盘|助手|管家)$/.test(s)) return true;
+    // 功能卖点整段：「AI推荐音乐」「推荐歌曲」「智能歌单」绝不当仿冒展示名
+    if (/^(?:AI|AIGC|GPT)?(?:推荐|智能推荐|猜你|为你|个性|热门|精选).{0,4}(?:音乐|歌曲|歌单|曲库|播单)$/i.test(s.replace(/[\s\-_/]+/g, ""))) return true;
+    if (/^(?:推荐|智能)(?:音乐|歌曲|歌单)$/.test(s)) return true;
     // 营销口号（非产品名）：「音乐同好聚集」「开启沉浸式体验」等曾抢占 QQ音乐
     if (!/[A-Za-z0-9]/.test(s) && s.length >= 4) {
-      if (/同好|聚集|沉浸|打造|专属|宇宙|听觉|爱好者|聚集地|开启|体验$|独特的你|听我想听/.test(s)) return true;
+      if (/同好|聚集|沉浸|打造|专属|宇宙|听觉|爱好者|聚集地|开启|体验$|独特的你|听我想听|推荐音乐|智能推荐/.test(s)) return true;
     }
     // 站点栏目/导航形态：「技术支持」「下载中心」「新闻中心」「常见问题」「文档教程」
     // （support.html 标题「技术支持 - CrystalDiskMark…」曾误报仿冒「技术支持」）
     if (!/[A-Za-z0-9]/.test(s) && s.length >= 2 && s.length <= 8) {
-      if (/(?:支持|中心|教程|指南|文档|新闻|资讯|论坛|社区|帮助|问题|排查|关于|联系|客服|售后|频道|专栏)$/.test(s)) return true;
+      if (/(?:支持|中心|教程|指南|文档|新闻|资讯|论坛|社区|博客|帮助|问题|排查|关于|联系|客服|售后|频道|专栏)$/.test(s)) return true;
       if (/^(?:技术|客户|售后|在线|人工)?支持$/.test(s)) return true;
       if (/^(?:常见问题|故障排查|使用文档|联系作者|联系我们|关于我们|新闻中心|下载中心|帮助中心)$/.test(s)) return true;
     }
@@ -1643,7 +2614,7 @@
    */
   NS.pickChineseBrandFromPageSurface = function (raw) {
     try {
-      let rawFull = String(raw || "").trim();
+      let rawFull = String(raw || "").replace(/[\u200b-\u200d\ufeff]/g, "").trim();
       if (!rawFull) return "";
 
       // ⓪ 标题前缀动作词：「下载 火狐浏览器」「安装：钉钉」→ 丢掉「下载」
@@ -1832,6 +2803,15 @@
       if (fullMorph && !NS.isWeakChineseBrandToken(fullMorph)) {
         return fullMorph;
       }
+      // 「钉钉应用中心 / 火绒安全中心」：专名 + 应用/中心栏目壳 → 只取专名
+      // 禁止「中文官网」→「中文」
+      const shellLead = (t.match(/^([一-鿿]{2,4})(?:应用中心|应用|中心|官方|官网)/) || [])[1] || "";
+      if (shellLead
+        && !(typeof NS.isForbiddenSpoofDisplayBrand === "function" && NS.isForbiddenSpoofDisplayBrand(shellLead))
+        && !NS.isWeakChineseBrandToken(shellLead)
+        && !/^(?:应用|官方|官网|下载|安全|杀毒|中文|英文)$/.test(shellLead)) {
+        return shellLead;
+      }
       const pure = (t.match(/^([一-鿿]{2,6})/) || [])[1] || "";
       if (!pure) return "";
       // 纯中文前若原文紧贴拉丁（QQ音乐 → 勿只取 音乐）：在 raw 中校验
@@ -1849,6 +2829,15 @@
       s = NS.cutChineseBrandBeforeSlogan(s) || s;
       // 段首仍是「关于…」整句时再裁一次
       if (typeof NS.trimChineseBrandLead === "function") s = NS.trimChineseBrandLead(s) || s;
+      // 整段仍是「…应用中心」弱词时再剥壳
+      if (s && NS.isWeakChineseBrandToken(s)) {
+        const peeled = NS.trimChineseBrandTrail(s);
+        if (peeled && peeled !== s && !NS.isWeakChineseBrandToken(peeled)) s = peeled;
+        else {
+          const lead2 = (s.match(/^([一-鿿]{2,4})/) || [])[1] || "";
+          if (lead2 && !NS.isWeakChineseBrandToken(lead2)) s = lead2;
+        }
+      }
       if (!s || !NS.isPlausibleChineseBrandLength(s) || NS.isWeakChineseBrandToken(s)) return "";
       // 过短纯中文（2 字）且全文存在「拉丁+该中文」时让位混合品牌
       if (s.length <= 2) {
@@ -1977,7 +2966,7 @@
       seen.add(s);
       out.push(s);
     };
-    const t = String(text || "");
+    const t = String(text || "").replace(/[\u200b-\u200d\ufeff]/g, "");
     if (typeof NS.pickChineseBrandFromPageSurface === "function") {
       const surface = NS.pickChineseBrandFromPageSurface(t);
       if (surface) add(surface);
@@ -2123,8 +3112,8 @@
     try {
       const raw = String(rawLabel || "").toLowerCase().replace(/^www\./, "");
       if (!raw || raw.length < 5) return "";
-      // 营销夹带后缀（huorong-pc）；勿含 security/antivirus/ai/gpt——产品线正站
-      const mktSuf = /^(?:pc|app|soft|safe|vip|pro|cn|win|desk|guard|download|down|client|free|official|online|tool|tools|hub|box|mac|ios|android|mobile|setup|install|site|web|net|home|store)$/i;
+      // 营销夹带后缀（huorong-pc / huorong-lab）；勿含 security/antivirus/ai/gpt——产品线正站
+      const mktSuf = /^(?:pc|app|soft|safe|vip|pro|cn|win|desk|guard|download|down|client|free|official|online|tool|tools|hub|box|mac|ios|android|mobile|setup|install|site|web|net|home|store|lab|labs|tech)$/i;
       // ie/v-huorong：ie、v 为短营销前缀（频道/单字母夹带）
       const mktPre = /^(?:get|aa|bb|cc|ca|pc|app|free|soft|down|download|safe|vip|pro|pr|gw|my|the|best|new|top|go|use|try|win|cn|zh|en|im|ie|v|x|z|qq|wx|dl|to|up|re|un|web|www\d*|hi|ok|yes|seo|cdn|ott|tv|hd)$/i;
       const isMktPre = (part) => mktPre.test(part)
@@ -2143,6 +3132,16 @@
         if (parts.length >= 2) {
           const first = parts[0];
           const last = parts[parts.length - 1];
+          // ding-apps-dingding / brand-app-brand：中间 apps 等营销垫，取最长非营销段
+          if (parts.length >= 3) {
+            const mktMid = /^(?:apps?|soft|safe|vip|pro|pc|cn|win|download|down|client|free|official|online|tool|tools|hub|box|lab|labs|tech|site|web|net|store)$/i;
+            const brandish = parts.filter((p) => p.length >= 4 && !mktMid.test(p) && !isMktPre(p) && !mktSuf.test(p));
+            if (brandish.length >= 1) {
+              brandish.sort((a, b) => b.length - a.length || b.localeCompare(a));
+              // ding 与 dingding 并存时取更长完整核
+              return brandish[0];
+            }
+          }
           // ott-todesk / pr-todesk / aa-todesk / im-todesk：短前缀 + 品牌核 → 核心是后段
           if (first.length >= 1 && first.length <= 4 && last.length >= 4 && last.length <= 18
             && !mktSuf.test(last) && !isMktPre(last)
@@ -2150,6 +3149,18 @@
               || /^(?:pr|gw|seo|cdn|ott|tv|hd|www\d*|vip|pro|soft|safe|dl)$/i.test(first)
               || (typeof NS.isMarketingHostPrefixToken === "function" && NS.isMarketingHostPrefixToken(first)))) {
             return last;
+          }
+          // ding-apps / brand-apps：尾段营销 → 前段；若中段 apps 且末段更长品牌
+          if (parts.length === 2 && mktSuf.test(last) && /^[a-z][a-z0-9]{3,16}$/i.test(first) && !isMktPre(first) && !mktSuf.test(first)) {
+            return first;
+          }
+          // apps 作中缀的 2+ 段：ding-apps-xxx 已在 ≥3 处理；brand-apps 见上
+          if (parts.some((p) => /^(?:apps?)$/i.test(p))) {
+            const brandish2 = parts.filter((p) => p.length >= 4 && !/^(?:apps?)$/i.test(p) && !isMktPre(p) && !mktSuf.test(p));
+            if (brandish2.length) {
+              brandish2.sort((a, b) => b.length - a.length);
+              return brandish2[0];
+            }
           }
           // huorong-pc / huorong-safe-pc（非 pyas-security）
           if (mktSuf.test(last) && /^[a-z][a-z0-9]{3,16}$/i.test(first) && !isMktPre(first) && !mktSuf.test(first)) {
@@ -2162,9 +3173,12 @@
         }
       }
       const lab = raw.replace(/-/g, "");
+      // 不再对无页面证据的整段标签盲删最后一个字符。
+      // huorongr / qishuiyyds 之类必须由页面候选经 pinyin/拉丁双向确认；
+      // 否则 google/notion 等正常标签也会被错误裁短。
       // 无连字符：禁止用 desk 作营销尾缀——todesk/anydesk 等品牌以 desk 结尾，
-      // 否则 prtodesk → prto+desk 误报「Prto」
-      const m = lab.match(/^([a-z][a-z0-9]{3,16})(pc|app|soft|safe|vip|pro|cn|win|security|guard|download|client|free|official)$/i);
+      // 否则 prtodesk → prto+desk 误报「Prto」；含 lab：huoronglab → huorong
+      const m = lab.match(/^([a-z][a-z0-9]{3,16})(pc|app|soft|safe|vip|pro|cn|win|security|guard|download|client|free|official|lab|labs|tech|site)$/i);
       if (m && m[1] && !isMktPre(m[1])) return m[1].toLowerCase();
       // 无连字符前缀粘连：vdingtalk → dingtalk；qqmusics → musics（勿含 to，避免 todeskai 被拆）
       const glued = lab.match(/^(v|x|z|aa|bb|cc|ca|im|ie|pr|gw|get|ott|seo|cdn|vip|my|dl|qq|wx|hd|tv|win)([a-z][a-z0-9]{4,18})$/i);
@@ -2172,12 +3186,446 @@
         && !mktSuf.test(glued[2]) && !mktPre.test(glued[2])) {
         return glued[2].toLowerCase();
       }
-      // qq-musics / qq-music 连字符：核取 music(s) 段供 padded 判定（展示仍走 QQ音乐）
-      if (/^qq[-_]?musics?$/i.test(lab) || /^qq[-_]musics?$/i.test(raw)) {
-        return (lab.match(/musics?$/i) || ["music"])[0].toLowerCase();
-      }
+      // 品类尾剥核：qissmusic → qiss；qishuiyinyue → qishui；qqmusic → qq（算法，无品牌特判）
+      try {
+        if (typeof NS.parseHostChineseProductCategoryPad === "function") {
+          const pad = NS.parseHostChineseProductCategoryPad(raw || lab);
+          if (pad && pad.prefix && pad.prefix.length >= 2 && pad.prefix.length <= 16) {
+            return pad.prefix;
+          }
+        }
+      } catch { /* ignore */ }
+      // 注意：不再用固定品牌桥或盲删末字剥 huorongr→huorong；
+      // 尾污染茎只能由页面候选主导的双向匹配确认。
       return "";
     } catch { return ""; }
+  };
+
+  /**
+   * 统一写入 spoofBrand，防止「钉钉」与「Dingding」互相覆盖抢 toast。
+   * 规则：
+   * - 已锁定中文（_spoofBrandChineseLocked）时，禁止纯拉丁/拼音核回写
+   * - 当前已是中文时，禁止用纯拉丁替换
+   * - 写入中文时自动锁定
+   * @returns {string} 实际生效的展示名
+   */
+  NS.setSpoofDisplayBrand = function (brand, opts) {
+    try {
+      const state = NS.state;
+      if (!state) return String(brand || "").trim();
+      const o = opts || {};
+      let next = String(brand || "").trim();
+      let cur = String(state.spoofBrand || "").trim();
+      const isCn = (t) => /[一-鿿]{2,}/.test(String(t || ""));
+      const isPureLatin = (t) => /^[A-Za-z][A-Za-z0-9.\-]{2,28}$/.test(String(t || "").trim());
+
+      // 所有写入都先经过同一 UI 边界；禁止旁路把 tod​esk云电脑锁成中文品牌。
+      try {
+        if (next && typeof NS.canonicalizeBrandDisplayCandidate === "function") {
+          const normalized = NS.canonicalizeBrandDisplayCandidate(next);
+          if (normalized) next = normalized;
+        }
+      } catch { /* ignore */ }
+
+      // 旧扫描阶段可能已经把「拉丁品牌 + 中文功能描述」写入并锁定。
+      // 在判断锁之前先迁移当前状态，否则 tod​esk云电脑 会以“中文品牌”拒绝 ToDesk 覆盖。
+      try {
+        if (cur && typeof NS.canonicalizeBrandDisplayCandidate === "function") {
+          const normalizedCur = String(NS.canonicalizeBrandDisplayCandidate(cur) || "").trim();
+          if (normalizedCur && normalizedCur !== cur) {
+            const oldCur = cur;
+            cur = normalizedCur;
+            state.spoofBrand = normalizedCur;
+            state._spoofBrandChineseLocked = isCn(normalizedCur);
+            state._brandSpoofFinalPresented = false;
+            state._brandSpoofNoticeSent = false;
+            state._brandSpoofNoticeKey = "";
+            state._lastGuardNoticeKey = "";
+            try {
+              (state.details || []).forEach((d) => {
+                if (!d || !d.reason) return;
+                d.reason = String(d.reason).split(`「${oldCur}」`).join(`「${normalizedCur}」`);
+              });
+            } catch { /* ignore */ }
+          }
+        }
+      } catch { /* ignore */ }
+
+      // 当前已是弱中文（「中文」）：视为未锁，允许纠正
+      const curWeakCn = isCn(cur) && typeof NS.isWeakChineseBrandToken === "function"
+        && NS.isWeakChineseBrandToken(cur);
+
+      // 会话锁定：中文展示不可被拉丁拼音核打回（弱中文除外）
+      if (state._spoofBrandChineseLocked && isCn(cur) && !o.forceUnlock && !curWeakCn) {
+        if (!next || isPureLatin(next) || !isCn(next)) return cur;
+        // 仅允许显式 forceChinese 换另一中文
+        if (next !== cur && !o.forceChinese) return cur;
+      }
+      // 未锁但已是中文：仍禁止纯拉丁覆盖（Dingding 不得盖 钉钉）；弱中文可被拉丁核纠正
+      if (isCn(cur) && next && !isCn(next) && !curWeakCn) return cur;
+
+      if (!next) {
+        if (o.allowClear && (!state._spoofBrandChineseLocked || o.forceUnlock)) {
+          state.spoofBrand = "";
+          if (o.forceUnlock) state._spoofBrandChineseLocked = false;
+          return "";
+        }
+        return cur;
+      }
+
+      // 禁止写入弱中文展示（「中文」「官方」等）——统一门禁
+      if (typeof NS.isForbiddenSpoofDisplayBrand === "function"
+        && NS.isForbiddenSpoofDisplayBrand(next)) {
+        return cur;
+      }
+
+      // 主机碎片不写——但干净剥核（huorong @ huorongr）必须放行
+      try {
+        const lowN = next.toLowerCase().replace(/[^a-z0-9]/g, "");
+        let isCleanCore = false;
+        // 页面身份槽声明的完整品牌与 host 对齐时，不能再被域名碎片过滤器清掉。
+        // 该判断依赖页面候选，域名本身仍不能独立生成展示品牌。
+        if (typeof NS.pickHostAlignedLatinBrandFromPage === "function") {
+          const pageAligned = String(NS.pickHostAlignedLatinBrandFromPage() || "")
+            .toLowerCase().replace(/[^a-z0-9]/g, "");
+          if (pageAligned && pageAligned === lowN) isCleanCore = true;
+        }
+        if (typeof NS.resolveHostBrandCore === "function") {
+          const hc = String(NS.resolveHostBrandCore() || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+          if (hc && hc.length >= 4 && lowN === hc) isCleanCore = true;
+        }
+        if (typeof NS.inferMarketingPaddedBrandCore === "function" && !isCleanCore) {
+          try {
+            const lab = String((typeof location !== "undefined" ? location.hostname : "") || "")
+              .replace(/^www\./i, "").split(".")[0] || "";
+            const pe = String(NS.inferMarketingPaddedBrandCore(lab) || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+            if (pe && pe === lowN) isCleanCore = true;
+          } catch { /* ignore */ }
+        }
+        if (!isCleanCore && typeof NS.isHostShapedCompoundBrandToken === "function"
+          && NS.isHostShapedCompoundBrandToken(next)
+          && !isCn(next)) {
+          return cur;
+        }
+      } catch { /* ignore */ }
+
+      if (next === cur) {
+        if (isCn(next)) state._spoofBrandChineseLocked = true;
+        return cur;
+      }
+
+      state.spoofBrand = next;
+      // 旧版本可能把「中文」等弱词锁成中文品牌；被可信拉丁核纠正时同步解锁。
+      if (curWeakCn && !isCn(next)) {
+        state._spoofBrandChineseLocked = false;
+        // 清理同一页面已生成的旧文案，并允许正确品牌重新展示一次。
+        try {
+          (state.details || []).forEach((d) => {
+            if (!d || !d.reason) return;
+            d.reason = String(d.reason)
+              .split(`品牌「${cur}」`).join(`品牌「${next}」`)
+              .split(`仿冒「${cur}」`).join(`仿冒「${next}」`);
+          });
+          state._brandSpoofNoticeSent = false;
+          state._brandSpoofNoticeKey = "";
+          if (String(state._lastGuardNoticeKey || "").includes(cur)) {
+            state._lastGuardNoticeKey = "";
+          }
+        } catch { /* ignore */ }
+      }
+      if (isCn(next)) {
+        state._spoofBrandChineseLocked = true;
+      }
+      return next;
+    } catch {
+      return String(brand || "").trim();
+    }
+  };
+
+  /** 当前是否应固定使用中文 spoof 展示（禁止再选 Dingding） */
+  NS.getLockedSpoofDisplayBrand = function () {
+    try {
+      const state = NS.state;
+      if (!state) return "";
+      let cur = String(state.spoofBrand || "").trim();
+      // 修正同一页面早期已经锁入的混合功能候选，无需等待重新导航。
+      try {
+        if (cur && typeof NS.canonicalizeBrandDisplayCandidate === "function") {
+          const normalized = String(NS.canonicalizeBrandDisplayCandidate(cur) || "").trim();
+          if (normalized && normalized !== cur) {
+            cur = typeof NS.setSpoofDisplayBrand === "function"
+              ? String(NS.setSpoofDisplayBrand(cur, { forceUnlock: true }) || normalized).trim()
+              : normalized;
+            if (typeof NS.setSpoofDisplayBrand !== "function") {
+              state.spoofBrand = normalized;
+              state._spoofBrandChineseLocked = /[一-鿿]{2,}/.test(normalized);
+            }
+          }
+        }
+      } catch { /* ignore */ }
+      // 弱中文锁定无效（「中文」不得当锁定展示名）
+      if (typeof NS.isForbiddenSpoofDisplayBrand === "function"
+        && NS.isForbiddenSpoofDisplayBrand(cur)) {
+        return "";
+      }
+      if (state._spoofBrandChineseLocked && /[一-鿿]{2,}/.test(cur)) return cur;
+      if (/[一-鿿]{2,}/.test(cur) && !/^[A-Za-z]/.test(cur)) return cur;
+      return "";
+    } catch { return ""; }
+  };
+
+  /**
+   * 从 document.title 硬抽中文展示品牌（不依赖 pinyin、不走 clean 链）。
+   * 例：「钉钉应用中心 | 官方全平台免费下载」→「钉钉」
+   * 亦：「Huorong 火绒安全官网」「火绒 Huorong」→「火绒/火绒安全」
+   * 这是仿冒 toast 的最高优先级来源，禁止被主机核 Dingding/Huorong 覆盖。
+   */
+  NS.extractChineseBrandFromPageTitle = function (titleOpt) {
+    try {
+      let t = String(titleOpt != null ? titleOpt : (typeof document !== "undefined" ? document.title : "") || "")
+        .replace(/[\u200b-\u200d\ufeff]/g, "")
+        .trim();
+      if (!t) return "";
+      // 首段（| · — 等分隔）
+      const head = (t.split(/[\s]*[|｜·•\-–—][\s]*/)[0] || t).trim();
+      if (!head) return "";
+      // 栏目壳专名：只挡纯品类；中文合法性靠 pinyin 主机对齐 + 结构品类，不走 isGenericTech
+      // 栏目/语言壳：禁止「中文官网」「应用中心」当品牌
+      const okShellBrand = (s) => {
+        const x = String(s || "").trim();
+        if (!x || x.length < 2 || x.length > 6) return false;
+        if (!/^[\u4e00-\u9fff]{2,6}$/.test(x)) return false;
+        if (/^(?:应用|中心|官方|官网|下载|安全|杀毒|卫士|软件|客户端|平台|工具|系统|服务|首页|频道|中文|英文|英语|简体|繁体|语言|版本|国际|国内)$/.test(x)) {
+          return false;
+        }
+        if (typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(x)) return false;
+        return true;
+      };
+      // 1) 专名 + 应用中心（钉钉应用中心 → 钉钉）——最高优先级，须过 weak
+      let m = head.match(/^([\u4e00-\u9fff]{2,4})应用中心/);
+      if (m && m[1] && okShellBrand(m[1])) return m[1];
+      // 2) 专名 + 安全/应用/中心/官方…（火绒安全官网；钉钉应用）
+      //    禁止「中文官网」：中文 是语言壳
+      m = head.match(/^([\u4e00-\u9fff]{2,4})(?:安全|杀毒|卫士)?(?:应用中心|应用|中心|官方|官网|客户端|下载)/);
+      if (m && m[1]) {
+        let s = m[1];
+        const withProd = head.match(new RegExp("^(" + s + "(?:安全|杀毒|卫士))"));
+        if (withProd && withProd[1] && okShellBrand(withProd[1])) return withProd[1];
+        if (okShellBrand(s)) return s;
+      }
+      // 3) 整标题任意位置「xx应用中心」
+      m = t.match(/([\u4e00-\u9fff]{2,4})应用中心/);
+      if (m && m[1] && okShellBrand(m[1])) return m[1];
+      // 3b) 拉丁前缀后的中文：「Huorong 火绒安全」
+      m = t.match(/[A-Za-z][A-Za-z0-9.\-]{2,24}\s*([\u4e00-\u9fff]{2,6})(?:安全|杀毒|卫士|官网|官方|下载|客户端|应用|中心)?/);
+      if (m && m[1]) {
+        let s = m[1];
+        const withProd = t.match(new RegExp(s + "(安全|杀毒|卫士)"));
+        if (withProd && okShellBrand(s + withProd[1])) return s + withProd[1];
+        if (okShellBrand(s)) return s;
+      }
+      // 3c) 任意位置「xx安全/杀毒/卫士」产品专名（勿匹配「中文安全」类弱壳）
+      m = t.match(/([\u4e00-\u9fff]{2,4})(?:安全|杀毒|卫士)(?:官网|官方|下载|客户端|软件|中心)?/);
+      if (m && m[1]) {
+        const full = m[0].replace(/(?:官网|官方|下载|客户端|软件|中心)$/u, "");
+        if (okShellBrand(full)) return full;
+        if (okShellBrand(m[1])) return m[1];
+      }
+      // 4) 首段 2～4 字纯中文（剥栏目后）——须 weak 过关
+      m = head.match(/^([\u4e00-\u9fff]{2,6})/);
+      if (m && m[1]) {
+        let s = m[1];
+        if (typeof NS.trimChineseBrandTrail === "function") {
+          const peeled = NS.trimChineseBrandTrail(s);
+          if (peeled && peeled.length >= 2) s = peeled;
+        }
+        s = s.replace(/(?:应用中心|应用|中心)$/u, "");
+        if (okShellBrand(s) && s.length <= 4) return s;
+      }
+      // 5) 不再扫「任意中文 run」——易把「中文/官方」当品牌；只信上面结构壳
+      return "";
+    } catch {
+      return "";
+    }
+  };
+
+  /**
+   * 仿冒 UI 展示名：页内抽词优先（title 表面 / 等权 display / 中文榜），
+   * 拒绝弱词「音乐」、主机碎片、功能卖点。供 home-fast / 主检测 / guard 共用。
+   */
+  NS.pickBestSpoofDisplayBrand = function (hintOpt) {
+    try {
+      // 中文已锁定：直接返回，禁止再选举 Dingding
+      try {
+        const locked = typeof NS.getLockedSpoofDisplayBrand === "function"
+          ? NS.getLockedSpoofDisplayBrand() : "";
+        if (locked) return locked;
+      } catch { /* ignore */ }
+
+      const isBad = (t) => {
+        const s = String(t || "").trim();
+        if (!s || s.length < 2) return true;
+        if (typeof NS.isWeakChineseBrandToken === "function" && NS.isWeakChineseBrandToken(s)) return true;
+        if (typeof NS.looksLikeFunctionalClaimBrandToken === "function" && NS.looksLikeFunctionalClaimBrandToken(s)) return true;
+        if (typeof NS.looksLikeAssetGarbageToken === "function" && NS.looksLikeAssetGarbageToken(s)) return true;
+        if (NS.BRAND_TOKEN_STOP_RE && NS.BRAND_TOKEN_STOP_RE.test(s.toLowerCase())) return true;
+        // 纯品类/语言壳不够作展示（「音乐」「安全」「中文」）
+        if (/^(?:音乐|安全|杀毒|卫士|软件|下载|官网|官方|客户端|浏览器|中文|英文|简体|繁体|语言|版本)$/.test(s)) return true;
+        // 禁止域名标签/域名衍生当「被仿冒品牌」（Huorongr、HuorongLab @ huorongr.com.cn）
+        try {
+          if (typeof NS.isHostShapedCompoundBrandToken === "function"
+            && NS.isHostShapedCompoundBrandToken(s)) return true;
+        } catch { /* ignore */ }
+        return false;
+      };
+      const clean = (t) => {
+        let s = String(t || "").trim();
+        if (!s) return "";
+        if (typeof NS.canonicalizeBrandDisplayCandidate === "function") {
+          const c = NS.canonicalizeBrandDisplayCandidate(s);
+          // canonicalize 误清空时保留原串（勿把「汽水音乐」洗成空）
+          if (c) s = c;
+        }
+        return isBad(s) ? "" : s;
+      };
+
+      // 强制重新选举：避免 document_start 空 title 的缓存 display
+      try {
+        if (NS.caches) {
+          const urlKey = String((typeof location !== "undefined" ? location.href : "") || "").split("#")[0];
+          if (NS.caches._primaryKwUrl && NS.caches._primaryKwUrl !== urlKey) {
+            NS.caches._primaryKw = null;
+          }
+          // 标题已有实质内容时丢弃过期空选举
+          if (NS.caches._primaryKw && !(NS.caches._primaryKw.display)
+            && String(document.title || "").trim().length >= 2) {
+            NS.caches._primaryKw = null;
+            NS.caches._primaryKwAt = 0;
+          }
+        }
+      } catch { /* ignore */ }
+
+      // 0) 调用方提示：仅中文/混合可立即返回。纯拉丁 hint（Dingding）延后。
+      let hit = clean(hintOpt);
+      if (hit && /[\u4e00-\u9fff]{2,}/.test(hit)) return hit;
+      const deferredLatinHint = (hit && /^[A-Za-z]/.test(hit) && !/[\u4e00-\u9fff]/.test(hit)) ? hit : "";
+
+      // 0a) 页内拉丁 ↔ 域名段（WPS @ wps-officce-wps）——无需 pinyin
+      try {
+        if (typeof NS.pickHostAlignedLatinBrandFromPage === "function") {
+          const lat = String(NS.pickHostAlignedLatinBrandFromPage() || "").trim();
+          hit = clean(lat);
+          if (hit) return hit;
+        }
+      } catch { /* ignore */ }
+
+      // 0b) ★ 标题硬抽中文壳（钉钉应用中心）
+      try {
+        if (typeof NS.extractChineseBrandFromPageTitle === "function") {
+          const titleBrand = NS.extractChineseBrandFromPageTitle();
+          if (titleBrand && /[\u4e00-\u9fff]{2,}/.test(titleBrand)
+            && !(typeof NS.isForbiddenSpoofDisplayBrand === "function"
+              && NS.isForbiddenSpoofDisplayBrand(titleBrand))) return titleBrand;
+        }
+        const title0 = String(document.title || "");
+        if (title0 && typeof NS.pickChineseBrandFromPageSurface === "function") {
+          hit = clean(NS.pickChineseBrandFromPageSurface(title0));
+          if (hit && /[\u4e00-\u9fff]{2,}/.test(hit)
+            && !(typeof NS.isForbiddenSpoofDisplayBrand === "function"
+              && NS.isForbiddenSpoofDisplayBrand(hit))) return hit;
+        }
+      } catch { /* ignore */ }
+
+      // 1) ★ 标签选举总榜——display/cn/latin，禁止 pinyin
+      try {
+        const pk = typeof NS.collectPrimaryBrandKeywords === "function"
+          ? NS.collectPrimaryBrandKeywords()
+          : null;
+        if (pk && pk.display) {
+          hit = clean(pk.display);
+          if (hit && !(typeof NS.isForbiddenSpoofDisplayBrand === "function"
+            && NS.isForbiddenSpoofDisplayBrand(hit))) {
+            // 拉丁 display 且主机含该核 → 直接用（WPS）
+            if (/^[A-Za-z]/.test(hit)) {
+              const hl = (typeof location !== "undefined" ? location.hostname : "").toLowerCase();
+              if (hl.replace(/[^a-z0-9]/g, "").includes(hit.toLowerCase().replace(/[^a-z0-9]/g, ""))) {
+                return hit;
+              }
+            }
+            if (/[一-鿿]{2,}/.test(hit)) return hit;
+          }
+        }
+        if (pk && pk.cn && pk.cn.length) {
+          for (let i = 0; i < Math.min(pk.cn.length, 8); i++) {
+            hit = clean(pk.cn[i]);
+            if (hit && /[一-鿿]{2,}/.test(hit)
+              && !(typeof NS.isForbiddenSpoofDisplayBrand === "function"
+                && NS.isForbiddenSpoofDisplayBrand(hit))) return hit;
+          }
+        }
+      } catch { /* ignore */ }
+
+      // 2) resolveSpoofDisplayBrand（仍走选举 display）
+      try {
+        if (typeof NS.resolveSpoofDisplayBrand === "function") {
+          hit = clean(NS.resolveSpoofDisplayBrand());
+          if (hit) return hit;
+        }
+      } catch { /* ignore */ }
+
+      // 3) title / 表面产品名（含 QQ音乐、汽水音乐官网）
+      try {
+        const title = String(document.title || "");
+        if (typeof NS.pickChineseBrandFromPageSurface === "function") {
+          hit = clean(NS.pickChineseBrandFromPageSurface(title));
+          if (hit) return hit;
+        }
+        // 拉丁+中文产品：QQ音乐
+        const mixed = title.match(/([A-Za-z][A-Za-z0-9]{0,10}[一-鿿]{1,6}(?:音乐|浏览器|播放器|输入法|客户端|网盘|助手|管家)?)/);
+        if (mixed) {
+          hit = clean(mixed[1].replace(/(?:官网|官方|下载).*$/, ""));
+          if (hit) return hit;
+        }
+        const cnProd = title.match(/([一-鿿]{2,8}(?:音乐|安全|杀毒|卫士|浏览器|播放器|客户端|输入法|网盘|助手|管家))/);
+        if (cnProd) {
+          hit = clean(cnProd[1]);
+          if (hit) return hit;
+        }
+        // 钉钉/火绒类短中文品牌（2字）+ 官网/下载话术
+        const cnShort = title.match(/([一-鿿]{2,6})(?:官网|官方|下载|客户端|安全中心)/);
+        if (cnShort) {
+          hit = clean(cnShort[1]);
+          if (hit) return hit;
+        }
+        // h1
+        const h1 = String(document.querySelector("h1")?.textContent || "").trim().slice(0, 80);
+        if (h1 && typeof NS.pickChineseBrandFromPageSurface === "function") {
+          hit = clean(NS.pickChineseBrandFromPageSurface(h1));
+          if (hit) return hit;
+        }
+      } catch { /* ignore */ }
+
+      // 4) 夹带主机剥核兜底（j-dingtalk → DingTalk）——仅结构核，禁止用整段 apex
+      try {
+        if (typeof NS.formatSpoofDisplayFromHostCore === "function") {
+          hit = clean(NS.formatSpoofDisplayFromHostCore());
+          if (hit && /[一-鿿]{2,}/.test(hit)) return hit;
+        }
+      } catch { /* ignore */ }
+
+      // 5) 最后才用延迟的拉丁 hint / 主机核（Dingding）——标题无中文时的兜底
+      if (deferredLatinHint) return deferredLatinHint;
+      try {
+        if (typeof NS.formatSpoofDisplayFromHostCore === "function") {
+          hit = clean(NS.formatSpoofDisplayFromHostCore());
+          if (hit) return hit;
+        }
+      } catch { /* ignore */ }
+
+      return "";
+    } catch {
+      return "";
+    }
   };
 
   /**
@@ -2247,17 +3695,8 @@
         const blob = String(blobOpt != null ? blobOpt : ((kw && kw.blob) || document.title || ""));
         const blobLow = blob.toLowerCase();
         const blobFlat = blobLow.replace(/[^a-z0-9\u4e00-\u9fff]/gi, "");
-        // 中文桥优先（dingtalk→钉钉）
-        if (typeof NS.DOMAIN_LATIN_CN_BRIDGE === "object" && NS.DOMAIN_LATIN_CN_BRIDGE[c]) {
-          for (const cn of NS.DOMAIN_LATIN_CN_BRIDGE[c]) {
-            if (blob.includes(String(cn))) {
-              const dCn = clean(cn);
-              if (dCn) return dCn;
-            }
-          }
-        }
-        // 无中文桥时，拉丁核必须被页面自己的身份字段声明过。
-        // pr-todesk + 页面 ToDesk 可展示；qqyinle 仅由域名剥出的 yinle 不可展示。
+        // 无固定中文桥：拉丁核必须被页面自己的身份字段声明过。
+        // pr-todesk + 页面 ToDesk 可展示；仅由域名剥出的碎片不可展示。
         if (!hasIndependentPageIdentityEvidence(c)) return "";
         if (blobFlat.includes(c) || blobLow.includes(c)) {
           return clean(
@@ -2274,40 +3713,29 @@
         );
       };
 
-      // 0) collectPrimaryBrandKeywords 已完成跨字段、强字段和域名证据总榜；
-      // 展示层必须服从其 display，不能再用“中文优先”等旁路改写冠军。
+      // 0) 标签选举 display：中文直接用（选举内已 pinyin 抬 火绒）
+      {
+        const dDisp = clean(kw.display);
+        if (dDisp && /[一-鿿]/.test(dDisp)) return dDisp;
+      }
+
+      // 0b) 选举 cn 榜（结构优先，不调 pinyin）
+      if (kw.cn && kw.cn.length) {
+        for (let i = 0; i < Math.min(kw.cn.length, 8); i++) {
+          const cn = String(kw.cn[i] || "").trim();
+          if (!cn) continue;
+          const d0 = clean(cn);
+          if (!d0) continue;
+          if (/^\d{3,6}/.test(d0)) return d0;
+          if (/[一-鿿]/.test(d0)) return d0;
+        }
+      }
+
+      // 0c) 无中文时才用总榜纯拉丁 display（Huorong）——禁止 pinyin 热路径
       {
         const dDisp = clean(kw.display);
         if (dDisp) return dDisp;
       }
-
-      // 0b) 总榜无可用展示名时，才回退到中文/数字候选。
-      if (kw.cn && kw.cn.length) {
-        for (let i = 0; i < kw.cn.length; i++) {
-          const cn = String(kw.cn[i] || "").trim();
-          if (!cn) continue;
-          const d0 = clean(cn);
-          if (d0 && /[一-鿿]/.test(d0)) return d0;
-          if (d0 && /^\d{3,6}/.test(d0)) return d0;
-        }
-      }
-
-      // 0c) 页内中文 + 域名桥（火绒/钉钉 @ 夹带域）
-      try {
-        const cores = typeof NS.collectHostBrandCores === "function" ? NS.collectHostBrandCores(host) : null;
-        if (cores && (cores.padCore || (cores.voteLatin && cores.voteLatin.length))
-          && kw.cn && kw.cn.length
-          && typeof NS.domainLatinRootHintsChineseBrand === "function") {
-          for (let i = 0; i < kw.cn.length; i++) {
-            const cn = String(kw.cn[i] || "").trim();
-            if (!cn || !/[一-鿿]/.test(cn)) continue;
-            if (NS.domainLatinRootHintsChineseBrand(cn, cores)) {
-              const d0 = clean(cn);
-              if (d0) return d0;
-            }
-          }
-        }
-      } catch { /* ignore */ }
 
       // 1) 等权票王 display（已滤主机碎片）
       let disp = clean(kw.display);
@@ -2387,14 +3815,19 @@
   NS.hostLabelIsPaddedBrand = function (label, brandToken) {
     const lab = String(label || "").toLowerCase().replace(/-/g, "");
     const br = String(brandToken || "").toLowerCase().replace(/-/g, "");
-    if (!lab || !br || br.length < 4) return false;
+    if (!lab || !br || br.length < 3) return false;
     if (lab === br) return false;
     if (!lab.includes(br)) return false;
+    const structuralAffix = typeof NS.isStructuralHostAffixForBrand === "function"
+      && NS.isStructuralHostAffixForBrand(lab, br);
+    // 三字母品牌只开放命名明确的结构/分发夹带；不放宽任意短词包含关系。
+    if (br.length === 3 && !structuralAffix) return false;
     // pyas-security 等品牌产品线域名：绝不当营销 padded 仿冒
     if (typeof NS.hostLabelIsBrandProductCategoryDomain === "function"
       && (NS.hostLabelIsBrandProductCategoryDomain(label, br) || NS.hostLabelIsBrandProductCategoryDomain(lab, br))) {
       return false;
     }
+    if (structuralAffix) return true;
     if (lab.startsWith(br)) {
       const pad = lab.slice(br.length);
       // archlinux / todeskai = 品牌+平台/产品线粘连正站，非营销夹带
@@ -2404,6 +3837,11 @@
       }
       // security/antivirus/ai 产品线尾缀不当 padded（todeskai、pyassecurity）
       if (BRAND_PRODUCT_CATEGORY_SUFFIX.test(pad)) return false;
+      // 单字母/数字尾缀拼写污染：huorongr / todeskx（火绒仿冒 huorongr.com.cn）
+      if (pad.length === 1 && /[a-z0-9]/i.test(pad) && br.length >= 5) return true;
+      // 双字符乱尾（非品类）：huorongxx（过短营销词已在 mkt 表）
+      if (pad.length === 2 && /^[a-z0-9]{2}$/i.test(pad) && br.length >= 5
+        && !BRAND_PRODUCT_CATEGORY_SUFFIX.test(pad) && !MKT_HOST_SUFFIX.test(pad)) return true;
       if (pad.length >= 2 && pad.length <= 12 && MKT_HOST_SUFFIX.test(pad)) return true;
       // 短营销垫：app/pro/vip…；勿含 ai/bot——已归产品线品类
       if (pad.length >= 2 && pad.length <= 4 && /^(?:app|pro|vip|pc|cn|get|dl|im)$/i.test(pad)) return true;
@@ -2783,37 +4221,32 @@
   };
 
   /**
-   * 中文产品形态的通用拼音尾缀（不是品牌名单）。
-   * 用于识别「中文品牌名 + 官网」场景下，域名产品尾缀多/少/错一个字母：
-   * qishuiyinyuer vs 汽水音乐(yinyue) → expected qishuiyinyue。
+   * 中文品牌品类尾拼音 vs 主机尾：仅「差一个字母」的拼写 typo（算法，无硬编码品类表）。
+   * 例：页内「…音乐」→ yinyue，主机 …yinyuer → distance 1。
+   * 完整结构 squat（qissmusic）见 detectChineseProductCategoryHostSquat。
    */
-  NS.CHINESE_PRODUCT_ROMANIZED_SUFFIXES = [
-    ["远程桌面", "yuanchengzhuomian"],
-    ["安全卫士", "anquanweishi"],
-    ["音乐播放器", "yinyuebofangqi"],
-    ["浏览器", "liulanqi"],
-    ["播放器", "bofangqi"],
-    ["客户端", "kehuduan"],
-    ["输入法", "shurufa"],
-    ["安全", "anquan"],
-    ["杀毒", "shadu"],
-    ["卫士", "weishi"],
-    ["音乐", "yinyue"],
-    ["办公", "bangong"],
-    ["网盘", "wangpan"],
-    ["助手", "zhushou"],
-    ["管家", "guanjia"]
-  ];
-
   NS.detectChineseProductRomanizedSuffixTypo = function (cnBrand, hostLabel) {
     try {
       const brand = String(cnBrand || "").replace(/\s+/g, "");
       const label = String(hostLabel || "").toLowerCase().replace(/[^a-z0-9]/g, "");
       if (!brand || !/[一-鿿]/.test(brand) || label.length < 7) return null;
-      for (const [cnSuffix, expectedSuffix] of NS.CHINESE_PRODUCT_ROMANIZED_SUFFIXES) {
-        if (!brand.endsWith(cnSuffix)) continue;
-        // 正确拼音尾缀不得因截短一位后“距离为 1”被反向误判。
+      if (typeof NS.chineseToPinyinFlat !== "function" || typeof NS.editDistanceShort !== "function") return null;
+      const morphs = typeof NS.extractChineseProductMorphSuffixes === "function"
+        ? NS.extractChineseProductMorphSuffixes(brand)
+        : [];
+      for (let i = 0; i < morphs.length; i++) {
+        const cnSuffix = morphs[i];
+        const expectedSuffix = NS.chineseToPinyinFlat(cnSuffix);
+        if (!expectedSuffix || expectedSuffix.length < 4) continue;
+        // 已是正确拼音尾 → 非 suffix-typo
         if (label.endsWith(expectedSuffix)) return null;
+        // 已是品类结构完整匹配（含英文 music 等）→ 交由 category squat
+        if (typeof NS.matchLatinPadToChineseMorph === "function") {
+          for (let al = Math.min(14, label.length - 2); al >= 4; al--) {
+            const act = label.slice(-al);
+            if (NS.matchLatinPadToChineseMorph(act, cnSuffix)) return null;
+          }
+        }
         const minLen = Math.max(4, expectedSuffix.length - 1);
         const maxLen = Math.min(label.length - 2, expectedSuffix.length + 1);
         for (let actualLen = minLen; actualLen <= maxLen; actualLen++) {
@@ -2896,11 +4329,87 @@
     return "none";
   };
 
+  /**
+   * 软件品牌拉丁核展示用形态切分词缀（英语词根/品类尾，不是品牌名单）。
+   * 从右往左剥，可处理任意 head+morph：ding+talk、to+desk、crystal+disk+mark、any+desk…
+   */
+  NS.BRAND_DISPLAY_MORPH_SUFFIXES = [
+    "antivirus", "security", "desktop", "browser", "player", "client", "driver",
+    "disk", "mark", "soft", "desk", "talk", "safe", "guard", "music", "cloud",
+    "info", "time", "box", "drive", "work", "book", "note", "cast", "link",
+    "hub", "lab", "view", "sync", "mail", "chat", "meet", "flow", "base",
+    "data", "ware", "lock", "shot", "play", "tune", "wave", "fire", "fox",
+    "tech", "code", "pack", "tool", "kit", "zone", "port", "gate", "wall",
+    "shield", "bolt", "spark", "pulse", "grid", "core", "edge", "node",
+    "share", "drop", "path", "route", "bridge", "stack", "layer", "frame",
+    "panel", "board", "card", "chip", "stream", "feed", "live", "room",
+    "space", "land", "world", "home", "house", "place", "site", "page",
+    "net", "app", "cam", "max", "pro", "bit", "key", "pass", "bee", "ant",
+    "cat", "dog", "sun", "sky", "moon", "star", "bird", "fish"
+  ];
+
+  /**
+   * 纯小写拉丁品牌核 → 结构驼峰（算法，无 dingtalk/todesk 特例）。
+   * crystaldiskmark → CrystalDiskMark；dingtalk → DingTalk；todesk → ToDesk；anydesk → AnyDesk
+   */
+  NS.camelizeLatinBrandToken = function (raw) {
+    try {
+      const low = String(raw || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (!low) return "";
+      if (/^[a-z]{2,3}$/.test(low)) return low.toUpperCase();
+      if (low.length < 4) return low.charAt(0).toUpperCase() + low.slice(1);
+
+      const morphs = (NS.BRAND_DISPLAY_MORPH_SUFFIXES || [])
+        .slice()
+        .sort((a, b) => b.length - a.length);
+      const parts = [];
+      let rest = low;
+      let guard = 0;
+      // 从右往左反复剥形态词缀（最长优先）
+      while (rest.length >= 4 && guard++ < 10) {
+        let peeled = false;
+        for (let i = 0; i < morphs.length; i++) {
+          const suf = morphs[i];
+          if (!suf || suf.length < 3) continue;
+          // 头部至少留 2 字符（to+desk、we+chat 类）
+          if (rest.length < suf.length + 2) continue;
+          if (!rest.endsWith(suf)) continue;
+          parts.unshift(suf.charAt(0).toUpperCase() + suf.slice(1).toLowerCase());
+          rest = rest.slice(0, rest.length - suf.length);
+          peeled = true;
+          break;
+        }
+        if (!peeled) break;
+      }
+      if (parts.length && rest.length >= 2) {
+        const head = rest.charAt(0).toUpperCase() + rest.slice(1).toLowerCase();
+        return head + parts.join("");
+      }
+      // 无词缀可剥：首字母大写
+      return low.charAt(0).toUpperCase() + low.slice(1).toLowerCase();
+    } catch {
+      const s = String(raw || "");
+      return s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : "";
+    }
+  };
+
   NS.formatBrandTokenForDisplay = function (token) {
     let t = String(token || "").trim();
     if (!t) return "";
     if (/[一-鿿]/.test(t)) return t;
-    // 夹带拼词先剥前缀再格式化：VdingTalk/vdingtalk → DingTalk（勿显示 VdingTalk）
+    // 页面 CamelCase 的分词边界若与连字符域名逐段完全一致，应保留页面品牌。
+    // ToDesk ⇄ to-desk 命中；CloudToDesk ⇄ cloud-todesk 边界不同，不命中。
+    try {
+      const host = NS.normalizeDomain((typeof location !== "undefined" && location.hostname) || "");
+      const labelRaw = (String(host || "").split(".")[0] || "").toLowerCase();
+      const hostParts = labelRaw.split(/[-_]+/).filter(Boolean);
+      const camelParts = t.match(/[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+/g) || [];
+      if (hostParts.length >= 2 && camelParts.length === hostParts.length
+        && camelParts.every((part, i) => part.toLowerCase() === hostParts[i])) {
+        return t;
+      }
+    } catch { /* ignore */ }
+    // 夹带拼词先剥前缀再格式化：vdingtalk → dingtalk → DingTalk
     try {
       if (typeof NS.isHostShapedCompoundBrandToken === "function" && NS.isHostShapedCompoundBrandToken(t)) {
         const stripped = typeof NS.stripMarketingHostPrefixFromToken === "function"
@@ -2908,32 +4417,24 @@
           : "";
         if (stripped && stripped.length >= 4) t = stripped;
       } else if (typeof NS.stripMarketingHostPrefixFromToken === "function") {
-        // 页内写死 VdingTalk 而主机比对未命中时，仍剥已知短前缀
         const low0 = t.toLowerCase().replace(/[^a-z0-9]/g, "");
-        if (/^(?:v|x|z|aa|bb|cc|ca|im|ie|pr)[a-z]{5,}$/i.test(low0)) {
+        // 结构：短营销前缀 + 较长拉丁核（不写死具体品牌）
+        if (/^(?:v|x|z|aa|bb|cc|ca|im|ie|pr|ott|get|my)[a-z]{4,}$/i.test(low0)) {
           const stripped = NS.stripMarketingHostPrefixFromToken(low0);
-          if (stripped && stripped.length >= 5) t = stripped;
+          if (stripped && stripped.length >= 4) t = stripped;
         }
       }
     } catch { /* ignore */ }
-    // 已有内部大写（CrystalDiskMark / DeepSeek）保持；但 VdingTalk 已在上方剥前缀
-    if (/[A-Z]/.test(t.slice(1)) && /[a-z]/.test(t) && !/^[VxZ][a-z]{2,}(?:Talk|Desk|Soft)/.test(t)) return t;
-    if (/^[a-z0-9]+$/i.test(t) && t.length <= 24) {
-      // 常见驼峰：crystaldiskmark → CrystalDiskMark；todesk → ToDesk；dingtalk → DingTalk
-      const low = t.toLowerCase();
-      // 短品牌缩写在计票时统一存为小写，展示时恢复行业通用的大写形式。
-      if (/^[a-z]{2,3}$/.test(low)) return low.toUpperCase();
-      if (low.length >= 6 && /disk|mark|soft|desk|talk|safe|guard|music|cloud/i.test(low)) {
-        try {
-          const camel = low
-            .replace(/(disk|mark|soft|desk|talk|safe|guard|music|cloud|info|time|box)/gi, (m) => m.charAt(0).toUpperCase() + m.slice(1).toLowerCase())
-            .replace(/^[a-z]/, (c) => c.toUpperCase());
-          if (camel.length === low.length) return camel.charAt(0).toUpperCase() + camel.slice(1);
-        } catch { /* fall through */ }
+    // 已有内部大写（CrystalDiskMark / DeepSeek）保持；营销前缀粘连脏驼峰（VdingTalk）不保留
+    if (/[A-Z]/.test(t.slice(1)) && /[a-z]/.test(t)
+      && !/^[VxZ][a-z]{2,}[A-Z]/.test(t)
+      && !/^(?:Aa|Bb|Cc|Ca|Im|Ie|Pr|Ott|Get|My)[a-z]+[A-Z]/.test(t)) {
+      return t;
+    }
+    if (/^[a-z0-9]+$/i.test(t) && t.length <= 28) {
+      if (typeof NS.camelizeLatinBrandToken === "function") {
+        return NS.camelizeLatinBrandToken(t) || (t.charAt(0).toUpperCase() + t.slice(1).toLowerCase());
       }
-      // dingtalk 无 talk 分段时的专用驼峰
-      if (low === "dingtalk") return "DingTalk";
-      if (low === "todesk") return "ToDesk";
       return t.charAt(0).toUpperCase() + t.slice(1).toLowerCase();
     }
     return t;
@@ -2946,14 +4447,19 @@
     const footer = typeof NS.collectFooterCopyrightText === "function" ? NS.collectFooterCopyrightText() : "";
     const brandSource = `${title} ${headings} ${logo} ${footer}`;
     const tokens = new Set();
-    const latinBrands = brandSource.match(/\b[A-Z][a-zA-Z]{2,}(?:[A-Z][a-zA-Z]+)*\b/g) || [];
+    // 含 3 字母全大写核（WPS / QQ / VIP 需另挡）
+    const latinBrands = brandSource.match(/\b[A-Z]{2,8}\b|\b[A-Z][a-zA-Z]{2,}(?:[A-Z][a-zA-Z]+)*\b/g) || [];
     latinBrands.forEach((b) => {
       const low = b.toLowerCase();
-      if (low.length >= 4 && !/^(download|windows|linux|android|macos|official|client|software|remote|solution|copyright|rights|reserved)$/i.test(low)) tokens.add(low);
+      if (low.length >= 3 && !/^(download|windows|linux|android|macos|official|client|software|remote|solution|copyright|rights|reserved|vip|app|web|api|cdn|pdf|ssl|tls|http|html|com|net|org)$/i.test(low)) {
+        tokens.add(low);
+      }
     });
-    `${title} ${headings} ${footer}`.match(/[A-Za-z][a-zA-Z]{3,}/g)?.forEach((b) => {
+    `${title} ${headings} ${footer}`.match(/\b[A-Za-z]{3,}\b/g)?.forEach((b) => {
       const low = b.toLowerCase();
-      if (low.length >= 4 && !/^(download|windows|linux|android|macos|official|client|software|remote|solution|desktop|copyright|rights|reserved)$/i.test(low)) tokens.add(low);
+      if (low.length >= 3 && !/^(download|windows|linux|android|macos|official|client|software|remote|solution|desktop|copyright|rights|reserved|vip|app|web|api|cdn)$/i.test(low)) {
+        tokens.add(low);
+      }
     });
     (brandSource.match(/\d{3,4}/g) || []).forEach((d) => {
       if (d.length < 3) return;

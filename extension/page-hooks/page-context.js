@@ -117,6 +117,59 @@
     }
 
     /**
+     * 干净品牌根主机（dingtalk.com 首页/任意路径）。document_start 安全。
+     * 仅结构启发，不读品牌字典。
+     */
+    static looksLikeCleanOfficialBrandHostEarly() {
+      try {
+        const host = String(location.hostname || "").toLowerCase().replace(/^www\./, "");
+        if (!host || host.split(".").length < 2) return false;
+        const parts = host.split(".").filter(Boolean);
+        let label = parts[0] || "";
+        if (parts.length >= 3) {
+          const last = parts[parts.length - 1] || "";
+          const second = parts[parts.length - 2] || "";
+          if ((last === "cn" && /^(?:com|net|org|gov|edu|ac)$/i.test(second))
+            || (last.length === 2 && /^(com|net|org|co|ac|gov|edu)$/i.test(second))) {
+            label = parts[parts.length - 3] || label;
+          } else {
+            label = parts[parts.length - 2] || label;
+          }
+        } else if (parts.length === 2) {
+          label = parts[0] || "";
+        }
+        if (!label || label.length < 3 || label.length > 16) return false;
+        if (/[-_]/.test(label)) return false;
+        if (/\d{2,}/.test(label)) return false;
+        if (!/^[a-z][a-z0-9]*$/i.test(label)) return false;
+        if (parts.length >= 3) {
+          const sub = parts[0] || "";
+          if (/^(?:win|pc|download|down|dl|soft|vip|free|get|safe|official|cdn|static)$/i.test(sub)) return false;
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    /**
+     * 廉价：干净品牌根 + /download|/client 路径（dingtalk.com/download）。
+     */
+    static looksLikeCleanOfficialDownloadHostPathEarly() {
+      try {
+        if (!PageContext.looksLikeCleanOfficialBrandHostEarly()) return false;
+        const path = String(location.pathname || "").toLowerCase();
+        if (!/\/(download|downloads|client|app|apps|get|install)(\/|$|\.)/i.test(path)
+          && !/\/(pc|desktop|mobile)\/(download|client)/i.test(path)) {
+          return false;
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    /**
      * document_start 即可判定：应跳过重型 DOM 原型 wrap。
      * 仅 URL 形态 / 已有 head 信号，不读域名白名单。
      */
@@ -124,6 +177,9 @@
       try {
         if (PageContext.isSearchUrlShapeEarly()) return true;
         if (PageContext.isSearchUrlShapeOnly()) return true;
+        // 仅干净「/download」路径轻量；禁止把 huorongr 这类拼写仿冒当品牌正站 light
+        // （干净品牌根仅在 content 侧 ICP/WHOIS 证实后 enterIntelLightMode）
+        if (PageContext.looksLikeCleanOfficialDownloadHostPathEarly()) return true;
         // 标题已是仿冒下载壳 → 必须全量 hook
         if (/官网|官方下载|官方正版|官方客户端|立即免费下载/i.test(document.title || "")) return false;
         try {

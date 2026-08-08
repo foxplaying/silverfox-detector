@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "SilverFox Detector",
-  "version": "0.2.0",
-  "description": "Detect suspicious download landing pages via DOM heuristics and MAIN-world behavioral hooks.",
+  "name": "__MSG_extensionName__",
+  "version": "0.2.1",
+  "description": "__MSG_extensionDescription__",
+  "default_locale": "zh_CN",
   "permissions": [
     "storage",
     "tabs",
@@ -80,6 +81,7 @@
       "js": [
         "content/state.js",
         "content/package-heuristics.js",
+        "content/brand-domain-match.js",
         "content/brand-heuristics.js",
         "content/brand-correlation.js",
         "content/encrypted-spa.js",

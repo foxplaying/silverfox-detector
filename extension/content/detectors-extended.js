@@ -85,6 +85,8 @@
   NS.detectFakeOfficialDownloadSpa = function () {
     try {
       const state = NS.state;
+      // 纯 SPA noscript 挂载壳（You need to enable JavaScript…）不是仿冒下载站
+      if (typeof NS.pageLooksLikeBareJsAppShell === "function" && NS.pageLooksLikeBareJsAppShell()) return false;
       if (NS.looksLikeSelfConsistentOfficialSite()) return false;
       if (NS.looksLikeMatureOfficialPortal() && NS.countTransparentProductPackages(NS.getThreatScanHtml(60000)) >= 1) return false;
       const title = document.title || "";
@@ -347,7 +349,10 @@
       if (NS.pageLooksLikeSearchEngineResultsPage()) return false;
       if (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) return false;
       if (NS.looksLikeSelfConsistentOfficialSite() && NS.countTransparentProductPackages(NS.getThreatScanHtml(80000)) >= 1) return false;
-      const hasIcp = !!(state.icpInfo && String(state.icpInfo).trim() && !/未查询到|查询失败|暂无/.test(state.icpInfo));
+      const hasIcp = typeof NS.hasValidIcpRecord === "function"
+        ? NS.hasValidIcpRecord()
+        : !!(state.icpInfo && String(state.icpInfo).trim()
+          && !/未查询到|查询失败|查询未确认|暂无/.test(state.icpInfo));
       const icpHostOk = !state.icpMatchedHost || NS.intelHostIsValidAttribution(state.icpMatchedHost, location.hostname);
       const whoisOld = /已注册\s*(\d+)\s*天/.exec(state.whoisInfo || "");
       const days = whoisOld ? parseInt(whoisOld[1], 10) : null;
@@ -556,6 +561,14 @@
 
   NS.detectRemoteDownloadApiBinding = function () {
     const state = NS.state;
+    if (state._seoCloakKitDetected || state._desktopForceDlKit) return false;
+    // 正站不报远程绑定
+    try {
+      if (typeof NS.pageHasStrongTrustedIdentity === "function" && NS.pageHasStrongTrustedIdentity()) return false;
+      if (typeof NS.hasValidIcpRecord === "function" && NS.hasValidIcpRecord()
+        && typeof NS.hostLooksLikeOfficialProductSubdomain === "function"
+        && NS.hostLooksLikeOfficialProductSubdomain()) return false;
+    } catch { /* ignore */ }
     const html = NS.getHtmlSlice(80000);
     const scripts = Array.from(document.scripts).map((s) => s.textContent || "").join("\n").slice(0, 200000);
     const blob = `${html}\n${scripts}`;
@@ -563,27 +576,104 @@
       || /fetch\s*\(\s*['"]https?:\/\/[^'"]+(?:page-admin|download-api|getdown|getlink|download[_-]?api)[^'"]*['"]/i.test(blob)
       || /\.(?:get|post)\s*\(\s*['"][^'"]*api\.php/i.test(blob)
       || /axios\.[a-z]+\s*\(\s*['"][^'"]*(?:api\.php|getdown|getlink|download)[^'"]*['"]/i.test(blob);
-    const bindDownload = /download_link|downloadUrl|down_url|download_url|download_uri|windowsDownload|macDownload/i.test(blob)
-      && (/\.href\s*=/.test(blob) || /querySelectorAll\s*\([^)]*download/i.test(blob) || /getElementsByClassName\s*\([^)]*download/i.test(blob) || /downloadElements|initDownloadLinks/i.test(blob));
+    // 含 GLOBAL_DOWNLOAD_URL 模板（汽水仿冒多平台 button 共用一个全局链）
+    const globalDlBind = /GLOBAL_DOWNLOAD_URL|window\.GLOBAL_DOWNLOAD/i.test(blob)
+      && /location\.href\s*=\s*(?:window\.)?GLOBAL_DOWNLOAD_URL|GLOBAL_DOWNLOAD_URL\s*=\s*['"]https?:\/\//i.test(blob);
+    const bindDownload = globalDlBind || (/download_link|downloadUrl|down_url|download_url|download_uri|windowsDownload|macDownload/i.test(blob)
+      && (/\.href\s*=/.test(blob) || /location\.href\s*=/.test(blob)
+        || /querySelectorAll\s*\([^)]*download/i.test(blob)
+        || /getElementsByClassName\s*\([^)]*download/i.test(blob)
+        || /downloadElements|initDownloadLinks/i.test(blob)));
     let emptyHrefDlBtns = 0;
+    let multiPlatformHrefless = 0;
     try {
-      document.querySelectorAll("a, button, [role='button'], .download-btn, #mainDownloadBtn").forEach((el) => {
+      document.querySelectorAll("a, button, [role='button'], .download-btn, .btn-download, #mainDownloadBtn").forEach((el) => {
         const href = (el.getAttribute("href") || el.getAttribute("data-href") || "").trim();
         const text = (el.textContent || "").replace(/\s+/g, " ").trim();
-        if ((!href || href === "#") && (NS.DOWNLOAD_TEXT.test(text) || /download/i.test(el.className || "") || /download/i.test(el.id || ""))) emptyHrefDlBtns += 1;
+        const cls = String(el.className || "");
+        const hrefless = !href || href === "#" || /^javascript:/i.test(href);
+        const dlIntent = NS.DOWNLOAD_TEXT.test(text) || /download|btn-download/i.test(cls) || /download/i.test(el.id || "");
+        if (hrefless && dlIntent) emptyHrefDlBtns += 1;
+        if (hrefless && /Windows|macOS|Android|iOS|APK|Win\b/i.test(text)) multiPlatformHrefless += 1;
       });
     } catch { /* ignore */ }
-    const shellBind = emptyHrefDlBtns >= 1 && (/download_uri|api\.php|fetchDownloadLink|download_link|initDownloadLinks/i.test(blob) || bindDownload);
-    if ((apiFetch && bindDownload) || shellBind) {
+    const shellBind = emptyHrefDlBtns >= 1 && (
+      /download_uri|api\.php|fetchDownloadLink|download_link|initDownloadLinks|GLOBAL_DOWNLOAD_URL/i.test(blob)
+      || bindDownload
+    );
+    // 多平台无 href 按钮 + 全局下载变量：仿冒下载中心模板（优先 brand-spoof 话术）
+    const multiGlobalShell = multiPlatformHrefless >= 2 && globalDlBind && emptyHrefDlBtns >= 2;
+    if ((apiFetch && bindDownload) || shellBind || multiGlobalShell) {
+      let brandTok = "";
+      try {
+        if (typeof NS.resolveSpoofDisplayBrand === "function") brandTok = NS.resolveSpoofDisplayBrand() || "";
+        if (brandTok && typeof NS.canonicalizeBrandDisplayCandidate === "function") {
+          brandTok = NS.canonicalizeBrandDisplayCandidate(brandTok);
+        }
+      } catch { brandTok = ""; }
+      let domainMismatch = false;
+      try {
+        if (typeof NS.evaluateDomainKeywordRelevance === "function") {
+          const rel = NS.evaluateDomainKeywordRelevance();
+          domainMismatch = !!(rel && !rel.related && (rel.mismatch || rel.squat || rel.hostMatch === "none"
+            || rel.hostMatch === "padded" || rel.hostMatch === "typo"));
+        }
+      } catch { /* ignore */ }
+
       const reason = (apiFetch && bindDownload)
         ? "页面通过远程 api 动态写入下载按钮地址，常见于仿冒官网分发模板"
-        : `检测到 ${emptyHrefDlBtns} 个无直链下载按钮并含远程绑定脚本，疑似动态下发安装包`;
+        : multiGlobalShell
+          ? `检测到 ${emptyHrefDlBtns} 个多平台下载按钮共用 GLOBAL_DOWNLOAD_URL，无透明安装包直链`
+          : `检测到 ${emptyHrefDlBtns} 个无直链下载按钮并含远程绑定脚本，疑似动态下发安装包`;
       state.remoteDownloadDispatchDetected = true;
-      NS.addSignal("远程API动态绑定下载", 18, reason);
-      NS.installDownloadGuard(
-        (apiFetch && bindDownload) ? "检测到远程 API 动态绑定下载链接" : "下载按钮已绑定可疑远程地址",
-        { notify: true, message: (apiFetch && bindDownload) ? "远程动态下载地址" : "下载按钮已绑定可疑远程地址", forceNotify: true, lockHard: true }
-      );
+      // 品牌错配 + 多平台全局链 → 按仿冒官网报（禁止「中文」等弱词当展示名）
+      if (brandTok && typeof NS.isForbiddenSpoofDisplayBrand === "function"
+        && NS.isForbiddenSpoofDisplayBrand(brandTok)) {
+        brandTok = "";
+      }
+      if ((multiGlobalShell || shellBind) && brandTok && domainMismatch) {
+        try {
+          if (typeof NS.setSpoofDisplayBrand === "function") {
+            NS.setSpoofDisplayBrand(brandTok, { lockChinese: /[一-鿿]/.test(brandTok) });
+          } else {
+            state.spoofBrand = brandTok;
+          }
+          state._brandSpoofPortalDetected = true;
+        } catch { /* ignore */ }
+        const shown = String(state.spoofBrand || brandTok || "").trim();
+        if (shown && !(typeof NS.isForbiddenSpoofDisplayBrand === "function"
+          && NS.isForbiddenSpoofDisplayBrand(shown))) {
+          NS.addSignal("仿冒品牌官网下载站", 24,
+            `标题/正文品牌「${shown}」与域名 ${location.hostname} 不匹配；多平台下载按钮绑定全局远程地址`);
+          NS.installDownloadGuard(`仿冒品牌官网下载站（仿冒「${shown}」）`, {
+            notify: true,
+            message: `页面标题/正文品牌「${shown}」与当前域名不匹配，疑似仿冒官网。`,
+            title: `已识别仿冒「${shown}」官网`,
+            forceNotify: true,
+            guardKind: "brand-spoof",
+            lockHard: true
+          });
+        } else {
+          NS.addSignal(multiGlobalShell ? "多平台共用全局下载地址" : "远程API动态绑定下载", 18, reason);
+          NS.installDownloadGuard(
+            multiGlobalShell ? "多平台下载按钮共用全局远程地址" : "下载按钮已绑定可疑远程地址",
+            { notify: true, forceNotify: true, lockHard: true }
+          );
+        }
+      } else {
+        NS.addSignal(multiGlobalShell ? "多平台共用全局下载地址" : "远程API动态绑定下载", 18, reason);
+        NS.installDownloadGuard(
+          (apiFetch && bindDownload) ? "检测到远程 API 动态绑定下载链接"
+            : (multiGlobalShell ? "多平台下载按钮共用全局远程地址" : "下载按钮已绑定可疑远程地址"),
+          {
+            notify: true,
+            message: (apiFetch && bindDownload) ? "远程动态下载地址"
+              : (multiGlobalShell ? "多平台按钮无直链、共用全局下载地址" : "下载按钮已绑定可疑远程地址"),
+            forceNotify: true,
+            lockHard: true
+          }
+        );
+      }
       NS.disableAllDownloadIntentControls();
       return true;
     }
@@ -609,11 +699,19 @@
     try {
       const url = new URL(href, location.href);
       if (url.origin !== location.origin) return false;
-      const path = url.pathname || "/";
-      // download.html / install.html / get.php / down/ 等落地页
+      const path = (url.pathname || "/").toLowerCase();
+      // 注意：勿用裸 soft——会误匹配 /tools/（uptimepro、证书工具站）
+      // 路径段必须完整：download / install / client / soft（软件站）等
+      const dlSeg = /(?:^|\/)(?:download|downloads|down|dows|install|setup|landing|client|soft(?:ware)?|getapp|getsoft|dl)(?:\/|\.|$)/i;
+      if (dlSeg.test(path)) return true;
+      // download.html / install.php 等
       if (/\.(?:html?|php|asp|aspx|jsp)$/i.test(path)
-        && /(?:download|down|install|setup|landing|client|soft|get|dows|app)/i.test(path)) return true;
-      return /(?:download|down|dows|install|setup|landing|dl|redirect|clash|verge|client|soft|\d{3,}down|down\d{2,}|dl\d{2,}|app[_-][a-z0-9]{3,})(?:\.|\/|$)/i.test(path);
+        && /(?:^|\/|[-_])(?:download|down|install|setup|landing|client|soft(?:ware)?|dows|get)(?:[-_.]|$)/i.test(path)) {
+        return true;
+      }
+      // 数字+down / app_xxx 等仿冒落地形态
+      if (/(?:\d{3,}down|down\d{2,}|dl\d{2,}|app[_-][a-z0-9]{3,})(?:\.|\/|$)/i.test(path)) return true;
+      return false;
     } catch { return false; }
   };
 

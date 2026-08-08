@@ -1,0 +1,8 @@
+{
+  "extensionName": {
+    "message": "SilverFox Detector"
+  },
+  "extensionDescription": {
+    "message": "Detect suspicious download pages, spoofed websites, abnormal redirects, and installer risks."
+  }
+}

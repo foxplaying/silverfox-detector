@@ -18,6 +18,40 @@
     return;
   }
 
+  // 本机/局域网管理台（AdGuard Home、路由器等）：不装 Location/导航钩子，避免干扰 SPA
+  function isPrivateOrLocalHost() {
+    try {
+      const h = String(location.hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+      if (!h) return false;
+      if (h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "0.0.0.0") return true;
+      if (h.endsWith(".localhost") || h.endsWith(".local") || h.endsWith(".home.arpa")) return true;
+      if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+      if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+      if (/^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+      if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+      if (/^fe80:/i.test(h) || /^f[cd][0-9a-f]{0,2}:/i.test(h)) return true;
+      return false;
+    } catch { return false; }
+  }
+  if (isPrivateOrLocalHost()) {
+    window.__silverfoxNavBootInstalled = true;
+    window.__silverfoxPrivateLocalLight = true;
+    window.__silverfoxNavApi = {
+      setGuard() {},
+      setOfficialSafe() {},
+      setCloakingKit() {},
+      rememberHop() {},
+      clearHops() {},
+      setExtraPolicy() {},
+      tryBlock() { return false; },
+      hasGesture() { return true; },
+      isAuthSsoRedirectUrl() { return false; },
+      markGesture() {}
+    };
+    try { window.postMessage({ source: "silverfox-detector-hooks", type: "hooks-ready" }, "*"); } catch { /* ignore */ }
+    return;
+  }
+
   const { PackageClassifier, SsoDetector, PageShellDetector, CloakingKitScanner, GestureTracker, NavBlocker, LocationGuard } = NS;
 
   /** 向 content.js (isolated) 发消息。 */
@@ -121,9 +155,12 @@
 
   NS.NavBoot = NavBoot;
 
-  // 搜索页：no-op 轻路径；否则全量安装（大站 light 由 content 侧 soft-nav 结构逻辑负责，非域名名单）
+  // 搜索 / 干净正站下载路径：no-op 轻路径（不装 Location/套件 MO）
+  // 其余全量安装；大站 light 再由 content 侧 official-safe 拆钩
   const boot = new NavBoot();
-  if (PageShellDetector.isSearchUrlShapeEarly()) {
+  if (typeof PageShellDetector.shouldUseLightNavBootEarly === "function"
+    ? PageShellDetector.shouldUseLightNavBootEarly()
+    : PageShellDetector.isSearchUrlShapeEarly()) {
     boot.installSearchLight();
   } else {
     boot.install();

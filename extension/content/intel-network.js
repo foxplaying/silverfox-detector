@@ -6,8 +6,11 @@
   "use strict";
 
   const ICP_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+  // 聚合“无备案”只短期复用：避免每次刷新都重打三个来源，同时不给第三方滞后
+  // 结果造成长期钉死。任一备案号正缓存仍优先于该负缓存。
+  const ICP_MISS_CACHE_TTL_MS = 15 * 60 * 1000;
   const ICP_CACHE_KEY_PREFIX = "icp_cache_v4_";
-  const ICP_MISS_KEY_PREFIX = "icp_miss_v1_";
+  const ICP_MISS_KEY_PREFIX = "icp_miss_v2_";
   // 顺序：爱站 → beiancx → uapis（race 并行，任一命中备案号即返回）
   const ICP_CACHE_SOURCES = ["aizhan", "beiancx", "uapis"];
   const WHOIS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -17,13 +20,14 @@
   /**
    * 所有外部 HTTP(S) 经 background SW。content-script fetch 受 CORS 限制。
    * @param {string} url
-   * @param {{ method?: string, body?: string, contentType?: string, timeoutMs?: number, redirect?: string }} [opts]
+   * @param {{ method?: string, body?: string, contentType?: string, timeoutMs?: number,
+   *           redirect?: string, statusOnly404?: boolean }} [opts]
    */
   NS.fetchPageTextFromBackground = function (url, opts = {}) {
     return new Promise((resolve) => {
       try {
         if (!chrome?.runtime?.id) { resolve({ success: false, error: "no-extension-runtime" }); return; }
-        const payload = { type: "fetchPageText", url, method: opts.method || "GET", body: opts.body, contentType: opts.contentType, timeoutMs: opts.timeoutMs != null ? opts.timeoutMs : 5000, redirect: opts.redirect || "follow" };
+        const payload = { type: "fetchPageText", url, method: opts.method || "GET", body: opts.body, contentType: opts.contentType, timeoutMs: opts.timeoutMs != null ? opts.timeoutMs : 5000, redirect: opts.redirect || "follow", statusOnly404: opts.statusOnly404 === true };
         chrome.runtime.sendMessage(payload, (response) => {
           if (chrome.runtime.lastError || !response) { resolve({ success: false, error: chrome.runtime.lastError?.message || response?.error || "fetch-failed" }); return; }
           if (response.success !== true) { resolve({ success: false, error: response.error || "fetch-failed", status: response.status, url: response.url }); return; }
@@ -121,7 +125,8 @@
           for (const key of keys) {
             const entry = r && r[key];
             if (!entry || typeof entry !== "object" || !entry.ts) continue;
-            if (now - entry.ts > ICP_CACHE_TTL_MS) { expired.push(key); continue; }
+            const ttl = entry.missing === true ? ICP_MISS_CACHE_TTL_MS : ICP_CACHE_TTL_MS;
+            if (now - entry.ts > ttl) { expired.push(key); continue; }
             if (entry.missing === true) { map.set(key, { success: true, icpRecord: "", icpMissing: true, source: entry.source || "aggregate", fromCache: true, queriedHost: entry.queriedHost || "", hostMiss: true }); continue; }
             if (!entry.result) continue;
             map.set(key, { ...entry.result, fromCache: true });
@@ -174,13 +179,24 @@
     // 与 WHOIS 一致：保留 www 作为查询/缓存键
     const host = intelHost(domain);
     if (!host) return { success: false };
-    if (batchMap) { const hit = batchMap.get(icpCacheStorageKey(host, source)); if (hit && hit.success) return { ...hit, queriedHost: hit.queriedHost || host, fromCache: true }; }
-    else { const cached = await readIcpCache(host, source); if (cached && cached.success) return { ...cached, queriedHost: cached.queriedHost || host }; }
+    // 只复用「有备案号」的缓存；missing 缓存不短路，避免爱站误 miss 钉死真备案
+    if (batchMap) {
+      const hit = batchMap.get(icpCacheStorageKey(host, source));
+      if (hit && hit.success && hit.icpRecord && NS.looksLikeIcpLicense(hit.icpRecord)) {
+        return { ...hit, queriedHost: hit.queriedHost || host, fromCache: true };
+      }
+    } else {
+      const cached = await readIcpCache(host, source);
+      if (cached && cached.success && cached.icpRecord && NS.looksLikeIcpLicense(cached.icpRecord)) {
+        return { ...cached, queriedHost: cached.queriedHost || host };
+      }
+    }
     const result = await fetcher(host);
     if (result && result.success) {
       const hasLicense = !!(result.icpRecord && NS.looksLikeIcpLicense(result.icpRecord));
       const normalized = { ...result, source: result.source || source, icpRecord: hasLicense ? result.icpRecord : "", icpMissing: !hasLicense };
-      writeIcpCache(host, normalized);
+      // 仅缓存命中备案；单源 missing 不写 24h 负缓存（爱站对真备案常假 missing）
+      if (hasLicense) writeIcpCache(host, normalized);
       if (batchMap) batchMap.set(icpCacheStorageKey(host, source), { ...normalized, fromCache: false });
       return { ...normalized, queriedHost: result.queriedHost || host };
     }
@@ -212,16 +228,24 @@
     const m = String(text).match(/document\.write\s*\(\s*['"]([^'"]*)['"]\s*\)/i);
     if (!m) return { success: false };
     const value = (m[1] || "").trim();
-    const isMissingMsg = !value || /未找到|未查询|未备案|没有|无备案|暂无|查无|不存在|null|undefined|失败|错误/i.test(value) || !NS.looksLikeIcpLicense(value);
-    if (isMissingMsg) return { success: true, icpRecord: "", icpMissing: true, source: "aizhan" };
-    return { success: true, icpRecord: value, icpMissing: false, source: "aizhan" };
+    // 严格三态：明确“无记录”才写 missing；失败/未知文本不能伪装成无备案。
+    if (!value || /未找到(?:备案)?信息|未查询到备案|未备案|没有备案|无备案|暂无备案|查无备案|不存在(?:备案)?|null|undefined/i.test(value)) {
+      return { success: true, icpRecord: "", icpMissing: true, source: "aizhan" };
+    }
+    if (/查询失败|信息查询失败|请求失败|服务异常|错误|error|fail/i.test(value)) {
+      return { success: false, source: "aizhan" };
+    }
+    if (NS.looksLikeIcpLicense(value)) {
+      return { success: true, icpRecord: value, icpMissing: false, source: "aizhan" };
+    }
+    return { success: false, source: "aizhan" };
   }
 
-  // 爱站/uapis 轻量接口；beiancx 整页 HTML 更慢，超时更短以免拖死 race
-  const ICP_FAST_TIMEOUT_MS = 2500;
-  const ICP_BEIANCX_TIMEOUT_MS = 2800;
-  // 任一源已给出明确 missing 后，再给其它源抢备案号的宽限
-  const ICP_RACE_MISSING_GRACE_MS = 500;
+  // 爱站/uapis 轻量接口；beiancx 整页 HTML 更慢
+  const ICP_FAST_TIMEOUT_MS = 2000;
+  // beiancx 对不存在的裸域偶尔连响应头都不返回；3.2 秒即结束该源，
+  // 其它源仍完整执行，避免一个挂起连接拖慢整轮。
+  const ICP_BEIANCX_TIMEOUT_MS = 2200;
 
   /**
    * 解析 uapis.cn ICP JSON，区分三类结局：
@@ -248,29 +272,31 @@
     const natureName = isIcpPlaceholderField(natureRaw) ? "" : natureRaw;
     const base = { source: "uapis", unitName, natureName, domain };
 
-    // ① 明确无备案
-    if (code === "NOT_FOUND" || code === "404"
-      || /no\s*icp\s*record|not\s*found|no\s*record|未备案|无备案|查无|不存在/i.test(msg)) {
-      return { ...base, success: true, icpRecord: "", icpMissing: true, unitName: "", natureName: "" };
-    }
-
-    // ② 查询失败 / 参数错误（含 code=200 但字段全是「查询失败」的假成功）
-    if (code === "INVALID_PARAMETER" || code === "ERROR" || code === "FAIL"
-      || /信息查询失败|invalid\s*parameter|参数错误/i.test(msg)
-      || isIcpPlaceholderField(licenseRaw)
-      || /查询失败/.test(licenseRaw)) {
-      return { ...base, success: false };
-    }
-
-    // ③ 真实命中
-    if ((code === "200" || code === "0" || code === "OK" || code === "SUCCESS")
-      && NS.looksLikeIcpLicense(licenseRaw)) {
+    // ① 真实命中优先（含 msg=query success / 查询成功；勿被其它分支误伤）
+    // 实测 ssusu.com: {"code":"200","serviceLicence":"湘ICP备2024068964号","msg":"query success"}
+    if (NS.looksLikeIcpLicense(licenseRaw)
+      && (code === "200" || code === "0" || code === "OK" || code === "SUCCESS" || code === ""
+        || /query\s*success|查询成功|success/i.test(msg))) {
       return {
         ...base,
         success: true,
         icpRecord: licenseRaw,
         icpMissing: false
       };
+    }
+
+    // ② 明确无备案
+    if (code === "NOT_FOUND" || code === "404"
+      || /no\s*icp\s*record|not\s*found|no\s*record|未备案|无备案|查无|不存在/i.test(msg)) {
+      return { ...base, success: true, icpRecord: "", icpMissing: true, unitName: "", natureName: "" };
+    }
+
+    // ③ 查询失败 / 参数错误（含 code=200 但字段全是「查询失败」的假成功）
+    if (code === "INVALID_PARAMETER" || code === "ERROR" || code === "FAIL"
+      || /信息查询失败|invalid\s*parameter|参数错误/i.test(msg)
+      || isIcpPlaceholderField(licenseRaw)
+      || /查询失败/.test(licenseRaw)) {
+      return { ...base, success: false };
     }
 
     // 其它 code / 空结果 → 失败，不写 missing 缓存
@@ -350,7 +376,12 @@
   async function queryIcpBeiancx(domain, batchMap) {
     return withIcpCache(domain, "beiancx", async (h) => {
       const url = `https://beiancx.com/${encodeURIComponent(h)}.html`;
-      const result = await NS.fetchPageTextFromBackground(url, { timeoutMs: ICP_BEIANCX_TIMEOUT_MS });
+      // beiancx 的 nginx 404 偶尔不结束响应体；状态码已足够判定 missing，
+      // 不应继续等 response.text() 直到超时。
+      const result = await NS.fetchPageTextFromBackground(url, {
+        timeoutMs: ICP_BEIANCX_TIMEOUT_MS,
+        statusOnly404: true
+      });
       const st = Number(result && result.status) || 0;
       if (!result.success) {
         if (st === 404 || /404|not\s*found/i.test(String(result.error || ""))) {
@@ -363,46 +394,33 @@
   }
 
   /**
-   * 并行 race：任一源返回备案号立刻结束；
-   * 若已有明确 missing，最多再等 ICP_RACE_MISSING_GRACE_MS 抢备案号，避免 beiancx 拖满 5s。
+   * 同一 host 的备案源全部并行、全部完成后再汇总。
+   * 不用单源 missing 提前展示；也不再用额外 grace timer 硬等。
    */
-  function raceIcpLicense(promises) {
-    return new Promise((resolve) => {
-      const list = promises.filter(Boolean);
-      if (!list.length) { resolve(null); return; }
-      let pending = list.length;
-      let lastOk = null;
-      let settled = false;
-      let graceTimer = null;
-      const finish = (r) => {
-        if (settled) return;
-        settled = true;
-        if (graceTimer) { try { clearTimeout(graceTimer); } catch { /* ignore */ } graceTimer = null; }
-        resolve(r);
+  async function raceIcpLicense(promises) {
+    const list = promises.filter(Boolean);
+    if (!list.length) return null;
+    const results = await Promise.all(list.map((p) =>
+      Promise.resolve(p).catch(() => null)
+    ));
+    const licenseHit = results.find((r) =>
+      r && r.success && r.icpRecord && NS.looksLikeIcpLicense(r.icpRecord)
+    );
+    if (licenseHit) return { ...licenseHit, icpMissing: false };
+    const missing = results.filter((r) => r && r.success && r.icpMissing);
+    if (missing.length) {
+      const preferred = missing.find((r) => String(r.source || "").toLowerCase() === "uapis")
+        || missing.find((r) => String(r.source || "").toLowerCase() === "beiancx")
+        || missing[0];
+      return {
+        ...preferred,
+        success: true,
+        icpRecord: "",
+        icpMissing: true,
+        missingSources: missing.map((r) => String(r.source || "")).filter(Boolean)
       };
-      for (const p of list) {
-        Promise.resolve(p).then((r) => {
-          if (settled) return;
-          if (r && r.success && r.icpRecord && NS.looksLikeIcpLicense(r.icpRecord)) {
-            finish({ ...r, icpMissing: false });
-            return;
-          }
-          if (r && r.success) {
-            lastOk = r;
-            // 明确未备案：启动短宽限，不再死等最慢源
-            if (r.icpMissing && !graceTimer) {
-              graceTimer = setTimeout(() => { finish(lastOk); }, ICP_RACE_MISSING_GRACE_MS);
-            }
-          }
-          pending -= 1;
-          if (pending <= 0) finish(lastOk);
-        }).catch(() => {
-          if (settled) return;
-          pending -= 1;
-          if (pending <= 0) finish(lastOk);
-        });
-      }
-    });
+    }
+    return null; // 全失败，不当 missing
   }
 
   /**
@@ -436,67 +454,101 @@
     const t0 = Date.now();
     const candidates = buildIcpQueryCandidates(domain);
     if (!candidates.length) {
-      writeIcpMissingCache(pageHost, { source: "no-candidates", triedHosts: [] });
-      return { success: true, icpRecord: "", icpMissing: true, queriedHost: pageHost, triedHosts: [], fromCache: false };
+      return { success: false, icpRecord: "", icpMissing: false, queriedHost: pageHost, triedHosts: [] };
     }
     const batchMap = await readIcpCacheBatch(candidates);
+    // 有备案号缓存 → 直接用；聚合 miss 稍后在所有候选备案号缓存复核后短路。
     const pageStatus = statusFromIcpBatchMap(pageHost, batchMap);
-    if (pageStatus && pageStatus.kind === "missing") {
-      NS.silverfoxLog("intel-icp", "cache-miss-hit", pageHost, "ms=", Date.now() - t0);
-      return { ...pageStatus.data, icpMissing: true, matchedHost: pageHost, queriedHost: pageHost, triedHosts: candidates, fromCache: true };
-    }
     if (pageStatus && pageStatus.kind === "license") {
       NS.silverfoxLog("intel-icp", "cache-license-hit", pageHost, "ms=", Date.now() - t0);
       return { ...pageStatus.data, icpMissing: false, matchedHost: pageHost, queriedHost: pageHost };
     }
     let lastSource = "unknown";
     let sawDefinitiveMissing = false;
-    // 最多查 2 个候选（当前 + apex），避免串行 race 叠满
+    let sawPartialMissing = false;
+    const partialMissingSources = new Set();
     const toTry = candidates.slice(0, 2);
-    for (const host of toTry) {
-      if (!NS.intelHostIsValidAttribution(host, pageHost) && host !== pageHost) continue;
-      const cached = statusFromIcpBatchMap(host, batchMap);
-      if (cached && cached.kind === "license") {
-        const matched = cached.data.matchedHost || host;
-        if (NS.intelHostIsValidAttribution(matched, pageHost) || matched === host) {
-          clearIcpMissingCache(pageHost);
-          NS.silverfoxLog("intel-icp", "host-cache-license", host, "ms=", Date.now() - t0);
-          return { ...cached.data, icpMissing: false, matchedHost: host, queriedHost: host };
-        }
-      }
-      if (cached && cached.kind === "missing") {
-        sawDefinitiveMissing = true;
-        lastSource = cached.data.source || lastSource;
-        continue;
-      }
-      NS.silverfoxLog("intel-icp", "race-start", host);
-      // aizhan / uapis 快路径 + beiancx 并行；备案号先到先用
-      const winner = await raceIcpLicense([
-        queryIcpAizhan(host, batchMap),
-        queryIcpUapis(host, batchMap),
-        queryIcpBeiancx(host, batchMap)
-      ]);
-      if (winner && winner.source) lastSource = winner.source;
-      if (winner && winner.icpRecord && NS.looksLikeIcpLicense(winner.icpRecord)) {
-        const claimed = NS.normalizeDomain(winner.domain || "");
-        if (claimed && claimed !== host && !NS.intelHostIsValidAttribution(claimed, pageHost)) continue;
-        clearIcpMissingCache(pageHost); clearIcpMissingCache(host);
-        NS.silverfoxLog("intel-icp", "license", host, winner.source, "ms=", Date.now() - t0);
-        return { ...winner, icpMissing: false, matchedHost: host, queriedHost: winner.queriedHost || host };
-      }
-      if (winner && winner.success) {
-        sawDefinitiveMissing = true;
-        writeIcpMissingCache(host, { source: winner.source || lastSource, triedHosts: [host] });
-        // 当前主机已明确 missing 则不必再拖第二个候选满 race（apex 缓存 miss 再试一次即可）
-        if (host === pageHost || host === pageHost.replace(/^www\./i, "")) {
-          /* continue to apex once */
-        }
+    const validHosts = toTry.filter((host) =>
+      host === pageHost || NS.intelHostIsValidAttribution(host, pageHost)
+    );
+    // 先扫所有候选的备案号缓存。
+    for (const host of validHosts) {
+      for (const src of ICP_CACHE_SOURCES) {
+        try {
+          const hit = batchMap && batchMap.get(icpCacheStorageKey(host, src));
+          if (hit && hit.success && hit.icpRecord && NS.looksLikeIcpLicense(hit.icpRecord)) {
+            clearIcpMissingCache(pageHost); clearIcpMissingCache(host);
+            NS.silverfoxLog("intel-icp", "host-cache-license", host, src, "ms=", Date.now() - t0);
+            return { ...hit, icpMissing: false, matchedHost: host, queriedHost: host, source: src };
+          }
+        } catch { /* ignore */ }
       }
     }
+    // 聚合负缓存是在上一轮所有 host/来源完成且没有备案号后写入；只短期复用。
+    // 必须放在候选备案号正缓存之后，避免 pageHost miss 掩盖 apex 的备案命中。
+    if (pageStatus && pageStatus.kind === "missing") {
+      NS.silverfoxLog("intel-icp", "cache-missing-hit", pageHost, "ms=", Date.now() - t0);
+      return {
+        ...pageStatus.data,
+        success: true,
+        icpRecord: "",
+        icpMissing: true,
+        matchedHost: pageHost,
+        queriedHost: pageHost,
+        triedHosts: toTry,
+        fromCache: true
+      };
+    }
+    // www 与裸域并行；每个 host 内的三个来源也并行。总耗时由最慢单源决定，
+    // 不再是 host1 完整等待后才开始 host2。
+    const hostResults = await Promise.all(validHosts.map(async (host) => {
+      NS.silverfoxLog("intel-icp", "all-sources-start", host);
+      const winner = await raceIcpLicense([
+        queryIcpUapis(host, batchMap),
+        queryIcpBeiancx(host, batchMap),
+        queryIcpAizhan(host, batchMap)
+      ]);
+      return { host, winner };
+    }));
+    // 所有查询完成后，备案号优先于任何 missing。
+    for (const { host, winner } of hostResults) {
+      if (!(winner && winner.icpRecord && NS.looksLikeIcpLicense(winner.icpRecord))) continue;
+      const claimed = NS.normalizeDomain(winner.domain || "");
+      if (claimed && claimed !== host && !NS.intelHostIsValidAttribution(claimed, pageHost)) continue;
+      clearIcpMissingCache(pageHost); clearIcpMissingCache(host);
+      NS.silverfoxLog("intel-icp", "license", host, winner.source, "ms=", Date.now() - t0);
+      return { ...winner, icpMissing: false, matchedHost: host, queriedHost: winner.queriedHost || host };
+    }
+    for (const { winner } of hostResults) {
+      if (!(winner && winner.success && winner.icpMissing)) continue;
+      const sources = Array.isArray(winner.missingSources) ? winner.missingSources : [winner.source];
+      sawPartialMissing = true;
+      sources.forEach((s) => { if (s) partialMissingSources.add(String(s)); });
+      // 三个解析器都已严格区分“明确无记录”和“查询失败”。
+      if (sources.some((s) => /^(?:uapis|beiancx|aizhan)$/i.test(String(s || "")))) {
+        sawDefinitiveMissing = true;
+      }
+      lastSource = winner.source || lastSource;
+    }
     if (sawDefinitiveMissing) {
+      // 仅严格解析出的明确 missing 才写负缓存；源失败不会进入这里。
       writeIcpMissingCache(pageHost, { source: lastSource, triedHosts: toTry });
       NS.silverfoxLog("intel-icp", "missing", pageHost, "ms=", Date.now() - t0);
       return { success: true, icpRecord: "", icpMissing: true, queriedHost: pageHost, triedHosts: toTry, source: lastSource, fromCache: false };
+    }
+    if (sawPartialMissing) {
+      NS.silverfoxLog("intel-icp", "partial-missing", pageHost,
+        Array.from(partialMissingSources).join(",") || "unknown", "ms=", Date.now() - t0);
+      return {
+        success: false,
+        icpRecord: "",
+        icpMissing: false,
+        partialMissing: true,
+        missingSources: Array.from(partialMissingSources),
+        queriedHost: pageHost,
+        triedHosts: toTry,
+        source: lastSource
+      };
     }
     NS.silverfoxLog("intel-icp", "fail", pageHost, "ms=", Date.now() - t0);
     return { success: false, icpRecord: "", icpMissing: false, queriedHost: pageHost, triedHosts: toTry, source: lastSource };

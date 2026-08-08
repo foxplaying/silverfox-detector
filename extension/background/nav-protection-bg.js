@@ -81,39 +81,61 @@
 
   NS.clearTabRiskStorage = function (tabId, newUrl) {
     if (tabId == null || tabId < 0) return;
+    // 同步失效报告合并内存及尚未返回的 storage.get，避免清理后旧 OV/DV 回调重新落盘。
+    if (NS._riskReportSeqByTab instanceof Map) {
+      NS._riskReportSeqByTab.set(tabId, (NS._riskReportSeqByTab.get(tabId) || 0) + 1);
+    }
+    if (NS._lastRiskReportByTab instanceof Map) NS._lastRiskReportByTab.delete(tabId);
     NS.withExistingTab(tabId, () => {
       try {
         chrome.action.setBadgeText({ tabId, text: "" }, () => { void chrome.runtime.lastError; });
         chrome.action.setTitle({ tabId, title: "Threat Detector" }, () => { void chrome.runtime.lastError; });
       } catch { /* ignore */ }
     });
+    const vtTabKey = `latestExeVt_${tabId}`;
     chrome.storage.local.remove([`risk_${tabId}`], () => { void chrome.runtime.lastError; });
-    chrome.storage.local.get(["latestNotice", "risk_latest", "latestExeVt"], (r) => {
+    chrome.storage.local.get(["latestNotice", "risk_latest", "latestExeVt", vtTabKey], (r) => {
       const toRemove = [];
       if (r.latestNotice && r.latestNotice.tabId === tabId) toRemove.push("latestNotice");
       if (r.risk_latest && r.risk_latest.tabId === tabId) toRemove.push("risk_latest");
-      // 换站才清文件检测（同站 SPA 路径变化保留）；避免粘到其它域名
+      const hostOf = (u) => {
+        try { return new URL(u || "").hostname.toLowerCase().replace(/^www\./, ""); } catch { return ""; }
+      };
+      const newHost = hostOf(newUrl);
+      const shouldDropVt = (vt) => {
+        if (!vt || typeof vt !== "object") return false;
+        // 仅处理本 tab 或未标 tab 的全局粘连
+        if (vt.tabId != null && Number(vt.tabId) !== Number(tabId)) return false;
+        // 检测进行中且仍属同一下载来源主机：保留（避免误杀进行中的分析）
+        const atHost = String(vt.pageHost || "").toLowerCase().replace(/^www\./, "") || hostOf(vt.pageUrl);
+        const inFlight = (vt.status === "checking" || vt.status === "uploading")
+          && (Date.now() - (Number(vt.timestamp) || 0) < 120000);
+        if (inFlight && newHost && atHost && newHost === atHost) return false;
+        // 换站 / 无来源主机：清掉，避免源标签页 VT 粘到新域名
+        if (!newHost || !atHost || newHost !== atHost) return true;
+        return false;
+      };
       try {
-        const vt = r.latestExeVt;
-        // 检测进行中不要清（换页/开 VT 后台页会误杀「正在 VT 检测」）
-        if (vt && (vt.status === "checking" || vt.status === "uploading")
-          && (Date.now() - (Number(vt.timestamp) || 0) < 120000)) {
-          /* keep */
-        } else if (vt && (vt.tabId === tabId || vt.tabId == null)) {
-          const hostOf = (u) => {
-            try { return new URL(u || "").hostname.toLowerCase().replace(/^www\./, ""); } catch { return ""; }
-          };
-          const newHost = hostOf(newUrl);
-          const atHost = String(vt.pageHost || "").toLowerCase().replace(/^www\./, "") || hostOf(vt.pageUrl);
-          if (!newHost || !atHost || newHost !== atHost) toRemove.push("latestExeVt");
-        }
+        if (shouldDropVt(r.latestExeVt)) toRemove.push("latestExeVt");
+        if (shouldDropVt(r[vtTabKey])) toRemove.push(vtTabKey);
       } catch {
-        if (r.latestExeVt && r.latestExeVt.tabId === tabId
-          && r.latestExeVt.status !== "checking" && r.latestExeVt.status !== "uploading") {
-          toRemove.push("latestExeVt");
-        }
+        toRemove.push("latestExeVt", vtTabKey);
       }
-      if (toRemove.length) chrome.storage.local.remove(toRemove, () => { void chrome.runtime.lastError; });
+      // 同步清内存，避免迟到的 write 又把旧结果写回 storage
+      try {
+        if (typeof NS.clearLatestExeVtIfStaleForTab === "function") {
+          NS.clearLatestExeVtIfStaleForTab(tabId, newUrl);
+        } else if (NS._latestExeVtMem) {
+          const m = NS._latestExeVtMem;
+          if (m.tabId == null || Number(m.tabId) === Number(tabId)) {
+            const mh = String(m.pageHost || "").toLowerCase().replace(/^www\./, "") || hostOf(m.pageUrl);
+            if (!newHost || !mh || newHost !== mh) NS._latestExeVtMem = null;
+          }
+        }
+      } catch { /* ignore */ }
+      if (toRemove.length) {
+        chrome.storage.local.remove([...new Set(toRemove)], () => { void chrome.runtime.lastError; });
+      }
     });
   };
 
@@ -233,25 +255,21 @@
   };
 
   /**
-   * 全局：把被动子资源 http→https（image/css/font/media）。
-   * 减轻 HTTPS 页 Mixed Content 自动升级噪音；不碰 main_frame / script / xhr。
-   * 规则 id 100–119，与会话导航阻断 500000+ 不冲突。
+   * 曾用全局 DNR upgradeScheme 把 image/css/font/media 的 http→https。
+   * 问题：规则无「仅当主文档是 HTTPS」条件，会误伤纯 HTTP 页
+   *（AdGuard Home / 路由器管理台 http://192.168.x.x 的 CSS 被升成 https 后加载失败）。
+   * script/main_frame 本就不在规则内，但 stylesheet 升 HTTPS 已足以弄坏局域网 SPA。
+   *
+   * Chrome 在 HTTPS 页已自动升级混合内容；页内 mixed-content-quiet 仅在 https: 文档生效。
+   * 此处只负责清掉历史动态规则，不再安装全局 upgradeScheme。
    */
   NS.ensureMixedContentUpgradeDnr = function () {
     if (!chrome.declarativeNetRequest || !chrome.declarativeNetRequest.updateDynamicRules) return;
-    const RULE_ID = 101;
+    const RULE_IDS = [100, 101, 102, 103];
     try {
       chrome.declarativeNetRequest.updateDynamicRules({
-        removeRuleIds: [RULE_ID],
-        addRules: [{
-          id: RULE_ID,
-          priority: 1,
-          action: { type: "upgradeScheme" },
-          condition: {
-            urlFilter: "|http://",
-            resourceTypes: ["image", "stylesheet", "font", "media", "object"]
-          }
-        }]
+        removeRuleIds: RULE_IDS,
+        addRules: []
       }, () => { void chrome.runtime.lastError; });
     } catch { /* ignore */ }
   };

@@ -128,7 +128,10 @@
       if (!m) return false;
       const head = m[1] || "";
       if (/^(?:app|soft|proxy|intsoft|down|dl|file|pkg|client|setup|install|installer)$/i.test(head)) return false;
-      if (!/[a-zA-Z一-鿿]{4,}/.test(head)) return false;
+      // 短品牌缩写必须保留原始全大写形态；普通短词仍不放行。
+      const shortUpperBrand = /^[A-Z]{3}$/.test(head)
+        && !/^(?:APP|DLL|EXE|GET|MSI|NEW|PRO|RUN|SDK|TMP|VIP|WEB|WIN|ZIP)$/.test(head);
+      if (!shortUpperBrand && !/[a-zA-Z一-鿿]{4,}/.test(head)) return false;
       if (PackageHeuristics.hasGarbleDigitLetterSoup(head)) return false;
       return true;
     }
