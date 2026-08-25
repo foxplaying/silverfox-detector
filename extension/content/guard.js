@@ -6,17 +6,85 @@
 
   const { PACKAGE_EXT, PACKAGE_NAME } = NS;
 
-  NS.dismissPageToast = function () {
+  function normalizeBrandFinalSnapshot(raw) {
+    try {
+      if (!raw || raw.final !== true) return null;
+      const out = {
+        final: true,
+        brand: String(raw.brand || "").trim(),
+        url: String(raw.url || ""),
+        analysisTxn: String(raw.analysisTxn || ""),
+        analysisTxnStartedAt: Number(raw.analysisTxnStartedAt) || 0,
+        decisionGeneration: Number(raw.decisionGeneration) || 0,
+        identityRevision: Number(raw.identityRevision) || 0,
+        pinyinRequestSequence: Number(raw.pinyinRequestSequence) || 0,
+        pinyinFingerprint: String(raw.pinyinFingerprint || "").slice(0, 1000),
+        noticeSequence: Number(raw.noticeSequence) || 0,
+        issuedAt: Number(raw.issuedAt) || 0
+      };
+      if (!out.brand || !out.url || !out.analysisTxn || out.noticeSequence < 1) return null;
+      return out;
+    } catch { return null; }
+  }
+
+  NS.brandFinalSnapshotVersion = function (raw) {
+    const s = normalizeBrandFinalSnapshot(raw);
+    if (!s) return "";
+    return [s.analysisTxn, s.identityRevision, s.decisionGeneration,
+      s.pinyinRequestSequence, s.noticeSequence].join(":");
+  };
+
+  NS.getCurrentBrandSpoofFinalSnapshot = function (candidate) {
+    try {
+      const state = NS.state || {};
+      const s = normalizeBrandFinalSnapshot(candidate || state._brandSpoofFinalSnapshot);
+      if (!s || s.url !== String(location.href || "")) return null;
+      if (s.analysisTxn !== String(state._analysisTxn || "")) return null;
+      if (s.decisionGeneration !== Number(state._brandSpoofDecisionGeneration || 0)) return null;
+      if (s.identityRevision !== Number(state._brandElectionIdentityRevision || 0)) return null;
+      if (s.brand !== String(state.spoofBrand || "").trim()) return null;
+      if (state._brandSpoofFinalPresented !== true) return null;
+      return s;
+    } catch { return null; }
+  };
+
+  NS.invalidateBrandSpoofNoticeSnapshot = function (candidate, reason = "brand-identity-changed") {
+    try {
+      const snapshot = normalizeBrandFinalSnapshot(candidate || (NS.state && NS.state._brandSpoofFinalSnapshot));
+      if (!snapshot) return false;
+      try { NS.dismissPageToast("brand-spoof"); } catch { /* ignore */ }
+      if (chrome?.runtime?.id) {
+        chrome.runtime.sendMessage({
+          type: "clear-brand-spoof-notice",
+          url: snapshot.url,
+          analysisTxn: snapshot.analysisTxn,
+          analysisTxnStartedAt: snapshot.analysisTxnStartedAt || Date.now(),
+          brandSnapshot: snapshot,
+          reason: String(reason || "brand-identity-changed").slice(0, 80)
+        }, () => { void chrome.runtime.lastError; });
+      }
+      return true;
+    } catch { return false; }
+  };
+
+  NS.dismissPageToast = function (guardKind = "") {
     try {
       const box = document.getElementById("silverfox-threat-toast");
+      if (box && guardKind
+        && String(box.dataset && box.dataset.silverfoxGuardKind || "") !== String(guardKind)) return false;
       if (box) { try { clearTimeout(box.__silverfoxHideTimer); } catch { /* ignore */ } box.remove(); }
       NS.caches.pageToastLastAt.clear();
       try { NS.caches.sentNoticeKeys.clear(); NS.caches.sentNoticeLastAt.clear(); } catch { /* ignore */ }
+      return true;
     } catch { /* ignore */ }
+    return false;
   };
 
   NS.showPageToast = function (title, message, opts = {}) {
     try {
+      const brandSnapshot = opts.guardKind === "brand-spoof" || opts.brandSnapshot
+        ? NS.getCurrentBrandSpoofFinalSnapshot(opts.brandSnapshot) : null;
+      if ((opts.guardKind === "brand-spoof" || opts.brandSnapshot) && !brandSnapshot) return false;
       // 子 frame 的 fixed Toast 可能落在隐藏/极小 iframe；经后台安全转发到顶层 frame。
       try {
         if (typeof NS.isTopFrame === "function" && !NS.isTopFrame() && chrome?.runtime?.id) {
@@ -24,9 +92,14 @@
             type: "relay-page-threat-toast",
             title: String(title || "已拦截可疑下载文件"),
             message: String(message || "可疑下载已被拦截"),
-            force: opts.force !== false
+            force: opts.force !== false,
+            guardKind: String(opts.guardKind || ""),
+            url: String(location.href || ""),
+            analysisTxn: String(NS.state && NS.state._analysisTxn || ""),
+            analysisTxnStartedAt: Number(NS.state && NS.state._analysisTxnStartedAt) || Date.now(),
+            brandSnapshot
           }, () => { void chrome.runtime.lastError; });
-          return;
+          return true;
         }
       } catch { /* fallback to local frame */ }
       const c = NS.caches;
@@ -50,6 +123,9 @@
         });
         document.documentElement.appendChild(box);
       }
+      box.dataset.silverfoxGuardKind = String(opts.guardKind || "");
+      box.dataset.silverfoxBrandVersion = brandSnapshot
+        ? NS.brandFinalSnapshotVersion(brandSnapshot) : "";
       box.style.opacity = "0";
       box.textContent = "";
       // 与扩展本地图标同步（48px），避免 emoji/手绘图标不一致
@@ -73,15 +149,25 @@
         try { box.style.opacity = "0"; setTimeout(() => { try { box.remove(); } catch { /* ignore */ } }, 220); }
         catch { try { box.remove(); } catch { /* ignore */ } }
       }, 6500);
+      return true;
     } catch { /* ignore */ }
+    return false;
   };
 
   NS.showGuardOverlay = function (href, opts = {}) {
     const state = NS.state;
     const targetLabel = NS.formatPackageLabel(href);
-    const title = opts.title || "已拦截可疑下载文件";
-    const message = opts.message || targetLabel;
+    const brandSnapshot = opts.guardKind === "brand-spoof"
+      ? NS.getCurrentBrandSpoofFinalSnapshot(opts.brandSnapshot) : null;
+    if (opts.guardKind === "brand-spoof" && !brandSnapshot) return false;
+    let title = opts.title || "已拦截可疑下载文件";
+    let message = opts.message || targetLabel;
+    if (brandSnapshot) {
+      title = `已识别仿冒「${brandSnapshot.brand}」官网`;
+      message = `页面标题/正文品牌「${brandSnapshot.brand}」与当前域名不匹配，疑似仿冒官网。`;
+    }
     const key = `${title}::${message}`;
+    const brandNoticeVersion = brandSnapshot ? NS.brandFinalSnapshotVersion(brandSnapshot) : "";
     const explicitUserAction = !!opts.userAction;
     const notifyRequested = explicitUserAction || !!opts.forceNotify;
     const isIdentityNotice = opts.guardKind === "brand-spoof" || opts.guardKind === "nav-trap" || /仿冒|官网|域名|跳转|搜索引擎/i.test(`${title} ${message}`);
@@ -102,7 +188,8 @@
     const lastSys = c.sentNoticeLastAt.get(key) || 0;
     const sameIdentityNotice = isIdentityNotice
       && state._lastGuardNoticeKind === (opts.guardKind || "")
-      && state._lastGuardNoticeKey === key;
+      && state._lastGuardNoticeKey === key
+      && (!brandNoticeVersion || state._lastGuardNoticeVersion === brandNoticeVersion);
     // brand-spoof 可覆盖 site-identity；拉丁→中文可升格；中文锁定后禁止再发拉丁版
     const titleMsg = `${title} ${message}`;
     const isLatinBrandNotice = opts.guardKind === "brand-spoof"
@@ -133,9 +220,12 @@
         title,
         message,
         url: location.href,
+        analysisTxn: state._analysisTxn || "",
+        analysisTxnStartedAt: Number(state._analysisTxnStartedAt) || now,
         timestamp: now,
         force: !!(notifyRequested || isIdentityNotice || brandUpgradeOverIdentity),
-        guardKind: opts.guardKind || ""
+        guardKind: opts.guardKind || "",
+        brandSnapshot
       };
       try {
         if (chrome?.runtime?.id) {
@@ -156,11 +246,14 @@
       || (explicitUserAction && now - lastSys >= sysGap);
     if (opts.toast !== false && canToast) {
       NS.showPageToast(title, message, {
-        force: notifyRequested || isIdentityNotice || brandUpgradeOverIdentity
+        force: notifyRequested || isIdentityNotice || brandUpgradeOverIdentity,
+        guardKind: opts.guardKind || "",
+        brandSnapshot
       });
     }
     state._lastGuardNoticeKind = opts.guardKind || "";
     state._lastGuardNoticeKey = key;
+    state._lastGuardNoticeVersion = brandNoticeVersion;
     if (opts.guardKind === "brand-spoof") {
       state._brandSpoofNoticeSent = true;
       state._brandSpoofNoticeKey = `${title}::${message}`;
@@ -351,6 +444,18 @@
   NS.ensureBrandSpoofNotice = function (trustedPortal = false) {
     try {
       const state = NS.state;
+      const active = !trustedPortal && !!(state._brandSpoofPortalDetected || state.spoofBrand
+        || (state.details || []).some((d) => /仿冒品牌官网/i.test(d.name || "")));
+      // 没有任何活动的品牌仿冒结论时不能把“通知被抑制”反写成 pending。
+      // 否则可信官网每次 emit 报告都会再次把 analysisDone 清回 false。
+      if (!active) {
+        if (trustedPortal || state._trustedBrandIdentityUrl === String(location.href || "")
+          || (typeof NS.hasValidIcpRecord === "function" && NS.hasValidIcpRecord())) {
+          state._pendingSoftBrandSpoof = false;
+          state._brandSpoofPresentationDeferred = false;
+        }
+        return false;
+      }
       // 任何补发通知路径也必须服从官网身份核验门槛，防止扫描器或报告刷新
       // 把尚未定案的品牌候选提前展示给用户。
       if (!(typeof NS.isBrandSpoofIdentityVerificationSettled === "function"
@@ -361,97 +466,42 @@
       // 未确认可展示软仿冒前：不弹（有效 ICP / 强信任 / 情报未完）
       if (typeof NS.canPresentSoftBrandSpoofNotice === "function"
         && !NS.canPresentSoftBrandSpoofNotice()) {
-        state._pendingSoftBrandSpoof = true;
+        const trustedNow = state._trustedBrandIdentityUrl === String(location.href || "")
+          || (typeof NS.pageHasStrongTrustedIdentity === "function" && NS.pageHasStrongTrustedIdentity())
+          || (typeof NS.hasValidIcpRecord === "function" && NS.hasValidIcpRecord());
+        state._pendingSoftBrandSpoof = !trustedNow;
+        if (trustedNow) state._brandSpoofPresentationDeferred = false;
         NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "ensure-notice-suppressed-until-official-check");
         return false;
       }
-      const active = !trustedPortal && !!(state._brandSpoofPortalDetected || state.spoofBrand
-        || (state.details || []).some((d) => /仿冒品牌官网/i.test(d.name || "")));
-      if (!active) return false;
       // 定稿中：禁止用临时/空品牌抢弹
       if (state._brandSpoofFinalizeScheduled && !state._brandSpoofFinalPresented) {
         return false;
       }
-      // 优先锁定中文；勿用 re-elect 把钉钉改回 Dingding 再弹
-      const forbid = (t) => typeof NS.isForbiddenSpoofDisplayBrand === "function"
-        && NS.isForbiddenSpoofDisplayBrand(t);
-      let brand = "";
-      try {
-        brand = typeof NS.getLockedSpoofDisplayBrand === "function"
-          ? NS.getLockedSpoofDisplayBrand() : "";
-      } catch { /* ignore */ }
-      if (forbid(brand)) brand = "";
-      if (!brand) {
-        brand = String(state.spoofBrand || "").trim();
-        if (forbid(brand)) brand = "";
-      }
-      if (!brand) {
-        try {
-          brand = String(NS.reconcileActiveSpoofBrand({ force: true }) || "").trim();
-          if (forbid(brand)) brand = "";
-        } catch { /* ignore */ }
-      }
-      // 仍无品牌：仅允许明确营销结构剥出的主机核兜底；整段标签不能盲删末字。
-      if (!brand) {
-        try {
-          if (typeof NS.extractChineseBrandFromPageTitle === "function") {
-            brand = String(NS.extractChineseBrandFromPageTitle() || "").trim();
-            if (forbid(brand)) brand = "";
-          }
-        } catch { /* ignore */ }
-      }
-      if (!brand) {
-        try {
-          let core = typeof NS.resolveHostBrandCore === "function"
-            ? String(NS.resolveHostBrandCore() || "").toLowerCase().replace(/[^a-z0-9]/g, "")
-            : "";
-          const lab = String(location.hostname || "").replace(/^www\./i, "").split(".")[0] || "";
-          const labFlat = lab.replace(/[^a-z0-9]/g, "");
-          if (core === labFlat) core = "";
-          if ((!core || core.length < 4) && typeof NS.inferMarketingPaddedBrandCore === "function") {
-            core = String(NS.inferMarketingPaddedBrandCore(lab) || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-          }
-          if (core && core.length >= 4 && core !== labFlat) {
-            brand = typeof NS.formatBrandTokenForDisplay === "function"
-              ? (NS.formatBrandTokenForDisplay(core) || core)
-              : (core.charAt(0).toUpperCase() + core.slice(1));
-            if (typeof NS.setSpoofDisplayBrand === "function") {
-              NS.setSpoofDisplayBrand(brand);
-            } else {
-              state.spoofBrand = brand;
-            }
-          }
-        } catch { /* ignore */ }
-      }
-      // 空品牌：不弹「与页面宣称品牌不匹配」空壳 toast
-      if (!brand) {
-        NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "notice-skip-empty-brand");
+      // Notifications never re-elect a brand.  They consume exactly the same
+      // final snapshot already used by the risk report, so a stale title/H1
+      // extraction cannot diverge from the popup.
+      const finalSnapshot = NS.getCurrentBrandSpoofFinalSnapshot();
+      if (!finalSnapshot) {
+        NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "notice-skip-without-final-snapshot");
         return false;
       }
-      // 若当前通知已是中文锁定版，禁止再发拉丁版
-      if (state._spoofBrandChineseLocked && /[一-鿿]{2,}/.test(brand)
-        && state._brandSpoofNoticeSent
-        && /仿冒「[一-鿿]{2,8}」/.test(String(state._brandSpoofNoticeKey || ""))) {
-        return false;
-      }
+      const brand = finalSnapshot.brand;
       const title = `已识别仿冒「${brand}」官网`;
       const message = `页面标题/正文品牌「${brand}」与当前域名不匹配，疑似仿冒官网。`;
       const key = `${title}::${message}`;
+      const noticeVersion = NS.brandFinalSnapshotVersion(finalSnapshot);
       if (state._brandSpoofNoticeSent && state._brandSpoofNoticeKey === key
         && state._lastGuardNoticeKind === "brand-spoof"
-        && state._lastGuardNoticeKey === key) return false;
-      // 已发过中文版后，忽略纯拉丁 brand 通知
-      if (state._brandSpoofNoticeSent
-        && /仿冒「[一-鿿]{2,8}」/.test(String(state._brandSpoofNoticeKey || ""))
-        && brand && /^[A-Za-z]/.test(brand) && !/[一-鿿]/.test(brand)) {
-        return false;
-      }
+        && state._lastGuardNoticeKey === key
+        && state._lastGuardNoticeVersion === noticeVersion) return false;
       const shown = NS.showGuardOverlay("", {
         title,
         message,
         toast: true,
         forceNotify: true,
-        guardKind: "brand-spoof"
+        guardKind: "brand-spoof",
+        brandSnapshot: finalSnapshot
       }) === true;
       // showGuardOverlay 在正常运行时会记录这组状态；这里再写一次，保证被测试桩、
       // 兼容层或定制 UI 包装后，品牌通知仍能正确去重并保持最高展示优先级。
@@ -491,6 +541,22 @@
     const state = NS.state;
     const c = NS.caches;
     const now = Date.now();
+    const reportUrl = String(location.href || "");
+    // history.pushState can change location before the navigation watcher gets
+    // its animation-frame turn.  Never publish old-page state under the new
+    // URL; let lifecycle rotate/reset the transaction first.
+    if (state._analysisTxnUrl && state._analysisTxnUrl !== reportUrl) {
+      try {
+        queueMicrotask(() => {
+          try {
+            if (typeof NS.handlePageUrlChanged === "function") {
+              NS.handlePageUrlChanged("risk-report-url-drift", reportUrl);
+            }
+          } catch { /* ignore */ }
+        });
+      } catch { /* ignore */ }
+      return;
+    }
     // Keep this local to emitRiskReport.  showGuardOverlay has a similarly named
     // value, but function scope means it is not visible here.  A missing local
     // declaration aborts report construction and makes the popup fall back to
@@ -554,8 +620,12 @@
         if (state._brandSpoofFinalizeScheduled && !state._brandSpoofFinalPresented) {
           /* skip re-elect */
         } else {
-        const curBrand = String(state.spoofBrand || "").trim();
-        const cnLocked = !!(state._spoofBrandChineseLocked && /[一-鿿]{2,}/.test(curBrand));
+        const committedSnapshot = NS.getCurrentBrandSpoofFinalSnapshot();
+        const curBrand = String((committedSnapshot && committedSnapshot.brand)
+          || state.spoofBrand || "").trim();
+        if (committedSnapshot) state.spoofBrand = curBrand;
+        const cnLocked = !!committedSnapshot
+          || !!(state._spoofBrandChineseLocked && /[一-鿿]{2,}/.test(curBrand));
         if (cnLocked) {
           // 中文已由 pinyin 升格锁定，只回写详情
           try {
@@ -668,7 +738,9 @@
       && (!state._brandSpoofFinalizeScheduled || state._brandSpoofFinalPresented);
     // 通知链已经拿到具名品牌时，不能仅因 finalize 的异步标志晚一拍就在完成报告
     // 中清空 spoofBrand；否则通知显示 ToDesk，popup 会退化成“仿冒品牌官网下载站”。
-    let reportSpoofBrand = String(state.spoofBrand || "").trim();
+    const reportBrandSnapshot = NS.getCurrentBrandSpoofFinalSnapshot();
+    let reportSpoofBrand = String((reportBrandSnapshot && reportBrandSnapshot.brand)
+      || state.spoofBrand || "").trim();
     try {
       if (reportSpoofBrand && typeof NS.canonicalizeBrandDisplayCandidate === "function") {
         reportSpoofBrand = String(NS.canonicalizeBrandDisplayCandidate(reportSpoofBrand)
@@ -698,8 +770,35 @@
     const pkgTargets = protectionTrusted ? [] : (state.protectedTargets || []).filter((t) => {
       try { return NS.isPackageFileUrl(t) || /\.(zip|exe|apk|dmg|msi|rar|7z)(?:\?|#|$)/i.test(String(t)); } catch { return false; }
     }).slice(0, 5);
-    const analysisComplete = !brandDecisionPending && !!(state._analysisDone
+    // A DOM/performance scan finishing is not the same as the identity
+    // pipeline finishing. Edge may freeze a background tab after the page
+    // fallback but before ICP/WHOIS/TLS callbacks arrive. Never serialize that
+    // intermediate state as a clean, completed 0-score report. Real threats
+    // may be reported immediately; clean pages wait for all identity sources.
+    const currentReportUrl = String(location.href || "");
+    const intelIdentitySettled = !!(state._icpQuerySettled === true
+      && c && c.intelDoneForUrl === currentReportUrl);
+    const sslIdentitySettled = !/^https:/i.test(String(location.protocol || ""))
+      || !!(state._sslIdentitySettled === true
+        && state._sslIdentityTimedOut !== true
+        && String(state._sslIdentityUrl || "") === currentReportUrl);
+    const explicitLocalTerminal = typeof NS.isPrivateOrLocalNetworkHost === "function"
+      && NS.isPrivateOrLocalNetworkHost();
+    const explicitSearchTerminal = typeof NS.isSearchUrlShapeOnly === "function"
+      && NS.isSearchUrlShapeOnly();
+    const identityUnavailable = state._identityVerificationUnavailable === true
+      && String(state._identityVerificationUnavailableUrl || "") === currentReportUrl;
+    const immediateThreatTerminal = !!(realHardKit || state.downloadGuardInstalled
+      || state.remoteDownloadDispatchDetected
+      || (Array.isArray(state.protectedTargets) && state.protectedTargets.length > 0));
+    const identityTerminal = explicitLocalTerminal || explicitSearchTerminal
+      || protectionTrusted || (intelIdentitySettled && sslIdentitySettled);
+    const internallyComplete = !!(state._analysisDone
       || (state._stickyComplete && state._stickyCompleteHost === hostKey));
+    const analysisComplete = !brandDecisionPending && internallyComplete
+      && (identityTerminal || immediateThreatTerminal);
+    const icpForcedMissing = typeof NS.shouldPreserveForcedMissingIcp === "function"
+      && NS.shouldPreserveForcedMissingIcp();
     const payload = {
       type: "threat-risk", score, riskLevel, analysisComplete,
       details: (() => {
@@ -711,7 +810,7 @@
           if (d.name === "已查询到ICP备案号") return false;
           // 页脚有备案宣称 / 假冒 ICP → 绝不展示「无ICP备案信息」
           if (d.name === "无ICP备案信息" && (hasFakeIcp || hasDeclared)) return false;
-          if (d.name === "无ICP备案信息" && (
+          if (d.name === "无ICP备案信息" && !icpForcedMissing && (
             NS.looksLikeUltraMatureWhoisDomain()
             || NS.looksLikeLongLivedWhoisDomain()
             || (NS.getWhoisAgeDays() != null && NS.getWhoisAgeDays() >= 365)
@@ -726,14 +825,21 @@
       icpInfo: (typeof NS.formatIcpInfoForReport === "function"
         ? NS.formatIcpInfoForReport(state.icpInfo)
         : (state.icpInfo || "")),
+      icpForcedMissing: !!icpForcedMissing,
+      identityVerificationUnavailable: !!identityUnavailable,
       whoisInfo: state.whoisInfo || "",
       sslInfo: state.sslInfo || null,
-      url: location.href,
+      url: reportUrl,
+      analysisTxn: state._analysisTxn || "",
+      analysisTxnStartedAt: Number(state._analysisTxnStartedAt) || now,
+      timestamp: now,
       downloadGuardInstalled: protectionTrusted ? false : !!state.downloadGuardInstalled,
       packageBlocked: packageBlockedLive,
       protectedTargets: pkgTargets,
       spoofBrand: (identityTrusted || (!brandDisplayFinal && !brandPayloadReady)) ? "" : reportSpoofBrand,
-      brandSpoofPortal: (identityTrusted || (!brandDisplayFinal && !brandPayloadReady)) ? false : (!!(state._brandSpoofPortalDetected || reportSpoofBrand) || threatDetails.some((d) => /仿冒品牌官网/i.test(d.name || "")))
+      brandSpoofPortal: (identityTrusted || (!brandDisplayFinal && !brandPayloadReady)) ? false : (!!(state._brandSpoofPortalDetected || reportSpoofBrand) || threatDetails.some((d) => /仿冒品牌官网/i.test(d.name || ""))),
+      brandFinalSnapshot: (identityTrusted || !brandPayloadReady)
+        ? null : reportBrandSnapshot
     };
     try {
       if (!chrome?.runtime?.id) return;
@@ -1102,6 +1208,9 @@
         const n = NS.getFilenameFromUrl(t) || NS.normalizeFileName(t);
         return !n || NS.isClearProductOrAndroidPackage(n) || NS.isBenignShortInstallerName(n) || NS.looksLikeProductPackageName(n) || NS.isContentAddressedPackageName(n);
       });
+      // 年轻夹带 / 搜索引擎假下载 CTA：禁止以「正站下载页」抬锁
+      if (typeof NS.shouldRejectOfficialDownloadShortcut === "function"
+        && NS.shouldRejectOfficialDownloadShortcut()) return false;
       if (onlyOfficialTargets && NS.isTrustedOfficialDownloadContext()) return true;
       if (NS.isTrustedOfficialDownloadContext()) return true;
       if (typeof NS.pageLooksLikeLegitimateOfficialDownload === "function" && NS.pageLooksLikeLegitimateOfficialDownload()) return true;
@@ -1162,6 +1271,8 @@
     state._brandSpoofNoticeKey = "";
     state._lastGuardNoticeKind = "";
     state._lastGuardNoticeKey = "";
+    state._lastGuardNoticeVersion = "";
+    state._brandSpoofFinalSnapshot = null;
     state.remoteDownloadDispatchDetected = false;
     state.protectedTargets = [];
     state._guardRedisableArmed = false;
@@ -1183,8 +1294,18 @@
     }, ms));
     try {
       if (chrome?.runtime?.id) {
-        chrome.runtime.sendMessage({ type: "set-tab-protect", enabled: false, force: true, url: location.href }, () => { void chrome.runtime.lastError; });
-        chrome.runtime.sendMessage({ type: "clear-threat-notice", url: location.href, reason: reason || "lift-guard" }, () => { void chrome.runtime.lastError; });
+        chrome.runtime.sendMessage({
+          type: "set-tab-protect", enabled: false, force: true, url: location.href,
+          analysisTxn: NS.state._analysisTxn || "",
+          analysisTxnStartedAt: Number(NS.state._analysisTxnStartedAt) || Date.now()
+        }, () => { void chrome.runtime.lastError; });
+        chrome.runtime.sendMessage({
+          type: "clear-threat-notice",
+          url: location.href,
+          reason: reason || "lift-guard",
+          analysisTxn: state._analysisTxn || "",
+          analysisTxnStartedAt: Number(state._analysisTxnStartedAt) || Date.now()
+        }, () => { void chrome.runtime.lastError; });
       }
     } catch { /* ignore */ }
     const softRe = /已启用安装包下载拦截|已启用仿冒站下载拦截|已启用异常跳转拦截|SEO伪装跳转|SEO收录仿冒|多平台下载指向搜索引擎|非用户手势|仿冒品牌官网|仿冒官网|主动探测仿冒|主动探测：|页面嵌入可疑安装包|可疑安装包链接|探测到跳转\/附件下载|探测到下载行为|已拦截可疑|域名与品牌资源不一致|多版本下载同一|无透明安装包|与标题品牌|疑似仿冒官网/;
@@ -1237,10 +1358,21 @@
     if (NS.looksLikeStrongProductInstallerName(fileName) || NS.isClearProductOrAndroidPackage(fileName) || NS.isClearProductOrAndroidPackage(href) || NS.isBenignShortInstallerName(fileName)) return false;
     try {
       const host = new URL(href, location.href).hostname;
-      if (NS.isAnonymousPublicObjectHost(host) && !NS.looksLikeStrongProductInstallerName(fileName)) return true;
+      // 匿名高熵桶仍可疑；可读产品/曲包名除外（与 BG verdict 对齐）
+      if (NS.isAnonymousPublicObjectHost(host)
+        && !NS.looksLikeStrongProductInstallerName(fileName)
+        && !(NS.looksLikeProductPackageName(fileName) && !NS.looksLikeOversimplifiedBrandInstallerName(fileName))) {
+        return true;
+      }
       if (NS.hostLooksLikePublicObjectStorageEndpoint(host) && NS.looksLikeObjectStoragePackageUrl(href)) return true;
     } catch { /* ignore */ }
     if (NS.looksLikeHighRiskBlobPackageUrl(href) || NS.isThreatObjectStoragePackage(href, element)) return true;
+    // 可读产品/曲包名优先放行，再判品牌近失（避免空格曲名被近失抢先拦截）
+    if (NS.looksLikeProductPackageName(fileName) && !NS.looksLikeOversimplifiedBrandInstallerName(fileName)
+      && !NS.looksLikeObjectStoragePackageUrl(href) && !NS.looksLikeHighRiskBlobPackageUrl(href)) {
+      // 近失仅在「强营销 ∧ 像安装包空格名」时仍可拦；looksLikeBrandNearMiss 内部已门控
+      if (!NS.looksLikeBrandNearMissPackageName(fileName)) return false;
+    }
     if (NS.looksLikeBrandNearMissPackageName(fileName)) return true;
     if (NS.isContentAddressedPackageName(fileName)) {
       if (NS.looksLikeSafeOfficialContext() || NS.looksLikeMatureOfficialPortal()) return NS.looksLikeHighRiskBlobPackageUrl(href);
@@ -1334,13 +1466,25 @@
   NS.armBackgroundProtect = function (mode = "full") {
     try {
       if (!chrome?.runtime?.id) return;
-      chrome.runtime.sendMessage({ type: "set-tab-protect", enabled: true, mode, provisional: mode === "provisional", url: location.href }, () => { void chrome.runtime.lastError; });
+      chrome.runtime.sendMessage({
+        type: "set-tab-protect",
+        enabled: true,
+        mode,
+        provisional: mode === "provisional",
+        url: location.href,
+        analysisTxn: NS.state._analysisTxn || "",
+        analysisTxnStartedAt: Number(NS.state._analysisTxnStartedAt) || Date.now()
+      }, () => { void chrome.runtime.lastError; });
     } catch { /* ignore */ }
   };
 
   NS.pageLooksLikeThinCloakingRelay = function () {
     try {
-      if (NS.pageLooksLikeLegitimateOfficialDownload()) return false;
+      // 年轻/夹带域的仿冒 download.html 不得当正站提前 return
+      if (typeof NS.shouldRejectOfficialDownloadShortcut === "function"
+        && NS.shouldRejectOfficialDownloadShortcut()) {
+        /* continue arm */
+      } else if (NS.pageLooksLikeLegitimateOfficialDownload()) return false;
       if (!document.body) return false;
       try {
         const htmlHead = NS.getHtmlSlice(60000);
@@ -1378,7 +1522,11 @@
       const state = NS.state;
       if (state.downloadGuardInstalled || state._earlyShellArmed) return;
       if (NS.pageLooksLikeSearchEngineResultsPage()) return;
-      if (NS.pageLooksLikeLegitimateOfficialDownload()) return;
+      // 仿冒 download.html 不得因「像正站下载中心」跳过 early shell
+      if (typeof NS.shouldRejectOfficialDownloadShortcut === "function"
+        && NS.shouldRejectOfficialDownloadShortcut()) {
+        /* continue */
+      } else if (NS.pageLooksLikeLegitimateOfficialDownload()) return;
       try {
         const path = (location.pathname || "").toLowerCase().replace(/\/+$/, "") || "/";
         const q = location.search || "";
@@ -1396,7 +1544,11 @@
       const thinRelay = NS.pageLooksLikeThinCloakingRelay();
       if (!titleHit && !domHit && !uriHit && !thinRelay) return;
       if (!thinRelay && !domHit && !uriHit) return;
-      if (thinRelay && NS.pageLooksLikeLegitimateOfficialDownload()) return;
+      if (thinRelay) {
+        const rejectShortcut = typeof NS.shouldRejectOfficialDownloadShortcut === "function"
+          && NS.shouldRejectOfficialDownloadShortcut();
+        if (!rejectShortcut && NS.pageLooksLikeLegitimateOfficialDownload()) return;
+      }
       state._earlyShellArmed = true;
       NS.armBackgroundProtect("provisional");
     } catch { /* ignore */ }
@@ -1406,6 +1558,8 @@
   NS.installDownloadGuard = function (reason = "检测到可疑安装包下载，已启用文件拦截保护", opts = {}) {
     const state = NS.state;
     const o = opts || {};
+    let finalBrandSnapshot = o.guardKind === "brand-spoof"
+      ? NS.getCurrentBrandSpoofFinalSnapshot(o.brandSnapshot) : null;
     // 所有品牌提示的统一出口：官网身份核验前不允许任何检测器抢先定稿或弹出
     // “已识别仿冒「品牌」官网”。其它 package/nav 等硬威胁通知不受影响。
     if (o.guardKind === "brand-spoof"
@@ -1428,8 +1582,9 @@
     // 其它检测器不得绕过统一品牌定稿：需要弹品牌通知时先交给 commit，
     // 由 host 拉丁核 / SW pinyin 双向校验完成后再回到这里。
     if (o.guardKind === "brand-spoof" && o.notify !== false
-      && !state._brandSpoofFinalPresented
+      && (!state._brandSpoofFinalPresented || !finalBrandSnapshot)
       && typeof NS.commitBrandSpoofPresentation === "function") {
+      if (!finalBrandSnapshot) state._brandSpoofFinalPresented = false;
       NS.commitBrandSpoofPresentation({
         brand: state.spoofBrand || "",
         host: location.hostname,
@@ -1441,7 +1596,9 @@
       try {
         const forbid = (t) => typeof NS.isForbiddenSpoofDisplayBrand === "function"
           && NS.isForbiddenSpoofDisplayBrand(t);
-        let correctedBrand = String(state.spoofBrand || "").trim();
+        finalBrandSnapshot = NS.getCurrentBrandSpoofFinalSnapshot(o.brandSnapshot);
+        if (!finalBrandSnapshot) return;
+        let correctedBrand = String(finalBrandSnapshot.brand || "").trim();
         if (forbid(correctedBrand)) correctedBrand = "";
         if (!correctedBrand) {
           correctedBrand = String(NS.reconcileActiveSpoofBrand({ force: true }) || "").trim();
@@ -1651,7 +1808,15 @@
         : guardKind === "site-identity"
           ? "已拦截身份异常网站下载"
           : guardKind === "nav-trap" ? "已拦截异常下载跳转" : "已拦截可疑安装包");
-      NS.showGuardOverlay(href, { title: noticeTitle, message: label, toast: true, forceNotify: !!o.forceNotify || firstTime || guardKind === "brand-spoof" || guardKind === "nav-trap", userAction: !!o.userAction, guardKind });
+      NS.showGuardOverlay(href, {
+        title: noticeTitle,
+        message: label,
+        toast: true,
+        forceNotify: !!o.forceNotify || firstTime || guardKind === "brand-spoof" || guardKind === "nav-trap",
+        userAction: !!o.userAction,
+        guardKind,
+        brandSnapshot: guardKind === "brand-spoof" ? finalBrandSnapshot : null
+      });
     }
     const redisable = () => {
       if (!state.downloadGuardInstalled) return;

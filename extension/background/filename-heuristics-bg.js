@@ -96,6 +96,16 @@
       if (base.length < 3 || base.length > 96) return false;
       if (PackageHeuristicsBg.looksLikeAndroidPackageIdName(base)) return true;
       if (PackageHeuristicsBg.isBenignShortInstallerName(name)) return true;
+      // 多词空格/波浪号可读名（谱面、曲包、(1) 重名）：BG 侧同样当产品包，避免 cancel
+      if (/\s|[~～()]/.test(base)) {
+        const words = base.match(/[a-zA-Z一-鿿]{3,}/g) || [];
+        const compact = base.replace(/[\s~～()[\]._-]+/g, "");
+        if (words.length >= 2
+          && !/(?:^|[\s._-])(?:setup|install|installer|client|official|官网|官方|安装包)(?:$|[\s._-])/i.test(base)
+          && !PackageHeuristicsBg.hasGarbleDigitLetterSoup(compact)) {
+          return true;
+        }
+      }
       let stem = base.replace(/[._-](x64|x86|x86_64|amd64|arm64|arm|win32|win64|mac|linux)$/i, "");
       stem = stem.replace(/[._-]?v?\d+(?:\.\d+){1,5}$/i, "");
       if (!stem || stem.length < 2) stem = base.replace(/[._-](x64|x86|x86_64|amd64|arm64|arm|win32|win64|mac|linux)$/i, "");

@@ -50,10 +50,12 @@
     /** 是否应阻断该 URL。 */
     shouldBlock(url) {
       if (this.officialSafe) return false;
-      // 干净 /download 路径：永不进 DOM 扫描（勿用品牌根首页 light——仿冒站会漏拦）
+      // 干净 /download 只控制初始性能；content 后续已启用 guard/套件时
+      // 必须恢复真实判断，不能让 URL 外观覆盖风险结论。
       try {
         if (typeof PageShellDetector.looksLikeCleanOfficialDownloadHostPathEarly === "function"
-          && PageShellDetector.looksLikeCleanOfficialDownloadHostPathEarly()) {
+          && PageShellDetector.looksLikeCleanOfficialDownloadHostPathEarly()
+          && !this.guard && !this.kitScanner.cloakingKit && !this.extraPolicy) {
           return false;
         }
       } catch { /* ignore */ }

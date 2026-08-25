@@ -116,36 +116,69 @@
       const policy = this.policy;
       const restoreList = this.restoreList;
       let done = false;
+      let lastProbeAt = 0;
+      let idleHandle = null;
+      const timers = [];
+      let onDomReady = null;
+      let onReadyState = null;
+      const cleanup = () => {
+        for (const timer of timers) {
+          try { clearTimeout(timer); } catch { /* ignore */ }
+        }
+        timers.length = 0;
+        try {
+          if (idleHandle != null && typeof cancelIdleCallback === "function") cancelIdleCallback(idleHandle);
+        } catch { /* ignore */ }
+        idleHandle = null;
+        try { if (onDomReady) document.removeEventListener("DOMContentLoaded", onDomReady); } catch { /* ignore */ }
+        try { if (onReadyState) document.removeEventListener("readystatechange", onReadyState); } catch { /* ignore */ }
+      };
+      const releaseHeavyHooks = (reason) => {
+        if (done) return;
+        try { DomGuard.restoreNativeDomProtos(restoreList); } catch { /* ignore */ }
+        // MixedContentQuiet 有自己的 Element/Image 包装和全树 MO，不在 restoreList 内。
+        try {
+          if (NS.MixedContentQuiet && typeof NS.MixedContentQuiet.uninstall === "function") {
+            NS.MixedContentQuiet.uninstall(reason || "benign-spa-promote");
+          }
+        } catch { /* ignore */ }
+        done = true;
+        cleanup();
+      };
       const promote = () => {
         if (done) return;
         try {
+          const now = Date.now();
+          if (now - lastProbeAt < 70) return;
+          lastProbeAt = now;
           const alreadyLight = !!(policy.officialSafe || policy.lightPage);
           const heavy = typeof PageContext.pageLooksLikeHeavyContentAppShell === "function"
             && PageContext.pageLooksLikeHeavyContentAppShell();
-          const catalog = typeof PageContext.pageLooksLikeMultiPlatformProductDownloadCatalog === "function"
+          const catalog = !heavy && typeof PageContext.pageLooksLikeMultiPlatformProductDownloadCatalog === "function"
             && PageContext.pageLooksLikeMultiPlatformProductDownloadCatalog();
           if (!alreadyLight && !heavy && !catalog) return;
-          if (heavy || catalog) policy.lightPage = true;
-          try { DomGuard.restoreNativeDomProtos(restoreList); } catch { /* ignore */ }
-          done = true;
+          // 性能降载不等同可信身份：不写 officialSafe/lightPage，后续 set-guard 仍须生效。
+          releaseHeavyHooks(alreadyLight ? "already-light-promote" : (catalog ? "download-catalog-promote" : "content-spa-promote"));
         } catch { /* ignore */ }
       };
       try {
-        // 更密的早期采样：CSP meta/script 常在首屏 insert，需尽快拆 wrap
-        [0, 16, 50, 100, 200, 400, 800, 1500, 3000].forEach((ms) => { setTimeout(promote, ms); });
+        // 让首帧留给站点 hydrate；结构探测走稀疏 timer/idle，不再在 rAF 中读取页面载荷。
+        [0, 120, 500, 1500, 3000].forEach((ms) => { timers.push(setTimeout(promote, ms)); });
         try {
-          if (typeof requestAnimationFrame === "function") {
-            requestAnimationFrame(() => { try { promote(); } catch { /* ignore */ } });
+          if (typeof requestIdleCallback === "function") {
+            idleHandle = requestIdleCallback(() => { idleHandle = null; promote(); }, { timeout: 1000 });
           }
         } catch { /* ignore */ }
+        onReadyState = () => {
+          if (document.readyState === "interactive" || document.readyState === "complete") promote();
+        };
         if (document.readyState === "loading") {
-          document.addEventListener("DOMContentLoaded", promote, { once: true });
+          onDomReady = promote;
+          document.addEventListener("DOMContentLoaded", onDomReady, { once: true });
         } else {
           promote();
         }
-        document.addEventListener("readystatechange", () => {
-          if (document.readyState === "interactive" || document.readyState === "complete") promote();
-        });
+        if (!done) document.addEventListener("readystatechange", onReadyState);
       } catch { /* ignore */ }
     }
 
@@ -156,12 +189,23 @@
         if (event && event.type === "contextmenu") return;
         const t = event.target;
         if (!t || typeof t.closest !== "function") return;
+        const candidateEl = t.closest("a, button, [role='button'], .download-btn, .download-btn-nav, .btn-download, #mainDownloadBtn");
+        if (!candidateEl) return;
+        const candidateHref = (candidateEl.getAttribute("href") || candidateEl.getAttribute("data-href")
+          || candidateEl.getAttribute("data-url") || "").trim();
+        let candidateAlreadyBlocked = false;
         try {
-          const candidateEl = t.closest("a, button, [role='button'], .download-btn, .download-btn-nav, .btn-download, #mainDownloadBtn");
-          if (candidateEl) {
-            const candidateHref = (candidateEl.getAttribute("href") || candidateEl.getAttribute("data-href") || candidateEl.getAttribute("data-url") || "").trim();
-            if (candidateHref) policy.noteTrustedDownloadIntent(candidateHref);
-          }
+          candidateAlreadyBlocked = !!(candidateHref && (policy.blockedHops.has(candidateHref)
+            || policy.blockedHops.has(new URL(candidateHref, location.href).href)));
+        } catch { candidateAlreadyBlocked = !!(candidateHref && policy.blockedHops.has(candidateHref)); }
+        // These paths do not deliver a file.  Resolve them before posting a
+        // trusted-download intent or running phish/relay page classifiers on
+        // mousedown + pointerdown + click.
+        if (!policy.guardEnabled && !policy.forceDesktopDlKit && !candidateAlreadyBlocked
+          && (PackageHeuristics.isDeclarativeDisclosureControl(candidateEl)
+            || PackageHeuristics.isPlainSameOriginDocumentNavigation(candidateHref, candidateEl))) return;
+        try {
+          if (candidateHref) policy.noteTrustedDownloadIntent(candidateHref);
         } catch { /* ignore */ }
         if (policy.officialSafe) {
           return;
@@ -171,8 +215,7 @@
           const tag = (t.tagName || "").toUpperCase();
           if (tag === "INPUT" || tag === "TEXTAREA" || t.isContentEditable) return; // 搜索框输入
         } catch { /* ignore */ }
-        const el = t.closest("a, button, [role='button'], .download-btn, .download-btn-nav, .btn-download, #mainDownloadBtn");
-        if (!el) return;
+        const el = candidateEl;
         const href = (el.getAttribute("href") || el.getAttribute("data-href") || el.getAttribute("data-threat-original-href") || "").trim();
 
         // SERP：永不拦截出站结果点击
@@ -505,19 +548,33 @@
   NS.PageHooks = PageHooks;
 
   const hooks = new PageHooks();
-  // 搜索 / densitydpi / 干净 /download 路径：document_start 不装重型 wrap
-  if (PageContext.isSearchUrlShapeEarly()
-    || (typeof PageContext.shouldUseLightHooksEarly === "function" && PageContext.shouldUseLightHooksEarly())) {
+  const searchLightEarly = !!PageContext.isSearchUrlShapeEarly();
+  const performanceLightEarly = !searchLightEarly
+    && typeof PageContext.shouldUseLightHooksEarly === "function"
+    && PageContext.shouldUseLightHooksEarly();
+  // 搜索页才是语义 no-op。densitydpi / 干净 /download 仅为性能轻模式，
+  // 不等同 officialSafe，必须保留 content bridge 以接受晚到 set-guard。
+  if (searchLightEarly) {
     try { hooks.policy.lightPage = true; } catch { /* ignore */ }
     try { hooks.policy.officialSafe = true; } catch { /* ignore */ }
-    // mixed-content 若已装（理论上 shouldUseLight 时会跳过），再兜底拆掉
+    // mixed-content 若已装，再兜底拆掉。
     try {
       if (NS.MixedContentQuiet && typeof NS.MixedContentQuiet.uninstall === "function") {
-        NS.MixedContentQuiet.uninstall("boot-light-early");
+        NS.MixedContentQuiet.uninstall("boot-search-light-early");
       }
     } catch { /* ignore */ }
     hooks.installSearchLight();
   } else {
+    if (performanceLightEarly) {
+      try { hooks.policy.lightPage = true; } catch { /* ignore */ }
+    }
     hooks.install();
+    if (performanceLightEarly) {
+      try {
+        if (NS.MixedContentQuiet && typeof NS.MixedContentQuiet.uninstall === "function") {
+          NS.MixedContentQuiet.uninstall("boot-performance-light-early");
+        }
+      } catch { /* ignore */ }
+    }
   }
 })(window.SilverfoxPageHooks ??= {});

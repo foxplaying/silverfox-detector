@@ -154,17 +154,48 @@
   // --- 下载事件尽早排队（模块未就绪前不丢事件）---
   const _dlEarlyQueue = [];
   let _dlModulesReady = false;
+  let _protectionRestoreReady = false;
   /** 已处理过的 downloadId，避免 onCreated + onDeterminingFilename 双触发 */
   NS._handledDownloadIds = NS._handledDownloadIds || new Set();
   /** Edge 可能先触发 downloads 事件、后送达页面的可信 URL 消息；短暂合并同一下载的判定。 */
   NS._pendingDownloadTrustChecks = NS._pendingDownloadTrustChecks || new Map();
 
-  function enqueueOrHandleDownload(item, source) {
+  function downloadsSubsystemReady() {
+    return _dlModulesReady && _protectionRestoreReady;
+  }
+
+  function processQueuedDownload(q) {
+    if (!q || !q.item) return;
+    if (typeof q.suggest === "function") {
+      try { q.suggest(); } catch { /* download may already be gone */ }
+    }
+    // Match the normal onDeterminingFilename path: let Edge finish the
+    // suggest callback before a verdict may cancel the item.
+    setTimeout(() => {
+      if (typeof NS.handleDownloadItem === "function") {
+        NS.handleDownloadItem(q.item, q.source || "queued");
+      }
+    }, 0);
+  }
+
+  function flushEarlyDownloadQueue() {
+    if (!downloadsSubsystemReady()) return;
+    try {
+      while (_dlEarlyQueue.length) processQueuedDownload(_dlEarlyQueue.shift());
+    } catch (e) {
+      try { console.warn("[silverfox] flush dl queue", e); } catch { /* ignore */ }
+    }
+  }
+
+  function enqueueOrHandleDownload(item, source, suggest) {
     try {
       if (!item || item.id == null) return;
-      if (!_dlModulesReady) {
-        _dlEarlyQueue.push({ item, source: source || "early" });
+      if (!downloadsSubsystemReady()) {
+        _dlEarlyQueue.push({ item, source: source || "early", suggest });
         return;
+      }
+      if (typeof suggest === "function") {
+        try { suggest(); } catch { /* ignore */ }
       }
       if (typeof NS.handleDownloadItem === "function") {
         NS.handleDownloadItem(item, source || "live");
@@ -180,14 +211,20 @@
   // 则保留为极少数未触发 filename 事件时的兜底。
   if (chrome.downloads && chrome.downloads.onDeterminingFilename) {
     chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
+      if (!downloadsSubsystemReady()) {
+        enqueueOrHandleDownload(item, "onDeterminingFilename", suggest);
+        // Keep Edge's filename decision pending until persisted protection has
+        // been restored. Otherwise a small download can finish in the window
+        // where protectedTabs is still empty.
+        return true;
+      }
       try {
         // 必须先提交文件名；若启发式处理先 cancel，Edge 的 suggest 会报
         // "Download must be in progress"，并被记为扩展 runtime 错误。
         if (typeof suggest === "function") suggest();
       } catch { /* ignore */ }
-      try {
-        setTimeout(() => enqueueOrHandleDownload(item, "onDeterminingFilename"), 0);
-      } catch { /* ignore */ }
+      try { setTimeout(() => enqueueOrHandleDownload(item, "onDeterminingFilename"), 0); } catch { /* ignore */ }
+      return undefined;
     });
   }
   if (chrome.downloads && chrome.downloads.onChanged) {
@@ -218,33 +255,79 @@
   importScripts("./brand-pinyin-bg.js");
   importScripts("./message-handler-bg.js");
 
-  // 模块就绪：处理排队中的下载
+  // Modules are only half of download readiness. Persisted protection must be
+  // restored before the first verdict is allowed to run.
   _dlModulesReady = true;
-  try {
-    while (_dlEarlyQueue.length) {
-      const q = _dlEarlyQueue.shift();
-      if (q && q.item && typeof NS.handleDownloadItem === "function") {
-        NS.handleDownloadItem(q.item, q.source || "queued");
-      }
-    }
-  } catch (e) {
-    try { console.warn("[silverfox] flush dl queue", e); } catch { /* ignore */ }
-  }
 
   // 从 storage 恢复 protect_tab_*（刷新扩展后内存 Set 会空）
+  const protectionRestoreMutationVersion = Number(NS._protectionMutationVersion || 0);
+  const finishProtectionRestore = (() => {
+    let finished = false;
+    return () => {
+      if (finished) return;
+      finished = true;
+      _protectionRestoreReady = true;
+      flushEarlyDownloadQueue();
+    };
+  })();
   try {
     chrome.storage.local.get(null, (all) => {
       try {
-        if (!all || typeof all !== "object") return;
-        Object.keys(all).forEach((k) => {
-          if (!/^protect_tab_(\d+)$/.test(k)) return;
-          if (!all[k]) return;
-          const id = Number(RegExp.$1);
-          if (id >= 0) NS.protectedTabs.add(id);
+        if (chrome.runtime.lastError || !all || typeof all !== "object") {
+          finishProtectionRestore();
+          return;
+        }
+        const entries = Object.keys(all).map((k) => {
+          const match = /^protect_tab_(\d+)$/.exec(k);
+          return match && all[k] ? { key: k, id: Number(match[1]), stored: all[k] } : null;
+        }).filter((x) => x && x.id >= 0);
+        if (!entries.length || !chrome.tabs || typeof chrome.tabs.get !== "function") {
+          finishProtectionRestore();
+          return;
+        }
+        let pending = entries.length;
+        const doneOne = () => { pending -= 1; if (pending <= 0) finishProtectionRestore(); };
+        entries.forEach(({ key, id, stored }) => {
+          chrome.tabs.get(id, (tab) => {
+            try {
+              const tabErr = chrome.runtime.lastError;
+              const liveUrl = String((tab && tab.url) || "");
+              const risk = all[`risk_${id}`] || null;
+              const notice = all.latestNotice || null;
+              const storedMode = stored && typeof stored === "object"
+                && stored.mode === "provisional" ? "provisional" : "full";
+              const storedUrl = String((stored && typeof stored === "object" && stored.url)
+                || (risk && risk.url) || (notice && notice.tabId === id && notice.url) || "");
+              let matchesLive = false;
+              if (!tabErr && /^https?:\/\//i.test(liveUrl) && storedUrl) {
+                try {
+                  const live = new URL(liveUrl);
+                  const saved = new URL(storedUrl);
+                  matchesLive = storedMode === "provisional"
+                    ? live.href === saved.href
+                    : live.origin === saved.origin;
+                } catch { matchesLive = false; }
+              }
+              const mutatedAt = NS._protectionMutationAtByTab instanceof Map
+                ? Number(NS._protectionMutationAtByTab.get(id) || 0)
+                : 0;
+              if (matchesLive && mutatedAt <= protectionRestoreMutationVersion
+                && typeof NS.restoreTabProtection === "function") {
+                NS.restoreTabProtection(id, stored, { risk, notice });
+              } else {
+                try { chrome.storage.local.remove([key], () => { void chrome.runtime.lastError; }); } catch { /* ignore */ }
+              }
+            } catch { /* fail closed for stale tab-id records */ }
+            finally { doneOne(); }
+          });
         });
-      } catch { /* ignore */ }
+      } catch {
+        finishProtectionRestore();
+      }
     });
-  } catch { /* ignore */ }
+  } catch {
+    finishProtectionRestore();
+  }
 
   // --- 注册 nav-boot + 清理残留 DNR / 启动清系统通知 ---
   try {
@@ -293,14 +376,14 @@
         if (st.reversing) { NS.injectNavBoot(tabId, 0); return; }
         NS.onTabUrlChangedForAnalysis(tabId, newUrl);
         if (!NS.isOnProtectedOrigin(tabId, newUrl) || NS.isHostileAutoTarget(newUrl)) {
-          if (NS.protectedTabs.has(tabId) && !NS.isOnProtectedOrigin(tabId, newUrl)) {
+          if (NS.isTabProtected(tabId) && !NS.isOnProtectedOrigin(tabId, newUrl)) {
             NS.pauseNavBlocking(tabId, "tabs-url-leave");
             NS.clearTabAnalysisState(tabId);
             if (!NS.isHostileAutoTarget(newUrl)) st.lastGoodUrl = newUrl;
             NS.injectNavBoot(tabId, 0);
             return;
           }
-          if (NS.isHostileAutoTarget(newUrl) && NS.protectedTabs.has(tabId)) { NS.pauseNavBlocking(tabId, "tabs-serp"); }
+          if (NS.isHostileAutoTarget(newUrl) && NS.isTabProtected(tabId)) { NS.pauseNavBlocking(tabId, "tabs-serp"); }
         }
         if (NS.releaseProtectionIfLeftOrigin(tabId, newUrl)) { st.lastGoodUrl = newUrl; NS.injectNavBoot(tabId, 0); return; }
         if (!NS.isHostileAutoTarget(newUrl)) st.lastGoodUrl = newUrl;
@@ -310,7 +393,7 @@
       if (changeInfo.status === "complete" && tab && tab.url && /^https?:/i.test(tab.url)) {
         const st = NS.getTabNav(tabId);
         if (!NS.isHostileAutoTarget(tab.url)) { st.lastGoodUrl = tab.url; NS.releaseProtectionIfLeftOrigin(tabId, tab.url); }
-        else if (NS.protectedTabs.has(tabId) && !NS.isOnProtectedOrigin(tabId, tab.url)) { NS.pauseNavBlocking(tabId, "complete-serp"); NS.clearTabAnalysisState(tabId); }
+        else if (NS.isTabProtected(tabId) && !NS.isOnProtectedOrigin(tabId, tab.url)) { NS.pauseNavBlocking(tabId, "complete-serp"); NS.clearTabAnalysisState(tabId); }
       }
     });
   }
@@ -334,7 +417,12 @@
 
   // --- tabs.onRemoved ---
   if (chrome.tabs && chrome.tabs.onRemoved) {
-    chrome.tabs.onRemoved.addListener((tabId) => { NS.clearTabAnalysisState(tabId); NS.disarmHostileNavDnr(tabId); NS.tabNavState.delete(tabId); });
+    chrome.tabs.onRemoved.addListener((tabId) => {
+      NS.clearTabAnalysisState(tabId);
+      try { if (typeof NS.clearRiskReportTransactionState === "function") NS.clearRiskReportTransactionState(tabId); } catch { /* ignore */ }
+      NS.disarmHostileNavDnr(tabId);
+      NS.tabNavState.delete(tabId);
+    });
   }
 
   // --- 下载处理（onCreated / onDeterminingFilename / onChanged 共用）---
@@ -351,9 +439,29 @@
         pendingTrustCheck.item = { ...pendingTrustCheck.item, ...item };
         return;
       }
+      // A DownloadItem can arrive through more than one downloads event.
+      // Check this before consuming replay permits so one item cannot drain
+      // permits belonging to another concurrent replay.
+      if (NS._handledDownloadIds.has(item.id)) return;
       const dlUrl = item.finalUrl || item.url || "";
       // VT 门禁通过后的二次下载
-      if (dlUrl && typeof NS.consumeVtPassUrl === "function" && NS.consumeVtPassUrl(dlUrl)) {
+      // Edge may expose the redirected finalUrl before the replayed original
+      // URL. Check and consume both identities; otherwise the allowed replay
+      // is mistaken for a second user download and gets hashed twice.
+      const consumedReleasedId = typeof NS.consumeVtReleasedDownloadId === "function"
+        && NS.consumeVtReleasedDownloadId(item.id);
+      let consumedVtUrl = false;
+      if (typeof NS.consumeVtPassUrl === "function") {
+        const passCandidates = [...new Set([item.finalUrl, item.url].map((x) => String(x || "")).filter(Boolean))];
+        for (const candidate of passCandidates) {
+          // Original and redirected URLs are aliases for the same replay.
+          // Retire one permit from every visible alias even when the exact
+          // downloadId matched, otherwise a manual retry could reuse it.
+          if (NS.consumeVtPassUrl(candidate)) consumedVtUrl = true;
+        }
+      }
+      const consumedVtPass = consumedReleasedId || consumedVtUrl;
+      if (consumedVtPass) {
         NS._handledDownloadIds.add(item.id);
         return;
       }
@@ -378,8 +486,6 @@
       })();
 
       // 已处理过：跳过（避免 onCreated + onDeterminingFilename 双开 VT）
-      if (NS._handledDownloadIds.has(item.id)) return;
-
       // onCreated 时文件名常空：若还看不出是安装包，留给 onDeterminingFilename/onChanged
       if (!isPkg && (source === "onCreated" || source === "early" || source === "queued")) {
         return;
@@ -388,7 +494,7 @@
       const verdict = typeof NS.shouldCancelDownload === "function"
         ? NS.shouldCancelDownload(item)
         : { cancel: false };
-      const protectedTab = tabId != null && NS.protectedTabs && NS.protectedTabs.has(tabId);
+      const protectedTab = tabId != null && typeof NS.isTabProtected === "function" && NS.isTabProtected(tabId);
 
       // Edge 常同时省略 tabId/referrer；页面 postMessage -> content -> SW 比 downloads 事件稍晚。
       // 对这种无来源且仅命中启发式的下载等待 450ms，再用精确 URL 可信意图复判。

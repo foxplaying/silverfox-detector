@@ -145,6 +145,25 @@
           }
           return true;
         }
+        // 域名衍生碎片（Todeskr / Huorongpc）不得进主身份关键词榜
+        try {
+          if (typeof NS.isHostShapedCompoundBrandToken === "function"
+            && NS.isHostShapedCompoundBrandToken(x)) return true;
+          const flat = String(x || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+          const host = (typeof location !== "undefined" ? String(location.hostname || "") : "")
+            .toLowerCase().replace(/^www\./, "");
+          const labelRaw = (host.split(".")[0] || "").toLowerCase();
+          const segs = labelRaw.split(/[-_]/).map((p) => p.replace(/[^a-z0-9]/g, "")).filter((p) => p.length >= 4);
+          const padCore = typeof NS.inferMarketingPaddedBrandCore === "function"
+            ? String(NS.inferMarketingPaddedBrandCore(labelRaw) || "").toLowerCase()
+            : "";
+          // 仅过滤「等于污染主机段」的词（todeskr），保留页内 ToDesk/todesk
+          if (flat && segs.includes(flat) && padCore && flat !== padCore
+            && typeof NS.hostLabelIsPaddedBrand === "function"
+            && NS.hostLabelIsPaddedBrand(flat, padCore)) {
+            return true;
+          }
+        } catch { /* ignore */ }
         return typeof NS.looksLikeAssetGarbageToken === "function" && NS.looksLikeAssetGarbageToken(x);
       };
       const digitRe = NS.CN_DIGIT_PRODUCT_RE || /^\d{2,6}[一-鿿]{2,6}$/;
@@ -809,6 +828,37 @@
       if (!out.display && bestLatEntry && !isHostDebris(bestLatEntry.c)) {
         out.display = fmtDisp(bestLatEntry.c);
       }
+      // ★ 页内身份拉丁（title/h1/og 的 ToDesk）必须压过「仅域名/主机段」拉丁（todeskr→Todeskr）
+      // 用户案例：页面写 ToDesk，toast 却显示域名碎片 Todeskr——选举有过滤，但定稿被域名核抢位。
+      try {
+        const labelRaw0 = String(hostCores.labelRaw || "").toLowerCase();
+        const hostSegs0 = labelRaw0.split(/[-_]/)
+          .map((p) => p.replace(/[^a-z0-9]/g, ""))
+          .filter((p) => p.length >= 4);
+        const pad0 = String(hostCores.padCore || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        const dispFlat0 = String(out.display || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        const displayIsHostSegNoise = !!(dispFlat0 && (
+          isHostDebris(out.display)
+          || (hostSegs0.includes(dispFlat0) && pad0 && dispFlat0 !== pad0)
+          || (dispFlat0 === labelRaw0.replace(/[^a-z0-9]/g, "") && pad0 && dispFlat0 !== pad0)
+        ));
+        const pageLatWinner = allRanked.find((entry) => {
+          if (!entry || entry.script !== "lat" || isHostDebris(entry.c)) return false;
+          const flat = String(entry.c || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+          if (!flat || flat.length < 4) return false;
+          // 必须在页面身份槽出现，不能只靠 domain 票
+          if (!(entry.sources || []).some((src) => PAGE_IDENTITY_FIELD.test(String(src)))) return false;
+          // 排除仍等于污染主机段的词
+          if (hostSegs0.includes(flat) && pad0 && flat !== pad0) return false;
+          return true;
+        });
+        if (pageLatWinner && (displayIsHostSegNoise || !out.display
+          || ((bestOverall && bestOverall.script === "lat"
+            && (bestOverall.sources || []).every((s) => s === "domain"))))) {
+          const pageDisp = fmtDisp(pageLatWinner.c);
+          if (pageDisp) out.display = pageDisp;
+        }
+      } catch { /* ignore */ }
       // 纯数字品牌展示保持原样（4399 不要被 format 成别的）
       if (bestOverall && /^\d{3,6}$/.test(bestOverall.c)) out.display = bestOverall.c;
       // ★ 页内强字段中文/混合产品（QQ音乐）永远压过「仅域名核」拉丁（Yinle@qqyinle）
@@ -1165,20 +1215,30 @@
           && NS.hostLooksLikeOfficialProductSubdomain(host, kw)) {
           // music.qq.com / y.qq.com / shurufa.sogou.com + 页内品牌 → 正站 exact
           consider(apexFlatRel || label, "exact", 99);
-        } else if (typeof NS.hostLabelStronglyAlignedWithIdentityKeywords === "function"
+        } else if (!mktShape
+          && !(typeof NS.isYoungUnverifiedRegistration === "function" && NS.isYoungUnverifiedRegistration())
+          && typeof NS.hostLabelStronglyAlignedWithIdentityKeywords === "function"
           && (NS.hostLabelStronglyAlignedWithIdentityKeywords(labelRaw, kw)
             || NS.hostLabelStronglyAlignedWithIdentityKeywords(apexLeftRel, kw))) {
           // 展示用品牌核：域名前缀里最长的页面拉丁 token（todesk 而非 ai）
-          // 强对齐仅对「非夹带」apex；用 apex 扁平标签比对
+          // 强对齐仅对「非夹带、非年轻」apex；todesk-ze 等已在上方走 padded
           const alignLab = apexFlatRel || label;
           let coreTok = "";
           const latinCands = cleanTokens
             .map((t) => String(t || "").toLowerCase().replace(/[^a-z0-9]/g, ""))
-            .filter((t) => t.length >= 4 && alignLab.startsWith(t) && !/^(?:linux|windows|android|macos|ai|gpt)$/i.test(t)
-              && !(typeof NS.isMarketingHostPrefixToken === "function" && NS.isMarketingHostPrefixToken(t)))
+            .filter((t) => {
+              if (t.length < 4 || !alignLab.startsWith(t) || /^(?:linux|windows|android|macos|ai|gpt)$/i.test(t)) return false;
+              if (typeof NS.isMarketingHostPrefixToken === "function" && NS.isMarketingHostPrefixToken(t)) return false;
+              const pad = alignLab.slice(t.length);
+              // 短垃圾尾（ze/o/x）→ 非 exact 正站
+              if (pad.length >= 1 && pad.length <= 2 && /^[a-z0-9]{1,2}$/i.test(pad)
+                && !/^(?:ai|go|tv|os|io|me|up|db|js|py|id)$/i.test(pad)) return false;
+              if (pad && typeof NS.hostLabelIsPaddedBrand === "function" && NS.hostLabelIsPaddedBrand(alignLab, t)) return false;
+              return true;
+            })
             .sort((a, b) => b.length - a.length);
           coreTok = latinCands[0] || (kw.latin && kw.latin[0]) || alignLab;
-          consider(coreTok, "exact", 100);
+          if (latinCands[0]) consider(coreTok, "exact", 100);
         }
       } catch { /* ignore */ }
 
@@ -1445,6 +1505,28 @@
       // 几乎关联：仅 exact / category（及极高分 partial 且拉丁主品牌≥5）
       let squat = bestMatch === "padded" || bestMatch === "typo" || bestMatch === "hyphen"
         || (bestMatch === "partial" && bestScore < 85);
+      // ★ 双保险：apex 已是营销夹带形态时，禁止 related/exact 放行（todesk-ze 曾被洗成 exact）
+      try {
+        const apexLeftForce = (() => {
+          try {
+            const ap = typeof NS.getRegistrableDomain === "function" ? NS.getRegistrableDomain(host) : host;
+            return (String(ap || "").split(".")[0] || labelRaw || "").toLowerCase();
+          } catch { return labelRaw; }
+        })();
+        if (typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
+          && (NS.apexLabelLooksLikeMarketingPaddedBrand(apexLeftForce)
+            || NS.apexLabelLooksLikeMarketingPaddedBrand(labelRaw))) {
+          squat = true;
+          if (bestMatch === "exact" || bestMatch === "category" || bestMatch === "none") {
+            bestMatch = "padded";
+          }
+          if (!bestTok && typeof NS.inferMarketingPaddedBrandCore === "function") {
+            bestTok = NS.inferMarketingPaddedBrandCore(apexLeftForce)
+              || NS.inferMarketingPaddedBrandCore(labelRaw)
+              || bestTok;
+          }
+        }
+      } catch { /* ignore */ }
       let related = !squat && (
         bestMatch === "exact"
         || bestMatch === "category"
@@ -2154,6 +2236,11 @@
         if (officialPitch && hostMatch === "hyphen" && brandHits >= 2) mismatch = true;
         // 前缀-品牌（im-todesk）在 pick 时 brandHits 可能偏低，官方话术 + padded 即 mismatch
         if (officialPitch && hostMatch === "padded" && brandHits >= 2 && (prefixedHyphen || paddedBrand)) mismatch = true;
+        // ★ todesk-ze 等短垃圾尾：有品牌核 + padded 即 mismatch（勿抬到 8 票才认）
+        if (!mismatch && hostMatch === "padded" && paddedBrand && brandToken && brandHits >= 1
+          && /下载|客户端|安装|免费|官网|官方|软件|远程|桌面/i.test(titleLow + claimText + body.slice(0, 800))) {
+          mismatch = true;
+        }
         if (officialPitch && hostMatch === "none" && brandHits >= 8) mismatch = true;
         if (officialPitch && hostMatch === "partial" && !rigorousMatch && brandHits >= 12) mismatch = true;
         if (officialPitch && canonMismatch && !rigorousMatch && brandHits >= 8) mismatch = true;
@@ -2304,12 +2391,24 @@
           if (titleLow.includes(hr) || titleLow.replace(/[^a-z0-9]/g, "").includes(hr)) return false;
         }
       } catch { /* ignore */ }
-      // title/logo/nav 关键词能拼成域名（todesk+AI）→ 非营销仿冒
+      // ★ 年轻无备案：必须走仿冒链，禁止任何「正站对齐」捷径
       try {
-        const labAlign = ((location.hostname || "").split(".")[0] || "").toLowerCase();
-        if (typeof NS.hostLabelStronglyAlignedWithIdentityKeywords === "function"
-          && NS.hostLabelStronglyAlignedWithIdentityKeywords(labAlign)) {
-          return false;
+        if (typeof NS.isYoungUnverifiedRegistration === "function"
+          && NS.isYoungUnverifiedRegistration()) {
+          /* 不 early-return；继续 mismatch / padded 判定 */
+        } else {
+          // title/logo/nav 关键词能拼成域名（todesk+AI）→ 非营销仿冒
+          // 必须用 apex 左标，勿用 www；todesk-ze 等短垃圾尾不得当正站放行
+          const host0 = String(location.hostname || "").toLowerCase().replace(/^www\./, "");
+          const apex0 = (typeof NS.getRegistrableDomain === "function" ? NS.getRegistrableDomain(host0) : host0) || host0;
+          const labAlign = (String(apex0).split(".")[0] || "").toLowerCase();
+          if (typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
+            && NS.apexLabelLooksLikeMarketingPaddedBrand(labAlign)) {
+            /* 夹带 apex：继续往下判仿冒 */
+          } else if (typeof NS.hostLabelStronglyAlignedWithIdentityKeywords === "function"
+            && NS.hostLabelStronglyAlignedWithIdentityKeywords(labAlign)) {
+            return false;
+          }
         }
       } catch { /* ignore */ }
       const state = NS.state;

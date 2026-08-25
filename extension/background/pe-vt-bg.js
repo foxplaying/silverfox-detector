@@ -21,15 +21,16 @@
   const VT_UI_BASE = "https://www.virustotal.com/ui/files/";
   const VT_UI_UPLOAD = "https://www.virustotal.com/ui/files";
   const VT_UPLOAD_PAGE = "https://www.virustotal.com/gui/home/upload";
-  /** 全量拉取 / 分段扫描统一上限 650MB */
+  /** 全量拉取仍受 VT 650MB 限制；Range 只读取 ZIP 元数据/候选成员，可覆盖更大的容器。 */
   const MAX_FULL_FETCH = 650 * 1024 * 1024;
-  const MAX_RANGE_ARCHIVE = 650 * 1024 * 1024;
+  const MAX_RANGE_ARCHIVE = 8 * 1024 * 1024 * 1024;
   /** 同一文件 hash 的 VT 结果缓存 24h（内存 + storage） */
   const VT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
   const VT_DURABLE_KEY_PREFIX = "vtOk_";
   /** v4：独立厂商加权票（Kaspersky=3…）；Avast/AVG 同组；拦截看加权分而非纯家数 */
   const VT_TRUST_POLICY_VERSION = 4;
-  const VT_STATS_POLICY_VERSION = 2;
+  /** v3：文件报告必须与目标完整 SHA-256 绑定；废弃可能串样本的旧统计缓存。 */
+  const VT_STATS_POLICY_VERSION = 3;
   const FETCH_TIMEOUT_MS = 120000;
   /** 与网页 https://www.virustotal.com/gui/home/upload 一致：最大 650MB */
   const VT_UPLOAD_MAX = 650 * 1024 * 1024;
@@ -484,7 +485,7 @@
    * 从 VT signature_info 判定数字签名真伪。
    * trust: valid | invalid | present | none | ""
    * 仅当 VT 明确 verified=Signed（或等价验真通过）才标 valid。
-   * 有 product/copyright 但无 Authenticode → none，禁止当成「VT 有效」。
+   * 仅有 product/copyright 不能证明有签或无签 → 空结论，禁止当成「VT 有效」。
    */
   function vtSignatureMetaFromAttrs(attrs) {
     try {
@@ -553,10 +554,10 @@
     if (hasAuthChain && signer) {
       return { trust: "present", signer };
     }
-    // 仅有 product/description/file version 等版本资源 → 无签名
+    // 仅有 product/description/file version 等版本资源并不能证明“未签名”。
     if (sig.product || sig.description || sig["file version"] || sig.file_version
       || sig["original name"] || sig.copyright) {
-      return { trust: "none", signer: "" };
+      return { trust: "", signer: "" };
     }
     return { trust: "", signer: "" };
     } catch {
@@ -641,7 +642,7 @@
       if (/"signers"\s*:\s*"[^"]{3,}"/i.test(s) && signer && !/not\s*signed|unsigned/i.test(sLow)) {
         return { trust: "present", signer };
       }
-      return { trust: "none", signer: "" };
+      return { trust: "", signer: "" };
     }
     if (signer && /Signed by/i.test(s) && /"verified"\s*:\s*"Signed"/i.test(s)) {
       return { trust: "valid", signer };
@@ -649,9 +650,24 @@
     return { trust: "", signer };
   }
 
+  function peSignatureInspectionWasSkipped(pe) {
+    if (!pe || pe.skipped !== true) return false;
+    if (pe.signatureUnscanned === true || pe.unscanned === true) return true;
+    return /too[-_ ]?large|unscanned|not[-_ ]?read|incomplete|超过.*(?:mb|大小)|未完整读取/i
+      .test(String(pe.reason || pe.error || ""));
+  }
+
+  function signatureTrustIsUnknown(value) {
+    return /^(?:unknown|unscanned)$/i.test(String(value || ""));
+  }
+
+  function signatureTrustIsPositive(value) {
+    return /^(?:present|valid)$/i.test(String(value || ""));
+  }
+
   /**
    * 综合本地 PE 证书表 + VT signature_info → 数字签名展示状态。
-   * trust: none | present(黑) | valid(绿) | invalid(红)
+   * trust: unknown(未读取) | none | present(黑) | valid(绿) | invalid(红)
    *
    * 绿：VT 确认签名有效（verified=Signed / 有 signature_info 签名人等）
    * 黑：仅本地有证书表，VT 未给出验真结论
@@ -664,40 +680,20 @@
     const name = localName || vtName;
     let vtTrust = String((vt && vt.sigTrustFromVt) || "").toLowerCase();
 
-    // 从 VT summary/raw 再抠一层（DOM/部分 JSON 路径）
-    if ((!vtTrust || vtTrust === "present") && vt) {
-      const blob = [vt.summary, vt.rawText, vt.pageHint].filter(Boolean).join("\n");
-      if (blob) {
-        const ex = extractVtSignatureFromText(blob);
-        if (ex.trust) vtTrust = ex.trust;
-        // signer 回填由调用方处理
-      }
-    }
-
-    let trust = "none";
+    let trust = peSignatureInspectionWasSkipped(pe) ? "unknown" : "none";
 
     if (vtTrust === "invalid") {
       trust = "invalid";
     } else if (vtTrust === "valid") {
       trust = "valid";
-    } else if (vtTrust === "none" && !localSigned) {
+    } else if (vtTrust === "none") {
+      // 仅接受与目标 SHA 绑定的结构化 signature_info；其明确未签名时覆盖本地粗检。
       trust = "none";
     } else if (localSigned && vt && vt.found === true && vt.notFound !== true && !vt.unknown) {
-      // 本地有签 + VT 库中有该文件：
-      // 若 VT 给出了签名人且与本地一致（或仅一边有名），升为绿
-      if (vtTrust === "present" || vtName || vtTrust === "valid") {
-        if (!vtName || !localName || signerNamesLooselyMatch(localName, vtName)) {
-          trust = "valid";
-        } else {
-          // 本地与 VT 签名人不一致 → 可疑红
-          trust = "invalid";
-        }
-      } else if (vt.sigTrustFromVt === "" || !vtTrust) {
-        // VT 有报告但未带回 signature_info：保持黑（仅本地有签）
-        trust = "present";
-      } else {
-        trust = "present";
-      }
+      // VT 有报告但没有明确验真结论：仍只显示本地“有签”，不得自行升绿。
+      trust = "present";
+    } else if (peSignatureInspectionWasSkipped(pe)) {
+      trust = "unknown";
     } else if (localSigned || vtTrust === "present") {
       trust = "present";
     } else if (pe && pe.isPe) {
@@ -721,7 +717,8 @@
       for (const n of nested) {
         if (!n) continue;
         let nSigner = sanitizePublisherName(n.signerHint || n.signer || "");
-        let nTrust = String(n.sigTrust || n.trust || (n.signed ? "present" : "none")).toLowerCase();
+        let nTrust = String(n.sigTrust || n.trust
+          || (peSignatureInspectionWasSkipped(n) ? "unknown" : (n.signed ? "present" : "none"))).toLowerCase();
         // 包内：版本资源名冒充签署者时打回无签
         if (nSigner && isPeVersionResourceLabel(nSigner) && nTrust !== "valid") {
           nSigner = "";
@@ -740,9 +737,11 @@
     if ((!pe || !pe.isPe || pe.skipped) && items.length) {
       if (items.some((x) => x.trust === "invalid")) trust = "invalid";
       else if (items.every((x) => x.trust === "valid")) trust = "valid";
-      else if (items.some((x) => x.signed || x.trust === "present" || x.trust === "valid")) {
+      else if (items.some((x) => x.trust === "present" || x.trust === "valid"
+        || (x.signed && x.trust !== "none"))) {
         trust = trust === "valid" ? "valid" : "present";
-      } else trust = "none";
+      } else if (items.some((x) => signatureTrustIsUnknown(x.trust))) trust = "unknown";
+      else trust = "none";
     }
 
     let displaySigner = name || vtName;
@@ -754,20 +753,45 @@
     return {
       trust: trust || "none",
       signer: displaySigner,
-      items
+      items,
+      unscanned: signatureTrustIsUnknown(trust),
+      reason: signatureTrustIsUnknown(trust) ? String((pe && (pe.reason || pe.error)) || "unscanned") : ""
     };
   }
 
   // ---------- ZIP 内嵌可执行文件（store / deflate；中文名 GBK/UTF-8）----------
-  async function inflateZipPayload(u8) {
+  async function inflateZipPayload(u8, expectedSize) {
     if (typeof DecompressionStream === "undefined") return null;
+    const expected = Number(expectedSize);
+    if (!Number.isFinite(expected) || expected < 64 || expected > MAX_NESTED_BYTES
+      || expected === 0xffffffff) return null;
     // ZIP 规范为 raw deflate；个别实现带 zlib 头，两种都试
     for (const fmt of ["deflate-raw", "deflate"]) {
       try {
         const ds = new DecompressionStream(fmt);
         const stream = new Blob([u8]).stream().pipeThrough(ds);
-        const ab = await new Response(stream).arrayBuffer();
-        if (ab && ab.byteLength >= 64) return ab;
+        const reader = stream.getReader();
+        const chunks = [];
+        let total = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = value instanceof Uint8Array ? value : new Uint8Array(value || 0);
+          total += chunk.byteLength;
+          if (total > MAX_NESTED_BYTES || total > expected) {
+            try { await reader.cancel("zip-output-limit"); } catch { /* ignore */ }
+            throw new Error("zip-output-limit");
+          }
+          chunks.push(chunk);
+        }
+        if (total !== expected || total < 64) continue;
+        const out = new Uint8Array(total);
+        let offset = 0;
+        for (const chunk of chunks) {
+          out.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        return out.buffer;
       } catch { /* try next */ }
     }
     return null;
@@ -883,6 +907,56 @@
     } catch {
       return "unknown";
     }
+  }
+
+  function responseLooksLikeWebDocument(ab, contentType) {
+    try {
+      const ct = String(contentType || "").toLowerCase();
+      if (/\b(?:text\/html|application\/(?:json|problem\+json|xhtml\+xml)|text\/xml)\b/i.test(ct)) return true;
+      if (!ab || !ab.byteLength) return true;
+      const u8 = new Uint8Array(ab, 0, Math.min(ab.byteLength, 2048));
+      let ascii = "";
+      for (let i = 0; i < u8.length; i++) {
+        const b = u8[i];
+        ascii += (b === 9 || b === 10 || b === 13 || (b >= 32 && b <= 126))
+          ? String.fromCharCode(b) : " ";
+      }
+      const head = ascii.replace(/^\s+/, "").slice(0, 800);
+      return /^(?:<!doctype\s+html|<html\b|<head\b|<body\b|<script\b|<\?xml\b)/i.test(head)
+        || /^(?:\{|\[)\s*"?(?:error|message|code|status|login|redirect|url)"?\s*:/i.test(head)
+        || /^(?:access\s*denied|unauthorized|forbidden|please\s+(?:log\s*in|sign\s*in))/i.test(head);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * A successful HTTP status is not proof that the response is the requested
+   * package. Reject login/error documents and enforce the formats whose magic
+   * is deterministic before computing SHA256 or declaring a file unsigned.
+   */
+  function packagePayloadMismatchReason(ab, kind, declaredArchiveFormat, contentType) {
+    if (responseLooksLikeWebDocument(ab, contentType)) return "web-document";
+    if (kind === "pe") {
+      if (!isMzPeBuffer(ab)) return "not-pe";
+      try {
+        if (!(NS.parsePeAuthenticode(ab) || {}).isPe) return "not-pe";
+      } catch { return "not-pe"; }
+    }
+    if (kind === "msi" && !isOleMsiBuffer(ab)) return "not-msi";
+    const actualArchive = detectArchiveFormat(ab);
+    if (kind === "apk" && actualArchive !== "zip") return "not-apk";
+    if (declaredArchiveFormat && /^(?:zip|rar|7z|gzip)$/.test(declaredArchiveFormat)
+      && actualArchive !== declaredArchiveFormat) {
+      return `not-${declaredArchiveFormat}`;
+    }
+    if (declaredArchiveFormat === "cab") {
+      try {
+        const u8 = new Uint8Array(ab, 0, Math.min(4, ab.byteLength));
+        if (!(u8[0] === 0x4d && u8[1] === 0x53 && u8[2] === 0x43 && u8[3] === 0x46)) return "not-cab";
+      } catch { return "not-cab"; }
+    }
+    return "";
   }
 
   function sliceZipView(ab) {
@@ -1449,10 +1523,19 @@
    * 策略：扩展名优先；扩展名匹配不到时，对包内文件解压并用 MZ/OLE 魔数探测。
    * 返回 { items, format, note }
    */
-  async function scanNestedExecutablesInArchive(arrayBuffer) {
+  async function scanNestedExecutablesInArchive(arrayBuffer, expectedNameOrFormat) {
     const result = { items: [], format: "unknown", note: "" };
+    const expectedRaw = typeof expectedNameOrFormat === "object" && expectedNameOrFormat
+      ? (expectedNameOrFormat.expectedFormat || expectedNameOrFormat.filename || expectedNameOrFormat.name || "")
+      : expectedNameOrFormat;
+    const expected = /^(?:rar|7z|zip)$/i.test(String(expectedRaw || ""))
+      ? String(expectedRaw).toLowerCase()
+      : expectedArchiveFormatFromName(expectedRaw);
     if (!arrayBuffer || arrayBuffer.byteLength < 64) {
-      result.note = "文件过小";
+      const label = expected === "rar" ? "RAR" : expected === "7z" ? "7Z" : "压缩包";
+      result.note = expected
+        ? `响应不是 ${label}（可能需要登录、发生跳转或文件不完整）`
+        : "文件过小，无法识别压缩包格式";
       return result;
     }
     result.format = detectArchiveFormat(arrayBuffer);
@@ -1463,7 +1546,14 @@
       return scanRarOr7zExecutables(arrayBuffer, "7z");
     }
     if (result.format !== "zip") {
-      result.note = "无法识别为 ZIP（扩展名可能被伪装）";
+      if (expected === "rar" || expected === "7z") {
+        const label = expected === "rar" ? "RAR" : "7Z";
+        result.note = `响应不是 ${label}（可能需要登录、发生跳转或文件不完整）`;
+      } else if (expected === "zip") {
+        result.note = "响应不是 ZIP（可能需要登录、发生跳转或文件不完整）";
+      } else {
+        result.note = "无法识别压缩包格式（响应可能为登录页、跳转页或文件不完整）";
+      }
       return result;
     }
 
@@ -1512,8 +1602,10 @@
         skippedMethod++;
         continue;
       }
-      // 仅当「压缩后」就超过上限才跳过；uncomp 虚高仍尝试解压
-      if (e.compSize > 0 && e.compSize !== 0xffffffff && e.compSize > MAX_NESTED_BYTES) {
+      // 压缩前后尺寸都必须可信且在预算内，避免高压缩比 ZIP bomb。
+      if (!Number.isFinite(e.compSize) || e.compSize < 0 || e.compSize === 0xffffffff
+        || e.compSize > MAX_NESTED_BYTES || !Number.isFinite(e.uncompSize)
+        || e.uncompSize < 64 || e.uncompSize === 0xffffffff || e.uncompSize > MAX_NESTED_BYTES) {
         skippedSize++;
         continue;
       }
@@ -1527,6 +1619,9 @@
         const e = entries[ei];
         if (!e || (e.flags & 0x1)) continue;
         if (e.method !== 0 && e.method !== 8) continue;
+        if (!Number.isFinite(e.compSize) || e.compSize < 0 || e.compSize === 0xffffffff
+          || e.compSize > MAX_NESTED_BYTES || !Number.isFinite(e.uncompSize)
+          || e.uncompSize < 64 || e.uncompSize === 0xffffffff || e.uncompSize > MAX_NESTED_BYTES) continue;
         let base = basenameFromZipPath(e.name || "") || ("entry_" + ei);
         fileEntries.push({
           e,
@@ -1602,10 +1697,11 @@
         if (payload.method === 0) {
           fileAb = copyToArrayBuffer(payload.data);
         } else if (payload.method === 8) {
-          fileAb = await inflateZipPayload(payload.data);
+          fileAb = await inflateZipPayload(payload.data, e.uncompSize);
         }
         tried++;
-        if (!fileAb || fileAb.byteLength < 64) {
+        if (!fileAb || fileAb.byteLength < 64 || fileAb.byteLength !== e.uncompSize
+          || fileAb.byteLength > MAX_NESTED_BYTES) {
           inflateFail++;
           continue;
         }
@@ -1673,11 +1769,22 @@
    * 压缩包风险以包内可执行文件为准：外壳 zip 常无 VT 记录，不能盖过内层 exe 的检出。
    * 返回 { item, vt, mal, sus, score } 或 null。
    */
+  function nestedVtMatchesItem(item) {
+    const itemHash = String((item && item.sha256) || "").trim().toLowerCase();
+    const vt = item && item.vt;
+    const vtHash = String((vt && vt.hash) || "").trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(itemHash)
+      || !/^[a-f0-9]{64}$/.test(vtHash)
+      || itemHash !== vtHash) return false;
+    // 只有 found 报告依赖统计口径；notFound/unknown 只验证文件身份。
+    return vt.found !== true || Number(vt.statsPolicyVersion) === VT_STATS_POLICY_VERSION;
+  }
+
   function pickBestNestedVtHit(nested) {
     let best = null;
     if (!Array.isArray(nested)) return null;
     for (const it of nested) {
-      if (!it) continue;
+      if (!it || !nestedVtMatchesItem(it)) continue;
       const v = it.vt;
       if (!v || v.found !== true || v.notFound === true || v.unknown) continue;
       const mal = Number(v.malicious) || 0;
@@ -1787,9 +1894,16 @@
     // 数字签名进独立行，风险里只报严重问题
     if (sig && sig.trust === "invalid") {
       risks.push({ level: "high", text: "数字签名无效/不可信（VT 或证书异常）" });
-    } else if (!trustedSource && requireSignedPe && pe && pe.isPe && !pe.signed) {
+    } else if (!trustedSource && requireSignedPe && pe && pe.isPe
+      && !signatureTrustIsPositive(sig && sig.trust)
+      && !peSignatureInspectionWasSkipped(pe) && !signatureTrustIsUnknown(sig && sig.trust)) {
       risks.push({ level: "medium", text: "未检测到数字签名（来源页处于下载保护状态）" });
-    } else if (!trustedSource && requireSignedPe && nested.length && nested.every((n) => !n.signed && n.kind === "pe")) {
+    } else if (!trustedSource && requireSignedPe
+      && nested.filter((n) => n && (n.kind === "pe" || /\.(?:exe|dll|sys)$/i.test(n.name || ""))).length
+      && nested.filter((n) => n && (n.kind === "pe" || /\.(?:exe|dll|sys)$/i.test(n.name || "")))
+        .every((n) => !signatureTrustIsPositive(n.sigTrust || n.trust)
+        && !peSignatureInspectionWasSkipped(n)
+        && !signatureTrustIsUnknown(n.sigTrust || n.trust))) {
       risks.push({ level: "medium", text: "压缩包内可执行文件均未检测到数字签名" });
     }
 
@@ -1901,6 +2015,46 @@
     ]);
   }
 
+  async function readResponseArrayBufferLimited(res, maxBytes, controller) {
+    const limit = Math.max(1, Number(maxBytes) || 1);
+    const declared = Number(res && res.headers && res.headers.get("content-length") || 0);
+    if (declared > limit) {
+      try { if (res.body) await res.body.cancel("response-too-large"); } catch { /* ignore */ }
+      try { if (controller) controller.abort(); } catch { /* ignore */ }
+      return { ok: false, tooLarge: true, contentLength: declared, buf: null };
+    }
+    if (!res.body || typeof res.body.getReader !== "function") {
+      // 无流式 reader 且长度未知时不能安全调用 arrayBuffer()。
+      if (!declared) return { ok: false, error: "response-stream-unavailable", buf: null };
+      const ab = await res.arrayBuffer();
+      return ab.byteLength <= limit
+        ? { ok: true, buf: ab, contentLength: ab.byteLength }
+        : { ok: false, tooLarge: true, contentLength: ab.byteLength, buf: null };
+    }
+    const reader = res.body.getReader();
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value || 0);
+      total += chunk.byteLength;
+      if (total > limit) {
+        try { await reader.cancel("response-too-large"); } catch { /* ignore */ }
+        try { if (controller) controller.abort(); } catch { /* ignore */ }
+        return { ok: false, tooLarge: true, contentLength: Math.max(total, declared), buf: null };
+      }
+      chunks.push(chunk);
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { ok: true, buf: out.buffer, contentLength: total };
+  }
+
   async function fetchArrayBuffer(url, opts) {
     const timeoutMs = (opts && opts.timeoutMs) || FETCH_TIMEOUT_MS;
     const maxBytes = (opts && opts.maxBytes) || MAX_FULL_FETCH;
@@ -1912,45 +2066,33 @@
     try {
       const res = await fetch(url, {
         method: "GET",
-        credentials: "omit",
+        // User-initiated download endpoints commonly require the browser
+        // session. Omitting cookies can return a 200 login/error document,
+        // which must never be hashed as though it were the installer.
+        credentials: "include",
         cache: "no-store",
         redirect: "follow",
         signal: controller ? controller.signal : undefined,
         headers
       });
-      if (timer) clearTimeout(timer);
-      if (!res.ok) return { ok: false, status: res.status, buf: null, headers: res.headers };
-      const len = Number(res.headers.get("content-length") || 0);
-      if (len > maxBytes) {
-        return {
-          ok: false,
-          status: res.status,
-          buf: null,
-          tooLarge: true,
-          contentLength: len,
-          headers: res.headers
-        };
-      }
-      const ab = await res.arrayBuffer();
-      if (ab.byteLength > maxBytes) {
-        return {
-          ok: false,
-          status: res.status,
-          buf: null,
-          tooLarge: true,
-          contentLength: ab.byteLength,
-          headers: res.headers
-        };
-      }
-      return { ok: true, status: res.status, buf: ab, headers: res.headers, contentLength: ab.byteLength };
+      const responseMeta = {
+        status: res.status,
+        headers: res.headers,
+        finalUrl: String(res.url || url || ""),
+        contentType: String(res.headers && res.headers.get("content-type") || "").toLowerCase()
+      };
+      if (!res.ok) return { ok: false, buf: null, ...responseMeta };
+      const body = await readResponseArrayBufferLimited(res, maxBytes, controller);
+      return { ...body, ...responseMeta };
     } catch (e) {
-      if (timer) clearTimeout(timer);
       return {
         ok: false,
         status: 0,
         buf: null,
         error: e && e.message ? e.message : "fetch-fail"
       };
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -1972,40 +2114,68 @@
           Accept: "*/*"
         }
       });
-      if (timer) clearTimeout(timer);
       if (res.status !== 206 && res.status !== 200) {
-        return { ok: false, status: res.status, buf: null, rangeSupported: res.status !== 200 };
+        return {
+          ok: false,
+          status: res.status,
+          buf: null,
+          rangeSupported: res.status !== 200,
+          headers: res.headers,
+          contentRange: String(res.headers.get("content-range") || "")
+        };
       }
-      const ab = await res.arrayBuffer();
+      const requested = Math.max(1, Number(end) - Number(start) + 1);
+      const maxRead = requested + 64 * 1024;
+      const body = await readResponseArrayBufferLimited(res, maxRead, controller);
+      if (!body.ok || !body.buf) {
+        return {
+          ...body,
+          status: res.status,
+          rangeSupported: res.status === 206,
+          headers: res.headers,
+          contentRange: String(res.headers.get("content-range") || "")
+        };
+      }
       return {
         ok: true,
         status: res.status,
-        buf: ab,
-        rangeSupported: res.status === 206
+        buf: body.buf,
+        contentLength: body.contentLength,
+        rangeSupported: res.status === 206,
+        headers: res.headers,
+        contentRange: String(res.headers.get("content-range") || "")
       };
     } catch (e) {
-      if (timer) clearTimeout(timer);
       return {
         ok: false,
         status: 0,
         buf: null,
         error: e && e.message ? e.message : "range-fail"
       };
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
   async function headContentLength(url) {
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => {
+      try { controller.abort(); } catch { /* ignore */ }
+    }, 15000) : null;
     try {
       const res = await fetch(url, {
         method: "HEAD",
         credentials: "omit",
         cache: "no-store",
-        redirect: "follow"
+        redirect: "follow",
+        signal: controller ? controller.signal : undefined
       });
       if (!res.ok) return 0;
       return Number(res.headers.get("content-length") || 0) || 0;
     } catch {
       return 0;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -2025,19 +2195,27 @@
     if (!total || total < 64) {
       // HEAD 失败：试 Range 最后 1 字节拿 Content-Range
       const probe = await fetchByteRange(url, 0, 0, 15000);
-      if (probe.ok && probe.buf) {
-        // 若 200 返回全文则放弃 range 路径
-        if (probe.status === 200 && probe.buf.byteLength > 2) {
-          result.note = "服务器不支持分段下载，且文件过大";
-          return result;
-        }
+      // 服务器忽略 Range 时绝不继续；fetchByteRange 已限制实际读取，避免吞下全文。
+      if (probe.status === 200 || probe.rangeSupported === false) {
+        result.note = "服务器不支持分段下载，且文件过大";
+        return result;
       }
-      result.note = "无法获取文件大小，跳过超大包扫描";
-      return result;
+      if (probe.ok && probe.buf && probe.status === 206) {
+        const match = String(probe.contentRange || "").match(/^bytes\s+\d+-\d+\/(\d+)$/i);
+        const rangeTotal = match ? Number(match[1]) : 0;
+        if (Number.isSafeInteger(rangeTotal) && rangeTotal >= 64) total = rangeTotal;
+      }
+      if (total >= 64) result.contentLength = total;
+      else {
+        result.note = "无法获取文件大小，跳过超大包扫描";
+        return result;
+      }
     }
     result.contentLength = total;
     if (total > MAX_RANGE_ARCHIVE) {
-      result.note = "文件超过 650MB，跳过包内扫描（" + Math.round(total / 1048576) + "MB）";
+      result.note = "文件超过 Range 扫描上限（"
+        + Math.round(MAX_RANGE_ARCHIVE / 1073741824) + "GB），跳过包内扫描（"
+        + Math.round(total / 1048576) + "MB）";
       return result;
     }
 
@@ -2149,7 +2327,9 @@
       if (looksDir && !byExt) continue;
       if (e.flags & 0x1) continue;
       if (e.method !== 0 && e.method !== 8) continue;
-      if (e.compSize > MAX_NESTED_BYTES) continue;
+      if (!Number.isFinite(e.compSize) || e.compSize < 0 || e.compSize === 0xffffffff
+        || e.compSize > MAX_NESTED_BYTES || !Number.isFinite(e.uncompSize)
+        || e.uncompSize < 64 || e.uncompSize === 0xffffffff || e.uncompSize > MAX_NESTED_BYTES) continue;
       candidates.push({ e, base, byExt });
     }
     candidates.sort((a, b) => (a.byExt === b.byExt ? 0 : a.byExt ? -1 : 1));
@@ -2160,7 +2340,9 @@
       for (let ei = 0; ei < Math.min(entries.length, 8); ei++) {
         const e = entries[ei];
         if ((e.flags & 0x1) || (e.method !== 0 && e.method !== 8)) continue;
-        if (e.compSize > MAX_NESTED_BYTES) continue;
+        if (!Number.isFinite(e.compSize) || e.compSize < 0 || e.compSize === 0xffffffff
+          || e.compSize > MAX_NESTED_BYTES || !Number.isFinite(e.uncompSize)
+          || e.uncompSize < 64 || e.uncompSize === 0xffffffff || e.uncompSize > MAX_NESTED_BYTES) continue;
         toTry.push({
           e,
           base: basenameFromZipPath(e.name) || ("entry_" + ei),
@@ -2199,23 +2381,23 @@
             if (!exact.ok || !exact.buf) continue;
             let fileAb = null;
             if (e.method === 0) fileAb = exact.buf;
-            else fileAb = await inflateZipPayload(new Uint8Array(exact.buf));
-            if (!fileAb) continue;
+            else fileAb = await inflateZipPayload(new Uint8Array(exact.buf), e.uncompSize);
+            if (!fileAb || fileAb.byteLength !== e.uncompSize || fileAb.byteLength > MAX_NESTED_BYTES) continue;
             await pushNestedFromBuffer(result.items, fileAb, base, e.name, byExt);
             continue;
           }
           const data = new Uint8Array(chunk.buf, dataStart, cs);
           let fileAb = null;
           if (e.method === 0) fileAb = copyToArrayBuffer(data);
-          else fileAb = await inflateZipPayload(data);
-          if (!fileAb) continue;
+          else fileAb = await inflateZipPayload(data, e.uncompSize);
+          if (!fileAb || fileAb.byteLength !== e.uncompSize || fileAb.byteLength > MAX_NESTED_BYTES) continue;
           await pushNestedFromBuffer(result.items, fileAb, base, e.name, byExt);
           continue;
         }
         let fileAb = null;
         if (payload.method === 0) fileAb = copyToArrayBuffer(payload.data);
-        else fileAb = await inflateZipPayload(payload.data);
-        if (!fileAb) continue;
+        else fileAb = await inflateZipPayload(payload.data, e.uncompSize);
+        if (!fileAb || fileAb.byteLength !== e.uncompSize || fileAb.byteLength > MAX_NESTED_BYTES) continue;
         await pushNestedFromBuffer(result.items, fileAb, base, e.name, byExt);
       } catch { /* next */ }
     }
@@ -2308,6 +2490,27 @@
     for (const it of candidates) {
       const hash = String((it && it.sha256) || "").toLowerCase();
       if (!/^[a-f0-9]{64}$/.test(hash)) continue;
+      const nv = it && it.vt;
+      if (nestedVtMatchesItem(it) && nv) {
+        if (nv.sigTrustFromVt === "valid") {
+          it.sigTrust = "valid";
+          if (nv.signerFromVt && !isPeVersionResourceLabel(nv.signerFromVt)) {
+            it.signerHint = sanitizePublisherName(nv.signerFromVt) || it.signerHint;
+          }
+        } else if (nv.sigTrustFromVt === "invalid") {
+          it.sigTrust = "invalid";
+        } else if (nv.sigTrustFromVt === "none") {
+          it.sigTrust = "none";
+        }
+        const signaturePending = !!it.signed
+          && (!/^(?:valid|invalid|none)$/i.test(String(nv.sigTrustFromVt || ""))
+            || nv.signatureIncomplete === true);
+        const verifiedMiss = nv.notFound === true && nv.verifiedNotFound === true && nv.softMiss !== true;
+        const recentUnknown = nv.unknown === true
+          && Date.now() - (Number(nv.checkedAt) || 0) < 30000;
+        if (!signaturePending && (nv.found === true || verifiedMiss || recentUnknown)) continue;
+        if (verifiedMiss || recentUnknown) continue;
+      }
       if (!byHash.has(hash)) byHash.set(hash, []);
       byHash.get(hash).push(it);
     }
@@ -2329,12 +2532,21 @@
           );
         } catch { vt = null; }
         if (!vt || typeof vt !== "object") continue;
+        const vtHash = String(vt.hash || "").trim().toLowerCase();
+        // 即使 lookup 调用参数正确，也必须在落到成员前再次核对返回文件身份。
+        if (!/^[a-f0-9]{64}$/.test(vtHash) || vtHash !== hash) continue;
         for (const it of groupedItems) {
           // 保留权威引擎明细，供风险文案 / 硬拦共识使用（勿只留 29/61 总数）
           it.vt = {
             found: vt.found,
             notFound: !!vt.notFound,
+            verifiedNotFound: vt.verifiedNotFound === true,
+            softMiss: vt.softMiss === true,
             unknown: !!vt.unknown,
+            hash: vtHash,
+            statsPolicyVersion: Number(vt.statsPolicyVersion) || 0,
+            signatureIncomplete: vt.signatureIncomplete === true,
+            checkedAt: Date.now(),
             malicious: Number(vt.malicious) || 0,
             suspicious: Number(vt.suspicious) || 0,
             total: Number(vt.total) || 0,
@@ -2583,7 +2795,8 @@
   function cacheVtResult(hash, result, ttlMs) {
     try {
       const h = String(hash || "").toLowerCase();
-      if (!h || h.length !== 64 || !result) return;
+      const resultHash = String((result && result.hash) || "").trim().toLowerCase();
+      if (!/^[a-f0-9]{64}$/.test(h) || resultHash !== h) return;
       const ttl = Math.max(1000, Number(ttlMs) || VT_CACHE_TTL_MS);
       const entry = {
         at: Date.now(),
@@ -2607,7 +2820,7 @@
                 verifiedNotFound: !found && result.verifiedNotFound === true,
                 unknown: false,
                 softMiss: false,
-                hash: h,
+                hash: resultHash,
                 guiUrl: result.guiUrl || (VT_GUI_BASE + h),
                 uploadUrl: result.uploadUrl || VT_UPLOAD_PAGE,
                 source: result.source || "vt-cache",
@@ -2621,7 +2834,8 @@
                 signerFromVt: result.signerFromVt || "",
                 sigTrustFromVt: result.sigTrustFromVt || "",
                 trustedPolicyVersion: result.trustedPolicyVersion || VT_TRUST_POLICY_VERSION,
-                statsPolicyVersion: result.statsPolicyVersion || VT_STATS_POLICY_VERSION,
+                // 不把旧/缺失统计口径伪装成当前版本；读取端会拒绝旧 found 缓存。
+                statsPolicyVersion: Number(result.statsPolicyVersion) || 0,
                 engineDetailsAvailable: !!result.engineDetailsAvailable,
                 trustedEngineCount: Number(result.trustedEngineCount) || 0,
                 trustedMaliciousCount: Number(result.trustedMaliciousCount) || 0,
@@ -2642,14 +2856,69 @@
     } catch { /* ignore */ }
   }
 
+  /** 文件名/URL 所声明的容器格式；只把实际 ZIP 容器交给 ZIP Range 解析器。 */
+  function expectedArchiveFormatFromName(value) {
+    const s = String(value || "").toLowerCase().split(/[?#]/, 1)[0];
+    if (/\.rar$/.test(s)) return "rar";
+    if (/\.7z$/.test(s)) return "7z";
+    // APK/AppX/MSIX 的容器同样是 ZIP，可安全复用 ZIP 中央目录 Range 扫描。
+    if (/\.(?:zip|apk|appx|msix)$/.test(s)) return "zip";
+    if (/\.(?:gz|tgz)$/.test(s)) return "gzip";
+    if (/\.cab$/.test(s)) return "cab";
+    if (/\.tar$/.test(s)) return "tar";
+    if (/\.(?:iso|img)$/.test(s)) return "iso";
+    return "";
+  }
+
+  /** `present` 仅表示有签名资料，不能作为 VT 已完成验签。 */
+  function hasTerminalVtSignature(result) {
+    return !!(result && result.found === true
+      && /^(?:valid|invalid|none)$/i.test(String(result.sigTrustFromVt || "")));
+  }
+
+  function vtFoundSatisfiesSignatureRequirement(result, requireSignature) {
+    return !!(result && result.found === true
+      && (!requireSignature || hasTerminalVtSignature(result)));
+  }
+
+  async function removeDurableVtCache(hash) {
+    try {
+      const h = String(hash || "").toLowerCase();
+      if (!/^[a-f0-9]{64}$/.test(h)) return;
+      const key = VT_DURABLE_KEY_PREFIX + h;
+      await new Promise((resolve) => {
+        try {
+          chrome.storage.local.remove([key], () => {
+            void chrome.runtime.lastError;
+            resolve();
+          });
+        } catch {
+          resolve();
+        }
+      });
+    } catch { /* ignore */ }
+  }
+
   async function readDurableVtCache(hash) {
     try {
       const h = String(hash || "").toLowerCase();
-      if (!h || h.length !== 64) return null;
+      if (!/^[a-f0-9]{64}$/.test(h)) return null;
       const key = VT_DURABLE_KEY_PREFIX + h;
       const bag = await readStorageKeys([key]);
       const ent = bag && bag[key];
-      if (!ent || !ent.result || !isDurableVtResult(ent.result)) return null;
+      if (!ent || !ent.result) return null;
+      const resultHash = String(ent.result.hash || "").trim().toLowerCase();
+      if (resultHash !== h) {
+        await removeDurableVtCache(h);
+        return null;
+      }
+      if (!isDurableVtResult(ent.result)) return null;
+      // 旧统计策略可能没有把响应对象绑定到目标 hash，不能继续复用其 found 结论。
+      if (ent.result.found === true
+        && Number(ent.result.statsPolicyVersion) !== VT_STATS_POLICY_VERSION) {
+        await removeDurableVtCache(h);
+        return null;
+      }
       const age = Date.now() - (Number(ent.at) || 0);
       const ttl = Number(ent.ttl) || VT_CACHE_TTL_MS;
       if (age < 0 || age > ttl) {
@@ -2737,7 +3006,13 @@
         }
         // 直接 attributes
         if (r.data.data && r.data.data.attributes) {
-          const hit = fileHitFromAttrs(r.data.data.attributes, hash, guiUrl, "vt-api-v3");
+          const hit = fileHitFromAttrs(
+            r.data.data.attributes,
+            hash,
+            guiUrl,
+            "vt-api-v3",
+            r.data.data.id
+          );
           if (hit) return hit;
         }
       }
@@ -2802,8 +3077,7 @@
 
     // 主报告顶部的明确文案优先，避免抓到 Relations/历史视图里的其他比例。
     const mMainFlag = s.match(/(\d{1,3})\s*\/\s*(\d{2,3})\s+security vendors?\s+flagged this file as malicious/i)
-      || s.match(/(\d{1,3})\s*\/\s*(\d{2,3})\s*(?:家|个)安全(?:厂商|引擎).{0,30}(?:标记|检出).{0,20}(?:恶意|有害)/i)
-      || s.match(/(\d{1,3})\s*\/\s*(\d{2,3})\s*(?:security vendors?|engines?)/i);
+      || s.match(/(\d{1,3})\s*\/\s*(\d{2,3})\s*(?:家|个)安全(?:厂商|引擎).{0,30}(?:标记|检出).{0,20}(?:恶意|有害)/i);
     if (mMainFlag) {
       const a = parseInt(mMainFlag[1], 10);
       const b = parseInt(mMainFlag[2], 10);
@@ -2813,35 +3087,8 @@
       }
     }
 
-    // "X security vendors flagged this file as malicious"
-    const mFlag = s.match(/(\d{1,3})\s+security vendors?\s+flagged/i);
-    if (mFlag && malicious == null) {
-      malicious = parseInt(mFlag[1], 10);
-    }
-    if (/No security vendors flagged this file as malicious|未发现安全厂商将此文件标记为恶意|没有安全厂商将此文件标记为恶意/i.test(s)
-      && malicious == null) {
-      malicious = 0;
-    }
-    // 中文 GUI
-    const mCn = s.match(/(\d{1,3})\s*\/\s*(\d{2,3})\s*(?:个安全厂商|家引擎|检测)/i);
-    if (mCn && (malicious == null || total == null)) {
-      malicious = parseInt(mCn[1], 10);
-      total = parseInt(mCn[2], 10);
-    }
-    // Community Score 旁常见 "0/70" 且页面已是当前文件报告
-    if ((malicious == null || total == null)
-      && /Community Score|Detections|检测结果|security vendors|安全厂商|安全引擎/i.test(s)) {
-      const mNear = s.match(/(\d{1,3})\s*\/\s*(\d{2,3})/);
-      if (mNear) {
-        const a = parseInt(mNear[1], 10);
-        const b = parseInt(mNear[2], 10);
-        if (b >= 20 && b <= 120 && a <= b) {
-          if (malicious == null) malicious = a;
-          if (total == null) total = b;
-        }
-      }
-    }
-    // 不再从全页任意比例猜主报告。Relations、历史视图等组件会产生无关值。
+    // 不从 Community Score/Detections 附近或全页首个比例猜主报告。
+    // Relations、行为与历史视图都可能产生其它文件的 x/y。
     if (malicious == null || total == null) return null;
     if (!total || total < malicious) total = Math.max(malicious, 0);
 
@@ -2870,15 +3117,31 @@
    *  content/vt-hook-main.js（document_start MAIN）拦截 SPA 的 /ui/files 响应
    *  后台轮询 window.__sfVtCaptures[hash] + DOM 兜底
    */
-  async function fetchVtUiFromPageContext(hash, budgetMs) {
+  async function fetchVtUiFromPageContext(hash, budgetMs, lookupOptions) {
     if (!chrome.tabs || !chrome.scripting || !chrome.scripting.executeScript) {
       return null;
     }
     const fileHash = String(hash || "").toLowerCase();
     if (fileHash.length !== 64) return null;
+    const requireSignature = !!(lookupOptions && lookupOptions.requireSignature);
     // 页内路径：预算放宽；超时也返回已刮到的 lastPayload，禁止 race 成 null
     const budget = Math.min(Math.max(12000, budgetMs || 24000), 40000);
     const targetUrl = "https://www.virustotal.com/gui/file/" + fileHash;
+    const payloadHasTerminalSignature = (payload) => {
+      if (!requireSignature) return true;
+      try {
+        const data = JSON.parse(String((payload && payload.text) || ""));
+        const hit = findTargetVtFileHitInJson(
+          data,
+          fileHash,
+          targetUrl,
+          "vt-page-signature-probe"
+        );
+        return hasTerminalVtSignature(hit);
+      } catch {
+        return false;
+      }
+    };
 
     const readCaptureFn = (h) => {
       try {
@@ -2991,15 +3254,34 @@
             // 比例组件可能位于很深的位置；单独查询，避免被通用 3000 节点上限截掉。
             for (const el of Array.from(root.querySelectorAll
               ? root.querySelectorAll("vt-ui-detections-ratio") : [])) {
-              const detections = Number(el.detections ?? el.getAttribute("detections"));
-              const total = Number(el.total ?? el.getAttribute("total"));
+              let renderedText = "";
+              try {
+                renderedText = [el.innerText, el.textContent, el.shadowRoot && el.shadowRoot.textContent]
+                  .filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 240);
+              } catch { renderedText = ""; }
+              const renderedMatch = renderedText.match(/(?:^|\D)(\d{1,3})\s*\/\s*(\d{2,3})(?:\D|$)/);
+              const propDetections = Number(el.detections ?? el.getAttribute("detections"));
+              const propTotal = Number(el.total ?? el.getAttribute("total"));
+              const renderedDetections = renderedMatch ? Number(renderedMatch[1]) : NaN;
+              const renderedTotal = renderedMatch ? Number(renderedMatch[2]) : NaN;
+              const renderedValid = Number.isFinite(renderedDetections) && Number.isFinite(renderedTotal)
+                && renderedTotal >= 20 && renderedTotal <= 200
+                && renderedDetections >= 0 && renderedDetections <= renderedTotal;
+              const detections = renderedValid ? renderedDetections : propDetections;
+              const total = renderedValid ? renderedTotal : propTotal;
               if (Number.isFinite(detections) && Number.isFinite(total) && total >= 20 && total <= 200
                 && detections >= 0 && detections <= total) {
+                const large = !!(el.classList && el.classList.contains("large"))
+                  || !!(el.hasAttribute && el.hasAttribute("large")) || el.large === true;
+                const visible = typeof el.getClientRects === "function" ? el.getClientRects().length > 0 : true;
                 domRatios.push({
                   detections,
                   total,
-                  large: !!(el.classList && el.classList.contains("large")),
-                  visible: typeof el.getClientRects === "function" ? el.getClientRects().length > 0 : true
+                  large,
+                  visible,
+                  main: large && visible,
+                  rendered: renderedValid,
+                  renderedText
                 });
               }
             }
@@ -3036,8 +3318,10 @@
             }
             addEngineResult({ engine_name: canonical, category, result: resultText });
           }
-          domRatios.sort((a, b) => Number(b.visible) - Number(a.visible)
-            || Number(b.large) - Number(a.large) || b.total - a.total);
+          domRatios.sort((a, b) => Number(b.main) - Number(a.main)
+            || Number(b.rendered) - Number(a.rendered)
+            || Number(b.visible) - Number(a.visible)
+            || Number(b.large) - Number(a.large));
         } catch { /* ignore */ }
         return {
           status,
@@ -3177,15 +3461,34 @@
             }
             for (const el of Array.from(root.querySelectorAll
               ? root.querySelectorAll("vt-ui-detections-ratio") : [])) {
-              const detections = Number(el.detections ?? el.getAttribute("detections"));
-              const total = Number(el.total ?? el.getAttribute("total"));
+              let renderedText = "";
+              try {
+                renderedText = [el.innerText, el.textContent, el.shadowRoot && el.shadowRoot.textContent]
+                  .filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 240);
+              } catch { renderedText = ""; }
+              const renderedMatch = renderedText.match(/(?:^|\D)(\d{1,3})\s*\/\s*(\d{2,3})(?:\D|$)/);
+              const propDetections = Number(el.detections ?? el.getAttribute("detections"));
+              const propTotal = Number(el.total ?? el.getAttribute("total"));
+              const renderedDetections = renderedMatch ? Number(renderedMatch[1]) : NaN;
+              const renderedTotal = renderedMatch ? Number(renderedMatch[2]) : NaN;
+              const renderedValid = Number.isFinite(renderedDetections) && Number.isFinite(renderedTotal)
+                && renderedTotal >= 20 && renderedTotal <= 200
+                && renderedDetections >= 0 && renderedDetections <= renderedTotal;
+              const detections = renderedValid ? renderedDetections : propDetections;
+              const total = renderedValid ? renderedTotal : propTotal;
               if (Number.isFinite(detections) && Number.isFinite(total) && total >= 20 && total <= 200
                 && detections >= 0 && detections <= total) {
+                const large = !!(el.classList && el.classList.contains("large"))
+                  || !!(el.hasAttribute && el.hasAttribute("large")) || el.large === true;
+                const visible = typeof el.getClientRects === "function" ? el.getClientRects().length > 0 : true;
                 domRatios.push({
                   detections,
                   total,
-                  large: !!(el.classList && el.classList.contains("large")),
-                  visible: typeof el.getClientRects === "function" ? el.getClientRects().length > 0 : true
+                  large,
+                  visible,
+                  main: large && visible,
+                  rendered: renderedValid,
+                  renderedText
                 });
               }
             }
@@ -3222,16 +3525,44 @@
             }
             addEngineResult({ engine_name: canonical, category, result: resultText });
           }
-          domRatios.sort((a, b) => Number(b.visible) - Number(a.visible)
-            || Number(b.large) - Number(a.large) || b.total - a.total);
+          domRatios.sort((a, b) => Number(b.main) - Number(a.main)
+            || Number(b.rendered) - Number(a.rendered)
+            || Number(b.visible) - Number(a.visible)
+            || Number(b.large) - Number(a.large));
         } catch { /* ignore */ }
         const key = String(h || "").toLowerCase();
         try {
           if (text && window.__sfVtCaptures) {
-            window.__sfVtCaptures[key] = { text: text.slice(0, 800000), status: res.status, at: Date.now() };
+            const captureQuality = (body) => {
+              const s = String(body || "");
+              const targetIdentity = new RegExp('"(?:sha256|id)"\\s*:\\s*"' + key + '"', "i").test(s);
+              const hasStats = /"last_analysis_stats"\s*:\s*\{|"malicious"\s*:\s*\d+/i.test(s);
+              if (targetIdentity && hasStats) return 5;
+              if (/NotFoundError|Item not found/i.test(s)) return 4;
+              if (targetIdentity) return 3;
+              if (/RecaptchaRequired|captcha|verify (?:that )?you are human/i.test(s)) return 0;
+              return 1;
+            };
+            const previous = window.__sfVtCaptures[key];
+            const quality = captureQuality(text);
+            const previousQuality = previous && Number.isFinite(Number(previous.quality))
+              ? Number(previous.quality)
+              : captureQuality(previous && previous.text);
+            if (!previous || !previous.text || quality > previousQuality
+              || (quality === previousQuality && text.length >= String(previous.text || "").length)) {
+              window.__sfVtCaptures[key] = {
+                text: text.slice(0, 800000),
+                status: res.status,
+                at: Date.now(),
+                url: "https://www.virustotal.com/ui/files/" + key,
+                quality
+              };
+              window.__sfVtCapture = text;
+              window.__sfVtCaptureStatus = res.status;
+              window.__sfVtCaptureUrl = "https://www.virustotal.com/ui/files/" + key;
+              window.__sfVtCaptureQuality = quality;
+            }
           }
-          window.__sfVtCapture = text;
-          window.__sfVtCaptureStatus = res.status;
         } catch { /* ignore */ }
         return {
           status: res.status,
@@ -3287,23 +3618,54 @@
         window.__sfVtCapture = null;
         window.__sfVtCaptureStatus = 0;
         window.__sfVtCaptureUrl = "";
+        window.__sfVtCaptureQuality = -1;
         window.__sfVtCaptures = window.__sfVtCaptures || {};
+        const fileReportHashFromUrl = (value) => {
+          try {
+            const parsed = new URL(String(value || ""), location.origin);
+            const match = parsed.pathname.match(/^\/ui\/files\/([a-f0-9]{64})\/?$/i);
+            return match ? match[1].toLowerCase() : "";
+          } catch {
+            return "";
+          }
+        };
+        const captureQuality = (text, key) => {
+          const s = String(text || "");
+          const targetIdentity = new RegExp('"(?:sha256|id)"\\s*:\\s*"' + key + '"', "i").test(s);
+          const hasStats = /"last_analysis_stats"\s*:\s*\{|"malicious"\s*:\s*\d+/i.test(s);
+          if (targetIdentity && hasStats) return 5;
+          if (/NotFoundError|Item not found/i.test(s)) return 4;
+          if (targetIdentity) return 3;
+          if (/RecaptchaRequired|captcha|verify (?:that )?you are human/i.test(s)) return 0;
+          return 1;
+        };
         const capture = (url, status, body) => {
           try {
             const u = String(url || "");
-            if (!/\/ui\/files\//i.test(u)) return;
+            const reportHash = fileReportHashFromUrl(u);
+            if (!reportHash) return;
             const text = String(body || "");
             if (text.length < 2) return;
-            window.__sfVtCapture = text.slice(0, 800000);
-            window.__sfVtCaptureStatus = status || 0;
-            window.__sfVtCaptureUrl = u;
-            const m = u.match(/\/ui\/files\/([a-f0-9]{64})/i);
-            if (m) {
-              window.__sfVtCaptures[m[1].toLowerCase()] = {
-                text: text.slice(0, 800000),
-                status: status || 0,
-                at: Date.now()
-              };
+            if (reportHash) {
+              const previous = window.__sfVtCaptures[reportHash];
+              const quality = captureQuality(text, reportHash);
+              const previousQuality = previous && Number.isFinite(Number(previous.quality))
+                ? Number(previous.quality)
+                : captureQuality(previous && previous.text, reportHash);
+              if (!previous || !previous.text || quality > previousQuality
+                || (quality === previousQuality && text.length >= String(previous.text || "").length)) {
+                window.__sfVtCapture = text.slice(0, 800000);
+                window.__sfVtCaptureStatus = status || 0;
+                window.__sfVtCaptureUrl = u;
+                window.__sfVtCaptureQuality = quality;
+                window.__sfVtCaptures[reportHash] = {
+                  text: text.slice(0, 800000),
+                  status: status || 0,
+                  at: Date.now(),
+                  url: u.slice(0, 500),
+                  quality
+                };
+              }
             }
           } catch { /* ignore */ }
         };
@@ -3318,9 +3680,11 @@
             } catch { url = ""; }
             return ofetch.apply(this, args).then((res) => {
               try {
-                if (/\/ui\/files\//i.test(url)) {
+                const responseUrl = res && res.url;
+                if (fileReportHashFromUrl(url) || fileReportHashFromUrl(responseUrl)) {
                   const c = res.clone();
-                  c.text().then((t) => capture(url, res.status, t)).catch(() => {});
+                  const captureUrl = fileReportHashFromUrl(url) ? url : responseUrl;
+                  c.text().then((t) => capture(captureUrl, res.status, t)).catch(() => {});
                 }
               } catch { /* ignore */ }
               return res;
@@ -3504,15 +3868,16 @@
               : Number(payload.domRatios[0].detections) || 0;
             const hasPageEngines = !!(payload && Array.isArray(payload.pageEngineResults)
               && payload.pageEngineResults.length >= 8);
-            if (mainDetected === 0 || hasPageEngines || i >= 10) break;
+            if (payloadHasTerminalSignature(payload)
+              && (mainDetected === 0 || hasPageEngines || i >= 10)) break;
           }
           if (onFilePage && hasMainFlag) {
             const mainMatch = currentPageHint.match(mainFlagRe);
             const mainDetected = mainMatch ? (parseInt(mainMatch[1], 10) || 0) : 0;
             const hasPageEngines = !!(payload && Array.isArray(payload.pageEngineResults)
               && payload.pageEngineResults.length);
-            const hasPageSignature = !!(payload && payload.pageSignatureInfo);
-            if (mainDetected === 0 || (hasPageEngines && hasPageSignature) || i >= 16) break;
+            if (payloadHasTerminalSignature(payload)
+              && (mainDetected === 0 || hasPageEngines || i >= 16)) break;
           }
           const capturedText = String((payload && payload.text) || "");
           // 任意长响应可能只是 Recaptcha/鉴权/占位对象，不能因此提前结束页面轮询。
@@ -3520,9 +3885,7 @@
           if (capturedText && !/RecaptchaRequired/i.test(capturedText)
             && (/last_analysis_stats/i.test(capturedText)
               || /"malicious"\s*:\s*\d+/i.test(capturedText))) {
-            const captureHasSignature = /"signature_info"\s*:/i.test(capturedText)
-              || !!(payload && payload.pageSignatureInfo);
-            if (captureHasSignature || i >= 6) break;
+            if (payloadHasTerminalSignature(payload) || (!requireSignature && i >= 6)) break;
           }
           if (capturedText && /NotFoundError|Item not found/i.test(capturedText)) {
             break;
@@ -3568,11 +3931,13 @@
               if (payload) payload.targetHash = fileHash;
               // 主动 fetch 已带回 stats，可提前结束
               if (payload.text && /last_analysis_stats|"malicious"\s*:\s*\d+/i.test(payload.text)
-                && !/RecaptchaRequired/i.test(payload.text)) {
+                && !/RecaptchaRequired/i.test(payload.text)
+                && payloadHasTerminalSignature(payload)) {
                 break;
               }
               if (Array.isArray(payload.domRatios) && payload.domRatios.length
-                && Number(payload.domRatios[0].total) >= 20) {
+                && Number(payload.domRatios[0].total) >= 20
+                && payloadHasTerminalSignature(payload)) {
                 break;
               }
             }
@@ -3585,7 +3950,8 @@
           || /\d{1,3}\s*\/\s*\d{2,3}\s+security vendors?\s+flagged this file as malicious/i.test(String((payload && payload.pageHint) || ""))
           || !!(payload && Array.isArray(payload.domRatios) && payload.domRatios.length
             && Number(payload.domRatios[0].total) >= 20);
-        if (!payload || !hasResolvedCapture || /RecaptchaRequired/i.test(finalCapturedText)) {
+        if (!payload || !hasResolvedCapture || /RecaptchaRequired/i.test(finalCapturedText)
+          || !payloadHasTerminalSignature(payload)) {
           const active = await exec(tabId, activeFetchFn, [fileHash], 7000);
           if (active) {
             if (!payload) payload = active;
@@ -3676,16 +4042,25 @@
     const dataIsCaptcha = !!(data && isVtCaptchaError(data, status));
     let pageEngineConsensus = {};
     try { pageEngineConsensus = vtEngineConsensusFromPageResults(payload.pageEngineResults) || {}; } catch { pageEngineConsensus = {}; }
-    const structuredAttrs = (!dataIsCaptcha && data && data.data && data.data.attributes)
-      ? data.data.attributes
-      : ((!dataIsCaptcha && data && data.attributes) ? data.attributes : null);
-    const pageSignatureInfo = payload.pageSignatureInfo
-      || (structuredAttrs && (structuredAttrs.signature_info || structuredAttrs.signatureInfo))
-      || null;
+    const structuredNode = !dataIsCaptcha && data && typeof data === "object"
+      ? (data.data || data)
+      : null;
+    const structuredAttrsCandidate = structuredNode && !Array.isArray(structuredNode)
+      ? (structuredNode.attributes || structuredNode)
+      : null;
+    const structuredAttrs = structuredAttrsCandidate
+      && vtFileIdentityMatchesTarget(hashLc, structuredNode && structuredNode.id, structuredAttrsCandidate)
+      ? structuredAttrsCandidate
+      : null;
+    const structuredSignatureInfo = (structuredAttrs
+      && (structuredAttrs.signature_info || structuredAttrs.signatureInfo)) || null;
+    // DOM/component 状态没有文件身份，绝不能给当前 hash 提供验签结论。
+    const pageSignatureInfo = structuredSignatureInfo;
     const finalizePageResult = (result) => {
       try {
-        const out = enrichVtResultWithSignature(result, text, pageHint);
-        if (!out || !pageSignatureInfo) return out;
+        const out = result;
+        if (!out) return out;
+        if (!pageSignatureInfo) return out;
         let meta = { trust: "", signer: "" };
         try { meta = vtSignatureMetaFromAttrs({ signature_info: pageSignatureInfo }) || meta; } catch { /* ignore */ }
         if (meta.signer && !out.signerFromVt) out.signerFromVt = meta.signer;
@@ -3702,19 +4077,12 @@
       }
     };
 
-    // 当前文件页：扩展专为该 hash 开的标签（targetHash）一律视为当前页。
-    // SPA 尚未把 hash 写进 URL 时，旧逻辑 pageOnCurrentFile=false → 丢弃全部 DOM 统计 → 误报 captcha。
+    // 当前文件页必须由真实 page/capture URL（或页面正文）绑定完整 hash；targetHash 是调用方输入，不能自证。
     const pageOnCurrentFile = !!(
       hashLc.length === 64 && (
-        String(payload.targetHash || "").toLowerCase() === hashLc
-        || pageUrl.includes(hashLc)
+        pageUrl.includes(hashLc)
         || captureUrl.includes(hashLc)
         || pageHint.toLowerCase().includes(hashLc)
-        || pageHint.toLowerCase().includes(hashLc.slice(0, 16))
-        // 页内已有检出比组件 / 引擎行时，也视为当前报告页（SPA 慢导航）
-        || (Array.isArray(payload.domRatios) && payload.domRatios.length > 0
-          && Number(payload.domRatios[0] && payload.domRatios[0].total) >= 20)
-        || (Array.isArray(payload.pageEngineResults) && payload.pageEngineResults.length >= 8)
       )
     );
 
@@ -3747,7 +4115,13 @@
           return finalizePageResult(parsed);
         }
         if (data.data && data.data.attributes) {
-          const hit = fileHitFromAttrs(data.data.attributes, hash, guiUrl, "vt-page");
+          const hit = fileHitFromAttrs(
+            data.data.attributes,
+            hash,
+            guiUrl,
+            "vt-page",
+            data.data.id
+          );
           if (hit) return finalizePageResult(hit);
         }
       } catch { /* continue DOM */ }
@@ -3759,32 +4133,36 @@
         if (fromText && fromText.found === true) {
           return finalizePageResult(fromText);
         }
-        if (!dataIsCaptcha) {
-          const onlySig = extractVtSignatureFromText(text);
-          if (onlySig.trust === "valid" || onlySig.signer) {
-            const base = fromText || {
-              success: true,
-              found: true,
-              notFound: false,
-              hash,
-              guiUrl,
-              source: "vt-page-sig",
-              malicious: 0,
-              suspicious: 0,
-              total: 0,
-              summary: ""
-            };
-            base.signerFromVt = onlySig.signer || base.signerFromVt || "";
-            base.sigTrustFromVt = onlySig.trust || base.sigTrustFromVt || "";
-            if (base.found === true) return finalizePageResult(base);
-          }
-        }
       } catch { /* continue */ }
     }
 
-    // ③ 逐引擎明细可直接计算主报告分母。只计算有效判定，排除 timeout/failure/type-unsupported。
+    // ③ 明确主报告标题最可靠；不再用 Community Score 附近的任意 x/y。
+    const fromDom = pageOnCurrentFile ? parseVtDomStats(pageHint, hash, guiUrl) : null;
+    if (fromDom) {
+      fromDom.source = "vt-page-main-report";
+      if (pageEngineConsensus.engineDetailsAvailable) Object.assign(fromDom, pageEngineConsensus);
+      return finalizePageResult(fromDom);
+    }
+
+    const ratios = Array.isArray(payload.domRatios) ? payload.domRatios : [];
+    const credibleRatios = ratios.filter((item) => item && (
+      item.main === true
+      || (item.large === true && item.visible !== false)
+      || (item.rendered === true && item.visible !== false)
+    ));
+    const bestRatio = credibleRatios[0] || null;
+    const ratioDetections = bestRatio ? (Number(bestRatio.detections) || 0) : 0;
+    const ratioTotal = bestRatio ? (Number(bestRatio.total) || 0) : 0;
+    const noVendorBanner = /No security vendors flagged this file as malicious|未发现安全厂商将此文件标记为恶意|没有安全厂商将此文件标记为恶意/i.test(pageHint);
+    const trustedDistributorBanner = ratioDetections === 0
+      && /File distributed by\s+[^\n]{2,160}|文件由\s*[^\n]{2,160}\s*分发/i.test(pageHint);
+    const ratioContextConfirmed = ratioDetections === 0 && (noVendorBanner || trustedDistributorBanner);
+
+    // ④ 逐引擎明细仅在它与已确认的主比例一致时计算；全 DOM 可能同时存在 Relations 的其它引擎表。
     const pageStats = vtStatsFromPageResults(payload.pageEngineResults);
-    if (pageOnCurrentFile && pageStats.total >= 20) {
+    const rowsMatchMainRatio = !!(bestRatio && pageStats.total === ratioTotal
+      && (pageStats.malicious + pageStats.suspicious) === ratioDetections);
+    if (pageOnCurrentFile && ratioContextConfirmed && rowsMatchMainRatio && pageStats.total >= 20) {
       const fromRows = {
         success: true,
         found: true,
@@ -3802,12 +4180,11 @@
       return finalizePageResult(fromRows);
     }
 
-    // ④ ★ 自定义元素 vt-ui-detections-ratio（captcha 时仍可用 DOM）
-    const ratios = Array.isArray(payload.domRatios) ? payload.domRatios : [];
-    if (pageOnCurrentFile && ratios.length) {
-      const best = ratios[0];
-      const malicious = Number(best.detections) || 0;
-      const total = Number(best.total) || 0;
+    // ⑤ ★ 自定义元素 vt-ui-detections-ratio（captcha 时仍可用 DOM）。
+    // 必须同时有 clean/distributor 主横幅；不再任取全页组件列表第一个。
+    if (pageOnCurrentFile && ratioContextConfirmed && bestRatio) {
+      const malicious = ratioDetections;
+      const total = ratioTotal;
       if (total >= 20 && total <= 200 && malicious >= 0 && malicious <= total) {
         const fromRatio = {
           success: true,
@@ -3829,14 +4206,6 @@
         };
         return finalizePageResult(fromRatio);
       }
-    }
-
-    // ⑤ DOM 刮取检出比 + 签名文案
-    const fromDom = pageOnCurrentFile ? parseVtDomStats(pageHint, hash, guiUrl) : null;
-    if (fromDom) {
-      fromDom.source = "vt-page-main-report";
-      if (pageEngineConsensus.engineDetailsAvailable) Object.assign(fromDom, pageEngineConsensus);
-      return finalizePageResult(fromDom);
     }
 
     // captcha 仅表示 JSON 接口被拦，不是最终结论（DOM 可能已成功；此处才失败）
@@ -3903,51 +4272,62 @@
     }
     const guiUrl = VT_GUI_BASE + hash;
     const requireSignature = !!(lookupOptions && lookupOptions.requireSignature);
-    const cached = NS._vtByHash.get(hash);
+    let signatureFallback = null;
+    const rememberSignatureFallback = (candidate) => {
+      if (!requireSignature || !candidate || candidate.found !== true
+        || hasTerminalVtSignature(candidate)) return;
+      const oldScore = signatureFallback && String(signatureFallback.sigTrustFromVt || "").toLowerCase() === "present" ? 2 : 0;
+      const newScore = String(candidate.sigTrustFromVt || "").toLowerCase() === "present" ? 2 : 1;
+      if (!signatureFallback || newScore >= oldScore) signatureFallback = candidate;
+    };
+    let cached = NS._vtByHash.get(hash);
+    if (cached && String(cached.result && cached.result.hash || "").trim().toLowerCase() !== hash) {
+      try { NS._vtByHash.delete(hash); } catch { /* ignore */ }
+      cached = null;
+    }
     const ttl = (cached && cached.ttl) || VT_CACHE_TTL_MS;
     if (cached && cached.at && Date.now() - cached.at < ttl) {
       const cr = cached.result || {};
-      const cachedDetections = (Number(cr.malicious) || 0) + (Number(cr.suspicious) || 0);
       const staleTrustPolicy = cr.found === true
         && Number(cr.trustedPolicyVersion) !== VT_TRUST_POLICY_VERSION;
       const staleStatsPolicy = cr.found === true
         && Number(cr.statsPolicyVersion) !== VT_STATS_POLICY_VERSION;
       const cachedSignatureMissing = requireSignature && cr.found === true
-        && !/^(?:valid|invalid|none|present)$/i.test(String(cr.sigTrustFromVt || ""));
+        && !hasTerminalVtSignature(cr);
 
-      // 加权策略升级：本地重算，绝不丢弃已成功的检出统计
-      if (staleTrustPolicy && cr.found === true) {
-        const upgraded = reweightCachedVtResult(cr);
-        if (upgraded) {
-          try { cacheVtResult(hash, upgraded, Math.max(5000, ttl - (Date.now() - cached.at))); } catch { /* ignore */ }
-          return { ...upgraded, cached: true, reweighted: true };
-        }
-      }
-
-      // ★ found:true 的成功结果一律复用（含 vt-dom / main-report）。
-      // 旧逻辑把 source===vt-dom、缺引擎明细的 main-report 整份 delete 再查，
-      // 重查一旦 SW 失败就误报「后台接口要求验证」——用户看到的正是这种假 captcha。
-      if (cr.found === true) {
-        // 仅 stats 策略真变了才允许丢；引擎明细可后台补，不挡展示
-        if (staleStatsPolicy && cachedDetections === 0 && !cr.total) {
-          try { NS._vtByHash.delete(hash); } catch { /* ignore */ }
-        } else {
-          if (staleTrustPolicy) {
-            const upgraded = reweightCachedVtResult(cr);
-            if (upgraded) return { ...upgraded, cached: true, reweighted: true };
+      if (staleStatsPolicy && cr.found === true) {
+        // v2 及更早版本可能把其它文件的 stats 串到当前 hash；无论 0 检出还是正检出都必须重查。
+        try { NS._vtByHash.delete(hash); } catch { /* ignore */ }
+        await removeDurableVtCache(hash);
+      } else {
+        // 加权策略升级：统计口径未变时可本地重算，避免无谓访问 VT。
+        if (staleTrustPolicy && cr.found === true) {
+          const upgraded = reweightCachedVtResult(cr);
+          if (upgraded) {
+            if (vtFoundSatisfiesSignatureRequirement(upgraded, requireSignature)) {
+              try { cacheVtResult(hash, upgraded, Math.max(5000, ttl - (Date.now() - cached.at))); } catch { /* ignore */ }
+              return { ...upgraded, cached: true, reweighted: true };
+            }
+            rememberSignatureFallback(upgraded);
           }
+        }
+
+        // 要求验签时，present/空值只能作为统计兜底，必须继续补取结构化 signature_info。
+        if (cr.found === true) {
+          if (!cachedSignatureMissing) return { ...cr, cached: true };
+          rememberSignatureFallback(cr);
+          try { NS._vtByHash.delete(hash); } catch { /* ignore */ }
+        }
+        if (cr.notFound === true && cr.verifiedNotFound === true && !cr.softMiss) {
           return { ...cr, cached: true };
         }
-      }
-      if (cr.notFound === true && cr.verifiedNotFound === true && !cr.softMiss) {
-        return { ...cr, cached: true };
-      }
 
-      // 绝不信任「猜的无」/ 无 Key 占位 / 失败 unknown 缓存
-      if (cr.softMiss || cr.source === "vt-no-key"
-        || cr.unknown || cr.captcha || cr.swCaptcha || cr.needApiKey
-        || cachedSignatureMissing) {
-        try { NS._vtByHash.delete(hash); } catch { /* ignore */ }
+        // 绝不信任「猜的无」/ 无 Key 占位 / 失败 unknown 缓存
+        if (cr.softMiss || cr.source === "vt-no-key"
+          || cr.unknown || cr.captcha || cr.swCaptcha || cr.needApiKey
+          || cachedSignatureMissing) {
+          try { NS._vtByHash.delete(hash); } catch { /* ignore */ }
+        }
       }
     }
 
@@ -3955,12 +4335,12 @@
     try {
       const durablePre = await readDurableVtCache(hash);
       if (durablePre && isDurableVtResult(durablePre)) {
-        try { cacheVtResult(hash, durablePre, VT_CACHE_TTL_MS); } catch { /* ignore */ }
         if (durablePre.found === true) {
-          // 若要求补签名且缓存无验签结论，继续走网络；否则直接返回
-          const sigOk = !requireSignature
-            || /^(?:valid|invalid|none|present)$/i.test(String(durablePre.sigTrustFromVt || ""));
-          if (sigOk) return { ...durablePre, cached: true, durable: true };
+          if (vtFoundSatisfiesSignatureRequirement(durablePre, requireSignature)) {
+            try { cacheVtResult(hash, durablePre, VT_CACHE_TTL_MS); } catch { /* ignore */ }
+            return { ...durablePre, cached: true, durable: true };
+          }
+          rememberSignatureFallback(durablePre);
         } else if (durablePre.notFound === true && durablePre.verifiedNotFound === true) {
           return { ...durablePre, cached: true, durable: true };
         }
@@ -4007,6 +4387,16 @@
       return null;
     };
 
+    const acceptFreshFound = (candidate, cacheTtl) => {
+      if (!candidate || candidate.found !== true) return null;
+      if (!vtFoundSatisfiesSignatureRequirement(candidate, requireSignature)) {
+        rememberSignatureFallback(candidate);
+        return null;
+      }
+      cacheVtResult(hash, candidate, cacheTtl || VT_CACHE_TTL_MS);
+      return candidate;
+    };
+
     const runLookup = async () => {
       // 扩展 SW 直连与真实 VT 页面属于不同请求上下文：SW 被验证码挡住，
       // 不代表携带浏览器会话的 GUI 页面也被验证码挡住。
@@ -4025,8 +4415,8 @@
             null
           );
           if (viaApi && viaApi.found === true) {
-            cacheVtResult(hash, viaApi, VT_CACHE_TTL_MS);
-            return viaApi;
+            const accepted = acceptFreshFound(viaApi, VT_CACHE_TTL_MS);
+            if (accepted) return accepted;
           }
           // API 404/NotFoundError 才是真「无」
           if (viaApi && viaApi.notFound === true && !viaApi.softMiss) {
@@ -4053,7 +4443,10 @@
             const r1 = await fetchVtJson(VT_UI_BASE + hash, Math.min(4000, remain()));
             const sw = tryParseSwResponse(r1);
             if (sw && sw.__swCaptcha) { /* ignore */ }
-            else if (sw && (sw.found === true || (sw.notFound === true && sw.verifiedNotFound))) {
+            else if (sw && sw.found === true) {
+              const accepted = acceptFreshFound(sw, VT_CACHE_TTL_MS);
+              if (accepted) return accepted;
+            } else if (sw && sw.notFound === true && sw.verifiedNotFound) {
               cacheVtResult(hash, sw, VT_CACHE_TTL_MS);
               return sw;
             }
@@ -4062,17 +4455,24 @@
         // Key 失败再试页内会话（用户浏览器 Cookie 有时比坏 Key 更有用）
         if (remain() > 4000) {
           try {
-            const pagePayload = await fetchVtUiFromPageContext(hash, Math.min(12000, remain() - 200));
+            const pagePayload = await fetchVtUiFromPageContext(
+              hash,
+              Math.min(12000, remain() - 200),
+              { requireSignature }
+            );
             const pageParsed = parseVtPageFetchPayload(pagePayload, hash, guiUrl);
             if (pageParsed && pageParsed.found === true) {
-              cacheVtResult(hash, pageParsed, VT_CACHE_TTL_MS);
-              return pageParsed;
+              const accepted = acceptFreshFound(pageParsed, VT_CACHE_TTL_MS);
+              if (accepted) return accepted;
             }
             if (pageParsed && pageParsed.notFound === true && pageParsed.verifiedNotFound && !pageParsed.softMiss) {
               cacheVtResult(hash, pageParsed, VT_CACHE_TTL_MS);
               return pageParsed;
             }
           } catch { /* ignore */ }
+        }
+        if (signatureFallback) {
+          return { ...signatureFallback, signatureIncomplete: true };
         }
         const unkKey = vtUnknownResult(hash, {
           source: "api-miss",
@@ -4090,7 +4490,10 @@
           if (sw && sw.__swCaptcha) sawSwCaptcha = true;
           else if (sw && sw.__rate) sawRateLimit = true;
           else if (sw && sw.__auth) sawAuthBlocked = true;
-          else if (sw && (sw.found === true || (sw.notFound === true && sw.verifiedNotFound))) {
+          else if (sw && sw.found === true) {
+            const accepted = acceptFreshFound(sw, VT_CACHE_TTL_MS);
+            if (accepted) return accepted;
+          } else if (sw && sw.notFound === true && sw.verifiedNotFound) {
             cacheVtResult(hash, sw, VT_CACHE_TTL_MS);
             return sw;
           }
@@ -4102,7 +4505,8 @@
         try {
           const pagePayload = await fetchVtUiFromPageContext(
             hash,
-            Math.min(38000, Math.max(14000, remain() - 800))
+            Math.min(38000, Math.max(14000, remain() - 800)),
+            { requireSignature }
           );
           const hadPageSession = !!(pagePayload && (
             (pagePayload.pageHint && String(pagePayload.pageHint).trim().length > 20)
@@ -4124,8 +4528,8 @@
 
           const pageParsed = parseVtPageFetchPayload(pagePayload, hash, guiUrl);
           if (pageParsed && pageParsed.found === true) {
-            cacheVtResult(hash, pageParsed, VT_CACHE_TTL_MS);
-            return pageParsed;
+            const accepted = acceptFreshFound(pageParsed, VT_CACHE_TTL_MS);
+            if (accepted) return accepted;
           }
           if (pageParsed && pageParsed.notFound === true && pageParsed.verifiedNotFound === true && !pageParsed.softMiss) {
             cacheVtResult(hash, pageParsed, VT_CACHE_TTL_MS);
@@ -4140,10 +4544,17 @@
       try {
         const durable = await readDurableVtCache(hash);
         if (durable && durable.found === true) {
-          cacheVtResult(hash, durable, VT_CACHE_TTL_MS);
-          return durable;
+          if (vtFoundSatisfiesSignatureRequirement(durable, requireSignature)) {
+            cacheVtResult(hash, durable, VT_CACHE_TTL_MS);
+            return durable;
+          }
+          rememberSignatureFallback(durable);
         }
       } catch { /* ignore */ }
+
+      if (signatureFallback) {
+        return { ...signatureFallback, signatureIncomplete: true };
+      }
 
       // 查不清 ≠ 库中无；文案禁止把普通失败说成 captcha
       let unkSummary = "VT: 自动取数未完成，请点开链接查看或配置 API Key";
@@ -4177,20 +4588,38 @@
     try {
       // 先读 durable，整段超时也有结果
       const durableEarly = await readDurableVtCache(hash);
+      if (durableEarly && durableEarly.found === true
+        && !vtFoundSatisfiesSignatureRequirement(durableEarly, requireSignature)) {
+        rememberSignatureFallback(durableEarly);
+      }
+      const timeoutFallback = durableEarly
+        && (durableEarly.found !== true
+          || vtFoundSatisfiesSignatureRequirement(durableEarly, requireSignature))
+        ? durableEarly
+        : vtUnknownResult(hash, {
+          source: "vt-timeout",
+          summary: "VT: 查询超时，请点开链接查看或稍后重试"
+        });
       const out = await raceMs(
         runLookup(),
         LOOKUP_BUDGET_MS + 2000,
-        durableEarly || vtUnknownResult(hash, {
-          source: "vt-timeout",
-          summary: "VT: 查询超时，请点开链接查看或稍后重试"
-        })
+        timeoutFallback
       );
-      if (out && out.found === true) return out;
-      if (durableEarly && durableEarly.found === true) return durableEarly;
+      if (out && out.found === true) {
+        if (vtFoundSatisfiesSignatureRequirement(out, requireSignature)) return out;
+        rememberSignatureFallback(out);
+      }
+      if (signatureFallback) return { ...signatureFallback, signatureIncomplete: true };
+      if (durableEarly && durableEarly.found === true
+        && vtFoundSatisfiesSignatureRequirement(durableEarly, requireSignature)) return durableEarly;
       return out || vtUnknownResult(hash, { summary: "VT: 自动取数未完成，请点开链接查看或配置 API Key" });
     } catch {
       const durable = await readDurableVtCache(hash);
-      if (durable && durable.found === true) return durable;
+      if (durable && durable.found === true) {
+        if (vtFoundSatisfiesSignatureRequirement(durable, requireSignature)) return durable;
+        rememberSignatureFallback(durable);
+      }
+      if (signatureFallback) return { ...signatureFallback, signatureIncomplete: true };
       return vtUnknownResult(hash, {
         source: "vt-error",
         summary: "VT: 自动取数未完成，请点开链接查看或配置 API Key"
@@ -4198,12 +4627,72 @@
     }
   };
 
-  /** 从任意文本中抠 last_analysis_stats / malicious 等 */
+  function textContainsTargetVtFileIdentity(text, hash) {
+    const expected = normalizeVtFileHash(hash);
+    if (!expected) return false;
+    const s = String(text || "");
+    // 只接受 JSON 文件身份字段；页面上偶然出现同一串文本不能为另一对象的 stats 背书。
+    const identityRe = /"(?:sha256|id)"\s*:\s*"([a-f0-9]{64})"/gi;
+    let match = null;
+    let foundTarget = false;
+    while ((match = identityRe.exec(s))) {
+      const candidate = String(match[1] || "").toLowerCase();
+      if (candidate !== expected) return false;
+      foundTarget = true;
+    }
+    return foundTarget;
+  }
+
+  /** 在混合/数组 JSON 中只取与目标 hash 精确绑定的 file 节点。 */
+  function findTargetVtFileHitInJson(data, hash, guiUrl, source) {
+    if (!data || typeof data !== "object") return null;
+    const seen = new WeakSet();
+    const queue = [{ value: data, depth: 0 }];
+    let scanned = 0;
+    while (queue.length && scanned++ < 5000) {
+      const current = queue.shift();
+      const value = current && current.value;
+      const depth = Number(current && current.depth) || 0;
+      if (!value || typeof value !== "object" || seen.has(value)) continue;
+      seen.add(value);
+
+      if (!Array.isArray(value)) {
+        const attrs = value.attributes && typeof value.attributes === "object"
+          ? value.attributes
+          : value;
+        const hasStats = !!(attrs.last_analysis_stats || attrs.lastAnalysisStats || attrs.stats);
+        if (hasStats && vtFileIdentityMatchesTarget(hash, value.id, attrs)) {
+          const hit = fileHitFromAttrs(attrs, hash, guiUrl, source || "vt-text-json", value.id);
+          if (hit) return hit;
+        }
+      }
+
+      if (depth >= 8) continue;
+      if (Array.isArray(value)) {
+        for (const item of value.slice(0, 1000)) queue.push({ value: item, depth: depth + 1 });
+      } else {
+        for (const child of Object.values(value)) {
+          if (child && typeof child === "object") queue.push({ value: child, depth: depth + 1 });
+        }
+      }
+    }
+    return null;
+  }
+
+  /** 从与目标完整 SHA-256 绑定的文本中抠 last_analysis_stats。 */
   function parseVtStatsFromAnyText(text, hash, guiUrl, source) {
     const s = String(text || "");
     if (!s || s.length < 20) return null;
+    try {
+      const parsed = JSON.parse(s);
+      return findTargetVtFileHitInJson(parsed, hash, guiUrl, source || "vt-text-json");
+    } catch { /* 非 JSON 仅走下面的单对象保守兜底 */ }
+    if (!textContainsTargetVtFileIdentity(s, hash)) return null;
+    // 非 JSON 文本无法可靠划分对象；出现多个 stats 时宁可不报，也不能把首个对象串给目标 hash。
+    const statsBlocks = Array.from(s.matchAll(/"last_analysis_stats"\s*:\s*\{([^}]{5,500})\}/gi));
+    if (statsBlocks.length > 1) return null;
     // 完整 last_analysis_stats 对象
-    const mStats = s.match(/"last_analysis_stats"\s*:\s*\{([^}]{5,500})\}/i);
+    const mStats = statsBlocks[0] || null;
     if (mStats) {
       const block = mStats[1];
       const g = (k) => {
@@ -4236,7 +4725,9 @@
       };
     }
     // "malicious":0,"suspicious":0,"undetected":70...
-    const mMal = s.match(/"malicious"\s*:\s*(\d+)\s*,\s*"suspicious"\s*:\s*(\d+)/i);
+    const rawPairs = Array.from(s.matchAll(/"malicious"\s*:\s*(\d+)\s*,\s*"suspicious"\s*:\s*(\d+)/gi));
+    if (rawPairs.length > 1) return null;
+    const mMal = rawPairs[0] || null;
     if (mMal) {
       const malicious = parseInt(mMal[1], 10) || 0;
       const suspicious = parseInt(mMal[2], 10) || 0;
@@ -4585,6 +5076,28 @@
     }
   };
 
+  function normalizeVtFileHash(value) {
+    const h = String(value || "").trim().toLowerCase();
+    return /^[a-f0-9]{64}$/.test(h) ? h : "";
+  }
+
+  /**
+   * VT 的报告/搜索/行为响应结构相似，不能只看到 last_analysis_stats 就当成目标文件。
+   * data.id 与 attributes.sha256 中凡是出现完整 SHA-256，都必须与查询 hash 一致。
+   */
+  function vtFileIdentityMatchesTarget(hash, nodeId, attrs) {
+    const expected = normalizeVtFileHash(hash);
+    if (!expected) return false;
+    const identities = [];
+    const idHash = normalizeVtFileHash(nodeId);
+    const attrHash = normalizeVtFileHash(attrs && attrs.sha256);
+    if (idHash) identities.push(idHash);
+    if (attrHash) identities.push(attrHash);
+    return identities.length > 0
+      && identities.includes(expected)
+      && identities.every((candidate) => candidate === expected);
+  }
+
   function statsFromAttrs(attrs) {
     const stats = (attrs && (attrs.last_analysis_stats || attrs.lastAnalysisStats || attrs.stats)) || {};
     const malicious = Number(stats.malicious) || 0;
@@ -4771,8 +5284,9 @@
     return authenticodeSignerFromSigInfo(sig);
   }
 
-  function fileHitFromAttrs(attrs, hash, guiUrl, source) {
+  function fileHitFromAttrs(attrs, hash, guiUrl, source, nodeId) {
     if (!attrs || typeof attrs !== "object") return null;
+    if (!vtFileIdentityMatchesTarget(hash, nodeId, attrs)) return null;
     // 有文件元数据即视为库中存在（即使 stats 暂空）
     const hasMeta = !!(
       attrs.sha256 || attrs.sha1 || attrs.md5
@@ -4827,12 +5341,12 @@
     const node = data.data || data;
     const attrs = (node && node.attributes) || (data.attributes) || null;
     if (attrs && typeof attrs === "object") {
-      const hit = fileHitFromAttrs(attrs, hash, guiUrl, "vt-ui");
+      const hit = fileHitFromAttrs(attrs, hash, guiUrl, "vt-ui", node && node.id);
       if (hit) return hit;
     }
     // 有时 data 本身就是 attributes
     if (node && typeof node === "object" && (node.last_analysis_stats || node.sha256 || node.type_description)) {
-      const hit = fileHitFromAttrs(node, hash, guiUrl, "vt-ui");
+      const hit = fileHitFromAttrs(node, hash, guiUrl, "vt-ui", node.id);
       if (hit) return hit;
     }
     return null;
@@ -4858,13 +5372,9 @@
       const attrs = item.attributes || item;
       // 命中同 hash 的 file
       if (type === "file" || /^[a-f0-9]{64}$/.test(id) || (attrs && attrs.sha256)) {
-        const itemHash = (attrs && attrs.sha256) || id;
-        if (itemHash && String(itemHash).toLowerCase() !== hash && type === "file" && id && id !== hash) {
-          // 不同文件，跳过
-          continue;
-        }
-        if (type === "file" || String(itemHash).toLowerCase() === hash || (attrs && String(attrs.sha256 || "").toLowerCase() === hash)) {
-          const hit = fileHitFromAttrs(attrs || {}, hash, guiUrl, "vt-search");
+        const exactItem = vtFileIdentityMatchesTarget(hash, id, attrs);
+        if (exactItem) {
+          const hit = fileHitFromAttrs(attrs || {}, hash, guiUrl, "vt-search", id);
           if (hit) return hit;
           // 至少 search 点到了这个 hash
           return {
@@ -4904,72 +5414,9 @@
       base.summary = "VT: 请点开链接查看检出";
       return base;
     }
-    // GUI HTML/营销文案不是权威查无结果，继续尝试解析真实 stats。
-    // 尝试从内嵌 JSON / 文案抽检出
-    let malicious = null;
-    let total = null;
-    const mStats = text.match(/"last_analysis_stats"\s*:\s*\{([^}]{0,400})\}/i);
-    if (mStats) {
-      const block = mStats[1];
-      const g = (k) => {
-        const m = block.match(new RegExp('"' + k + '"\\s*:\\s*(\\d+)', "i"));
-        return m ? parseInt(m[1], 10) : 0;
-      };
-      malicious = g("malicious");
-      const sus = g("suspicious");
-      const und = g("undetected");
-      const harm = g("harmless");
-      total = malicious + sus + und + harm;
-      base.malicious = malicious;
-      base.suspicious = sus;
-      base.undetected = und;
-      base.harmless = harm;
-      base.total = total;
-      base.found = true;
-      base.notFound = false;
-      base.unknown = false;
-      base.summary = formatVtSummary(malicious, sus, total, "");
-      return base;
-    }
-    const mRatio = text.match(/(\d{1,3})\s*\/\s*(\d{1,3})\s*(?:security vendors|engines|检测)/i)
-      || text.match(/"malicious"\s*:\s*(\d+)\s*,\s*"suspicious"\s*:\s*(\d+)/i);
-    if (mRatio) {
-      if (/malicious/i.test(mRatio[0])) {
-        malicious = parseInt(mRatio[1], 10);
-        const sus = parseInt(mRatio[2], 10) || 0;
-        base.malicious = malicious;
-        base.suspicious = sus;
-        base.found = true;
-        base.notFound = false;
-        base.unknown = false;
-        base.ratio = `${malicious + sus}?`;
-        base.summary = formatVtSummary(malicious, sus, 0, "");
-        return base;
-      }
-      malicious = parseInt(mRatio[1], 10);
-      total = parseInt(mRatio[2], 10);
-      base.malicious = malicious;
-      base.total = total;
-      base.found = true;
-      base.notFound = false;
-      base.unknown = false;
-      base.ratio = `${malicious}/${total}`;
-      base.summary = formatVtSummary(malicious, 0, total, "");
-      return base;
-    }
-    const mMal = text.match(/"malicious"\s*:\s*(\d+)/i);
-    const mUnd = text.match(/"undetected"\s*:\s*(\d+)/i);
-    if (mMal) {
-      malicious = parseInt(mMal[1], 10);
-      const und = mUnd ? parseInt(mUnd[1], 10) : 0;
-      base.malicious = malicious;
-      base.undetected = und;
-      base.found = true;
-      base.notFound = false;
-      base.unknown = false;
-      base.summary = formatVtSummary(malicious, 0, malicious + und, "");
-      return base;
-    }
+    // GUI 壳可能混入其它对象/营销组件；统一走完整 hash 绑定解析，禁止另写宽松正则。
+    const boundStats = parseVtStatsFromAnyText(text, hash, guiUrl, "vt-gui");
+    if (boundStats) return { ...base, ...boundStats, source: "vt-gui", status: status || 0 };
     // SPA 壳 / 登录墙：未知（有记录也可能是这壳），绝不能写成「无」
     if (/login|captcha|Access denied|cf-browser-verification/i.test(text) && text.length < 4000) {
       base.summary = "VT: 需登录/人机验证，请点开链接查看";
@@ -5046,7 +5493,11 @@
       return { success: false, error: "bad-url" };
     }
     const kind = packageKindFromName(name) || packageKindFromName(u) || "package";
-    const key = u.slice(0, 300);
+    // Separate user download transactions even when the server URL is the
+    // same. Reusing a URL-only promise can bind a refreshed download to the
+    // previous probe's callbacks and bytes.
+    const probeKey = String((meta && meta.probeKey) || "").slice(0, 120);
+    const key = `${u.slice(0, 300)}::${probeKey}`;
     if (NS._peVtInflight.has(key)) return NS._peVtInflight.get(key);
 
     const p = (async () => {
@@ -5063,6 +5514,8 @@
       try {
         const looksArchive = kind === "archive" || kind === "package"
           || ARCHIVE_EXT_RE.test(name) || ARCHIVE_EXT_RE.test(u);
+        const declaredArchiveFormat = expectedArchiveFormatFromName(name)
+          || expectedArchiveFormatFromName(u);
         let fetched = await fetchArrayBuffer(u, {
           timeoutMs: FETCH_TIMEOUT_MS,
           maxBytes: MAX_FULL_FETCH
@@ -5073,7 +5526,8 @@
           const sizeMb = fetched.contentLength
             ? Math.round(fetched.contentLength / 1048576)
             : "?";
-          if (looksArchive) {
+          // Range 实现只解析 ZIP 中央目录。RAR/7Z/CAB 等绝不能误送进 ZIP 扫描器。
+          if (looksArchive && declaredArchiveFormat === "zip") {
             try {
               const rangeScan = await scanLargeZipByHttpRange(u);
               report.kind = "archive";
@@ -5115,8 +5569,50 @@
               return report;
             }
           }
+          if (looksArchive) {
+            const fmt = declaredArchiveFormat || "unknown";
+            const label = fmt === "rar" ? "RAR"
+              : fmt === "7z" ? "7Z"
+              : fmt === "unknown" ? "压缩包" : fmt.toUpperCase();
+            const note = `${label} 文件过大（约 ${sizeMb}MB），未完整读取，未进行包内文件与数字签名扫描`;
+            report.kind = "archive";
+            report.pe = {
+              isPe: false,
+              signed: false,
+              signerHint: "",
+              skipped: true,
+              signatureUnscanned: true,
+              reason: "too-large"
+            };
+            report.nested = [];
+            report.archiveFormat = fmt;
+            report.archiveNote = note;
+            report.partialScan = true;
+            report.vt = {
+              success: true,
+              found: null,
+              notFound: false,
+              unknown: true,
+              summary: "",
+              guiUrl: ""
+            };
+            report.signature = resolveDigitalSignature(report.pe, null, []);
+            report.success = true;
+            report.error = "";
+            return report;
+          }
+          // 文件没有被完整读取时，false 只能表示“未知”，不能表示“无签名”。
+          report.pe = {
+            isPe: kind === "pe",
+            signed: false,
+            signerHint: "",
+            skipped: true,
+            signatureUnscanned: true,
+            reason: "too-large"
+          };
+          report.signature = resolveDigitalSignature(report.pe, null, []);
           report.error = "文件过大（约 " + sizeMb + "MB，上限 "
-            + Math.round(MAX_RANGE_ARCHIVE / 1048576) + "MB）";
+            + Math.round(MAX_FULL_FETCH / 1048576) + "MB）";
           report.success = false;
           return report;
         }
@@ -5127,6 +5623,38 @@
           return report;
         }
         const ab = fetched.buf;
+        report.responseUrl = String(fetched.finalUrl || u).slice(0, 500);
+        report.responseContentType = String(fetched.contentType || "").slice(0, 160);
+        let payloadMismatch = packagePayloadMismatchReason(
+          ab,
+          kind,
+          declaredArchiveFormat,
+          fetched.contentType
+        );
+        const expectedBytes = Number(meta && meta.expectedBytes) || 0;
+        if (!payloadMismatch && expectedBytes > 0) {
+          const delta = Math.abs(Number(ab.byteLength) - expectedBytes);
+          if (delta > Math.max(65536, expectedBytes * 0.05)) payloadMismatch = "size-mismatch";
+        }
+        if (payloadMismatch) {
+          report.responseMismatch = true;
+          report.responseMismatchReason = payloadMismatch;
+          report.pe = {
+            isPe: false,
+            signed: false,
+            signerHint: "",
+            skipped: true,
+            signatureUnscanned: true,
+            reason: "response-mismatch"
+          };
+          report.nested = [];
+          report.sha256 = "";
+          report.vt = null;
+          report.signature = resolveDigitalSignature(report.pe, null, []);
+          report.error = "重新获取的响应与下载文件类型不一致（可能需要登录、发生跳转或链接已失效），未生成 SHA256 或无签名结论";
+          report.success = false;
+          return report;
+        }
         // PE：Authenticode；其它先标 kind。包内扫描会与外层 VT 网络查询并行。
         if (kind === "pe" || (kind !== "archive" && kind !== "msi" && kind !== "apk"
           && NS.parsePeAuthenticode(ab).isPe)) {
@@ -5156,6 +5684,7 @@
                 kind: report.kind,
                 pe: report.pe,
                 sha256: report.sha256,
+                responseUrl: report.responseUrl || "",
                 signature: report.signature,
                 vt: null,
                 nested: [],
@@ -5173,7 +5702,7 @@
           || detectedArchiveFormat === "7z");
         // 解压/包内 PE 解析与外层 VT 查询互不依赖，并行可直接省掉一段串行等待。
         const nestedScanPromise = isZipLike
-          ? Promise.resolve().then(() => scanNestedExecutablesInArchive(ab)).then((scan) => {
+          ? Promise.resolve().then(() => scanNestedExecutablesInArchive(ab, name)).then((scan) => {
             // 包内本地解析一完成就推给 popup，不必等外层 VT；签名先黑色，VT 验真后再升级绿色。
             if (meta && typeof meta.onPartial === "function" && scan) {
               try {
@@ -5273,7 +5802,9 @@
           const shellBudget = nestStrong ? 12000 : 40000;
           try {
             report.vt = await raceMs(
-              NS.lookupVirusTotalHash(report.sha256),
+              NS.lookupVirusTotalHash(report.sha256, {
+                requireSignature: !!(report.pe && report.pe.isPe && report.pe.signed)
+              }),
               shellBudget,
               nestStrong
                 ? {
@@ -5302,28 +5833,10 @@
           if (!report.vt) {
             report.vt = vtUnknownResult(report.sha256, { summary: "" });
           }
-          try {
-            report.vt = enrichVtResultWithSignature(
-              report.vt,
-              report.vt && (report.vt.rawText || report.vt.summary) || "",
-              report.vt && report.vt.pageHint || ""
-            );
-          } catch { /* ignore */ }
           if (report.pe && report.pe.isPe && report.pe.signed && !report.pe.signerHint
             && report.vt && report.vt.signerFromVt) {
             const fromVt = sanitizePublisherName(report.vt.signerFromVt);
             if (fromVt) report.pe.signerHint = fromVt;
-          }
-          if (report.pe && report.pe.isPe && report.pe.signed && report.vt && report.vt.found === true) {
-            if (!report.vt.sigTrustFromVt || report.vt.sigTrustFromVt === "present") {
-              if (report.vt.signerFromVt || report.pe.signerHint) {
-                const a = report.pe.signerHint || "";
-                const b = report.vt.signerFromVt || "";
-                if (!a || !b || signerNamesLooselyMatch(a, b)) {
-                  report.vt.sigTrustFromVt = "valid";
-                }
-              }
-            }
           }
           try {
             report.signature = resolveDigitalSignature(report.pe, report.vt, report.nested || []);
@@ -5455,7 +5968,8 @@
             }
             const needNestedVt = report.nested.length
               && !(meta && meta.skipNestedVt)
-              && !report.nested.some((n) => n && n.vt && (n.vt.found === true || n.vt.notFound === true || n.vt.unknown));
+              && !report.nested.some((n) => nestedVtMatchesItem(n)
+                && n.vt && (n.vt.found === true || n.vt.notFound === true || n.vt.unknown));
             if (needNestedVt) {
               try {
                 await attachVtToNestedItems(
@@ -5507,17 +6021,25 @@
       bits.push("类型: " + kindLabel);
     }
     const sig = report.signature || resolveDigitalSignature(pe, vt, report.nested);
-    if (sig && (pe.isPe || (report.nested && report.nested.length) || sig.trust === "none")) {
+    if (sig && (pe.isPe || (report.nested && report.nested.length)
+      || sig.trust === "none" || signatureTrustIsUnknown(sig.trust))) {
       // 压缩包外壳无 Authenticode：不写「数字签名: 无」
       const archiveShell = reportLooksLikeArchiveShell(report);
       if (!(archiveShell && sig.trust === "none" && !(pe && pe.isPe && !pe.skipped))) {
-        if (sig.trust === "none") bits.push("数字签名: 无");
+        if (signatureTrustIsUnknown(sig.trust)) {
+          bits.push(report.responseMismatch
+            ? "数字签名: 未检测（重取响应与下载文件不一致）"
+            : "数字签名: 未检测（文件超过650MB，未完整读取）");
+        } else if (sig.trust === "none") bits.push("数字签名: 无");
         else if (sig.signer) bits.push("数字签名: " + sig.signer + (sig.trust === "valid" ? "（VT 有效）" : sig.trust === "invalid" ? "（无效）" : ""));
         else bits.push(sig.trust === "valid" ? "数字签名: 有（VT 有效）" : sig.trust === "invalid" ? "数字签名: 无效" : "数字签名: 有");
       }
       if (Array.isArray(sig.items) && sig.items.length) {
         const nestBits = sig.items.slice(0, 4).map((it) => {
-          if (!it.signed) return (it.name || "?") + " 无签名";
+          const trust = String(it.trust || "").toLowerCase();
+          if (signatureTrustIsUnknown(trust)) return (it.name || "?") + " 签名未检测";
+          if (trust === "invalid") return (it.name || "?") + " 签名无效";
+          if (trust === "none") return (it.name || "?") + " 无签名";
           return (it.name || "?") + (it.signer ? (" " + it.signer) : " 有签名");
         });
         bits.push("包内: " + nestBits.join("; "));
@@ -5567,19 +6089,92 @@
 
   /** 通过 VT 门禁后允许再下一次的 URL（防回路） */
   NS._vtPassUrls = NS._vtPassUrls || new Map();
+  NS._vtReleasedDownloadIds = NS._vtReleasedDownloadIds || new Map();
+
+  function vtPassUrlKey(url) {
+    const raw = String(url || "");
+    if (!raw) return "";
+    try {
+      const parsed = new URL(raw);
+      parsed.hash = "";
+      return parsed.href;
+    } catch {
+      return raw.split("#", 1)[0];
+    }
+  }
 
   NS.consumeVtPassUrl = function (url) {
-    const u = String(url || "");
+    const u = vtPassUrlKey(url);
     if (!u || !NS._vtPassUrls.has(u)) return false;
-    const exp = NS._vtPassUrls.get(u);
-    NS._vtPassUrls.delete(u);
-    return Number(exp) > Date.now();
+    const raw = NS._vtPassUrls.get(u);
+    const now = Date.now();
+    let tokens = [];
+    if (raw && typeof raw === "object" && Array.isArray(raw.tokens)) {
+      tokens = raw.tokens.filter((token) => token && Number(token.expiresAt) > now);
+    } else {
+      const expiresAt = typeof raw === "object" ? Number(raw.expiresAt) : Number(raw);
+      const count = typeof raw === "object" ? Math.max(1, Number(raw.count) || 1) : 1;
+      if (expiresAt > now) {
+        tokens = Array.from({ length: count }, (_, i) => ({ id: `legacy-${i}`, expiresAt }));
+      }
+    }
+    if (!tokens.length) {
+      NS._vtPassUrls.delete(u);
+      return false;
+    }
+    tokens.shift();
+    if (!tokens.length) NS._vtPassUrls.delete(u);
+    else NS._vtPassUrls.set(u, { tokens });
+    return true;
   };
 
-  NS.grantVtPassUrl = function (url, ttlMs) {
-    const u = String(url || "");
+  NS.grantVtPassUrl = function (url, ttlMs, tokenId) {
+    const u = vtPassUrlKey(url);
     if (!u) return;
-    NS._vtPassUrls.set(u, Date.now() + Math.max(5000, ttlMs || 90000));
+    const now = Date.now();
+    const raw = NS._vtPassUrls.get(u);
+    let tokens = raw && typeof raw === "object" && Array.isArray(raw.tokens)
+      ? raw.tokens.filter((token) => token && Number(token.expiresAt) > now)
+      : [];
+    const id = String(tokenId || `${now}-${Math.random().toString(36).slice(2, 10)}`);
+    tokens = tokens.filter((token) => String(token.id || "") !== id);
+    tokens.push({ id, expiresAt: now + Math.max(5000, ttlMs || 90000) });
+    NS._vtPassUrls.set(u, { tokens });
+  };
+
+  NS.revokeVtPassUrl = function (url, tokenId) {
+    const u = vtPassUrlKey(url);
+    if (!u || !NS._vtPassUrls.has(u)) return;
+    const raw = NS._vtPassUrls.get(u);
+    if (!(raw && typeof raw === "object" && Array.isArray(raw.tokens))) {
+      NS._vtPassUrls.delete(u);
+      return;
+    }
+    const now = Date.now();
+    const id = String(tokenId || "");
+    const tokens = raw.tokens.filter((token) => token && Number(token.expiresAt) > now);
+    const index = id ? tokens.findIndex((token) => String(token.id || "") === id) : 0;
+    if (index >= 0) tokens.splice(index, 1);
+    if (!tokens.length) NS._vtPassUrls.delete(u);
+    else NS._vtPassUrls.set(u, { tokens });
+  };
+
+  NS.rememberVtReleasedDownloadId = function (downloadId, ttlMs) {
+    if (!Number.isInteger(downloadId) || downloadId < 0) return;
+    NS._vtReleasedDownloadIds.set(downloadId, Date.now() + Math.max(5000, ttlMs || 30000));
+    if (NS._vtReleasedDownloadIds.size > 100) {
+      const now = Date.now();
+      for (const [id, expires] of NS._vtReleasedDownloadIds) {
+        if (Number(expires) <= now || NS._vtReleasedDownloadIds.size > 60) NS._vtReleasedDownloadIds.delete(id);
+      }
+    }
+  };
+
+  NS.consumeVtReleasedDownloadId = function (downloadId) {
+    if (!Number.isInteger(downloadId) || downloadId < 0) return false;
+    const expires = Number(NS._vtReleasedDownloadIds.get(downloadId)) || 0;
+    NS._vtReleasedDownloadIds.delete(downloadId);
+    return expires > Date.now();
   };
 
   function resolvePageContext(tabId) {
@@ -5680,6 +6275,7 @@
       const seq = ++NS._latestExeVtSeq;
       const tabId = payload.tabId != null ? payload.tabId : null;
       const probeGen = payload.probeGen;
+      const probeId = String(payload.probeId || "");
       // 过期探测：用户已开始更新下载 / 已换站，丢弃迟到结果
       if (Number.isInteger(tabId) && tabId >= 0 && probeGen != null) {
         const live = NS._vtProbeGenByTab.get(tabId);
@@ -5689,9 +6285,17 @@
       const sameTab = !!(prev && tabId != null && prev.tabId != null
         && Number(prev.tabId) === Number(tabId));
       const sameUrl = !!(prev && prev.url && nextUrl && prev.url === nextUrl);
+      const nextProbeGen = probeGen != null ? Number(probeGen) : null;
+      const prevProbeGen = prev && prev.probeGen != null ? Number(prev.probeGen) : null;
+      // URL is not file identity. A refresh/re-download of the same URL is a
+      // new transaction and must be allowed to replace the previous final
+      // state with a fresh checking state (including an intentionally empty
+      // hash) before its own bytes have been read.
+      const newerProbe = !!(sameTab && nextProbeGen != null
+        && (prevProbeGen == null || nextProbeGen > prevProbeGen));
 
       // 同 tab + 同下载 URL：禁止用更低阶段/checking 覆盖已完成
-      if (sameTab && sameUrl) {
+      if (sameTab && sameUrl && !newerProbe) {
         const prevRank = Number(prev._rank) || 0;
         if (nextRank < prevRank && !allowRankDowngrade) return null;
         if (/^(done|allowed|blocked|flagged|error)$/i.test(String(prev.status || ""))
@@ -5701,7 +6305,7 @@
       }
       // 同 tab、不同下载 URL：新文件的完成态可覆盖旧完成态；旧完成态不得被别的文件半成品冲掉
       // 且：若 prev 是更新探测（更高 probeGen / 更新 timestamp 的 final），拒绝旧 final 回写
-      if (sameTab && prev && prev.url && nextUrl && prev.url !== nextUrl) {
+      if (sameTab && prev && prev.url && nextUrl && prev.url !== nextUrl && !newerProbe) {
         if (/^(checking|uploading)$/i.test(String(prev.status || ""))
           && (Date.now() - (Number(prev.timestamp) || 0) < 120000)
           && nextRank < 90) {
@@ -5746,6 +6350,7 @@
         gated: !!payload.gated,
         allowed: payload.allowed,
         probeGen: probeGen != null ? Number(probeGen) : (prev && sameTab ? prev.probeGen : null),
+        probeId,
         timestamp: Date.now(),
         success: payload.success !== false,
         _rank: nextRank,
@@ -5852,10 +6457,6 @@
   NS.refreshStoredVirusTotalDetails = async function (sha256, tabId) {
     const hash = String(sha256 || "").toLowerCase().replace(/[^0-9a-f]/g, "");
     if (hash.length !== 64) return { success: false, error: "bad-hash" };
-    try { NS._vtByHash.delete(hash); } catch { /* ignore */ }
-    const vt = await NS.lookupVirusTotalHash(hash);
-    if (!vt || vt.found !== true) return { success: false, vt: vt || null };
-
     const tabKey = Number.isInteger(tabId) && tabId >= 0 ? `latestExeVt_${tabId}` : "";
     const stored = await new Promise((resolve) => {
       const keys = tabKey ? [tabKey, "latestExeVt"] : ["latestExeVt"];
@@ -5864,8 +6465,32 @@
     });
     const current = (tabKey && stored[tabKey]) || stored.latestExeVt || NS._latestExeVtMem || null;
     if (!current || String(current.sha256 || "").toLowerCase() !== hash) {
-      return { success: true, vt, updated: false };
+      return { success: false, error: "stale-report" };
     }
+
+    const requireSignature = !!(
+      current.peSigned
+      || (current.pe && current.pe.isPe && current.pe.signed)
+      || String(current.peSigTrust || "").toLowerCase() === "present"
+      || String(current.signature && current.signature.trust || "").toLowerCase() === "present"
+    );
+    try { NS._vtByHash.delete(hash); } catch { /* ignore */ }
+    // 手动刷新必须绕过持久化定论，否则刚删内存缓存又会立刻读回旧错结果。
+    await removeDurableVtCache(hash);
+    const vt = await NS.lookupVirusTotalHash(hash, { requireSignature });
+    if (!vt || vt.found !== true) return { success: false, vt: vt || null };
+
+    const pe = current.pe ? { ...current.pe } : null;
+    if (pe && pe.signed && !pe.signerHint && vt.signerFromVt) {
+      pe.signerHint = sanitizePublisherName(vt.signerFromVt) || "";
+    }
+    const signature = resolveDigitalSignature(pe, vt, current.nested || []);
+    const peSigner = sanitizePublisherName(
+      (signature && signature.signer)
+      || (pe && pe.signerHint)
+      || vt.signerFromVt
+      || ""
+    );
 
     const consensus = vtShouldHardBlock({ vt }, {});
     const oldPolicyVtFlag = Number(current.vt && current.vt.trustedPolicyVersion) !== VT_TRUST_POLICY_VERSION
@@ -5890,6 +6515,11 @@
       status,
       title,
       vt,
+      pe,
+      signature,
+      peSigned: !!(pe && pe.signed),
+      peSigner,
+      peSigTrust: (signature && signature.trust) || "",
       guiUrl: vt.guiUrl || current.guiUrl || (VT_GUI_BASE + hash),
       tabId: Number.isInteger(tabId) && tabId >= 0 ? tabId : current.tabId,
       allowed: consensus.block ? false : (oldPolicyVtFlag ? true : current.allowed),
@@ -5922,7 +6552,15 @@
       chrome.runtime.sendMessage({
         type: "exe-vt-result",
         tabId: updated && updated.tabId,
-        vtInfo: updated || { ...current, vt }
+        vtInfo: updated || {
+          ...current,
+          vt,
+          pe,
+          signature,
+          peSigned: !!(pe && pe.signed),
+          peSigner,
+          peSigTrust: (signature && signature.trust) || ""
+        }
       }, () => { void chrome.runtime.lastError; });
     } catch { /* ignore */ }
     return { success: true, vt, updated: !!updated };
@@ -5943,9 +6581,19 @@
     const nested = Array.isArray(current.nested)
       ? current.nested.map((item) => ({ ...item, vt: item && item.vt ? { ...item.vt } : null }))
       : [];
-    const pending = nested.filter((item) => item && item.signed
-      && /^(?:present)?$/i.test(String(item.sigTrust || item.trust || "present"))
-      && /^[a-f0-9]{64}$/i.test(String(item.sha256 || "")));
+    const pending = nested.filter((item) => {
+      if (!item || !/^[a-f0-9]{64}$/i.test(String(item.sha256 || ""))) return false;
+      const identityAndPolicyCurrent = nestedVtMatchesItem(item);
+      const nv = item.vt || null;
+      if (identityAndPolicyCurrent && nv) {
+        if (nv.notFound === true && nv.verifiedNotFound === true && nv.softMiss !== true) return false;
+        if (nv.unknown === true && Date.now() - (Number(nv.checkedAt) || 0) < 30000) return false;
+      }
+      const signatureNeedsRefresh = !!item.signed
+        && /^(?:present)?$/i.test(String(item.sigTrust || item.trust || "present"));
+      const identityOrPolicyNeedsRefresh = !identityAndPolicyCurrent;
+      return signatureNeedsRefresh || identityOrPolicyNeedsRefresh;
+    });
     if (!pending.length) return { success: true, updated: false };
 
     await attachVtToNestedItems(nested, 30000);
@@ -5999,7 +6647,7 @@
     const nested = (report && report.nested) || [];
     for (const n of nested) {
       const nv = n && n.vt;
-      if (!nv || nv.found !== true) continue;
+      if (!nv || nv.found !== true || !nestedVtMatchesItem(n)) continue;
       const nTrustedMal = Number(nv.trustedMaliciousCount) || 0;
       const nTrustedSus = Number(nv.trustedSuspiciousCount) || 0;
       const nTrusted = (nTrustedMal + nTrustedSus)
@@ -6031,14 +6679,20 @@
       }
     }
     const pe = report && report.pe;
-    if (opts && opts.requireSignedPe && pe && pe.isPe && !pe.signed) {
+    const outerSigTrust = report && report.signature && report.signature.trust;
+    if (opts && opts.requireSignedPe && pe && pe.isPe
+      && !signatureTrustIsPositive(outerSigTrust)
+      && !peSignatureInspectionWasSkipped(pe)
+      && !signatureTrustIsUnknown(outerSigTrust)) {
       return { block: true, reason: "unsigned-pe", deleteFile: false };
     }
     // 压缩包：要求签名时，包内 PE 全无签也拦
     if (opts && opts.requireSignedPe && nested.length
       && nested.some((n) => n && (n.kind === "pe" || /\.exe|\.dll|\.sys/i.test(n.name || "")))
       && nested.filter((n) => n && (n.kind === "pe" || /\.exe|\.dll|\.sys/i.test(n.name || "")))
-        .every((n) => !n.signed)) {
+        .every((n) => !signatureTrustIsPositive(n.sigTrust || n.trust)
+          && !peSignatureInspectionWasSkipped(n)
+          && !signatureTrustIsUnknown(n.sigTrust || n.trust))) {
       return { block: true, reason: "unsigned-pe", deleteFile: false };
     }
     return { block: false, reason: "", deleteFile: false };
@@ -6066,9 +6720,16 @@
       const filename = basenameFromUrlOrName(url, item.filename);
       const gate = !!(opts && opts.gate);
       const downloadId = item.id;
+      const probeId = (() => {
+        try {
+          if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+        } catch { /* ignore */ }
+        return `${Date.now()}-${Number.isInteger(downloadId) ? downloadId : "download"}-${Math.random().toString(36).slice(2, 10)}`;
+      })();
       let released = false;
       let pageUrl = "";
       let pageHost = "";
+      let verifiedResponseUrl = "";
       let pageVtToastShown = false;
       let downloadDeletePromise = null;
       let releasedDownloadId = null;
@@ -6080,26 +6741,45 @@
         return g;
       };
       let probeGen = bumpProbeGen(tabId);
+      const probeIsCurrent = () => {
+        if (!Number.isInteger(tabId) || tabId < 0 || !probeGen) return true;
+        const live = NS._vtProbeGenByTab.get(tabId);
+        return live == null || Number(live) === Number(probeGen);
+      };
       const writeVt = (payload) => writeLatestExeVt({
         ...payload,
         tabId: payload.tabId != null ? payload.tabId : tabId,
-        probeGen
+        probeGen,
+        probeId
       });
 
       const rememberReleasedDownloadId = (newDownloadId) => {
         if (!Number.isInteger(newDownloadId)) return;
+        try { NS.rememberVtReleasedDownloadId(newDownloadId, 30000); } catch { /* ignore */ }
+        // Download events and callbacks are not ordered. A concurrent replay
+        // may already have consumed this probe's URL token, so a successful
+        // callback only binds the exact id. Each DownloadItem retires one URL
+        // permit; failed replays still revoke their own token below.
+        if (!probeIsCurrent()) return;
         releasedDownloadId = newDownloadId;
-        if (NS._latestExeVtMem && NS._latestExeVtMem.url === url) {
+        const belongsToProbe = (entry) => !!(entry
+          && entry.url === url
+          && (entry.tabId == null || tabId == null || Number(entry.tabId) === Number(tabId))
+          && (!entry.probeId || entry.probeId === probeId)
+          && (entry.probeGen == null || Number(entry.probeGen) === Number(probeGen))
+          && (entry.downloadId == null || Number(entry.downloadId) === Number(downloadId)));
+        if (belongsToProbe(NS._latestExeVtMem)) {
           NS._latestExeVtMem.releasedDownloadId = newDownloadId;
         }
         const keys = ["latestExeVt"];
         if (Number.isInteger(tabId) && tabId >= 0) keys.push(`latestExeVt_${tabId}`);
         try {
           chrome.storage.local.get(keys, (stored) => {
+            if (!probeIsCurrent()) return;
             const updates = {};
             for (const key of keys) {
               const entry = stored && stored[key];
-              if (entry && entry.url === url) {
+              if (belongsToProbe(entry)) {
                 updates[key] = { ...entry, releasedDownloadId: newDownloadId };
               }
             }
@@ -6153,15 +6833,21 @@
             notify: true
           }, { frameId: 0 }, () => { void chrome.runtime.lastError; });
         } catch { /* ignore */ }
+        // This verdict originates inside the trusted service worker, not from
+        // a content document. Bypass the content-message transaction gate and
+        // install the hard protection directly.
         try {
-          if (chrome.runtime && chrome.runtime.sendMessage) {
-            chrome.runtime.sendMessage({
-              type: "set-tab-protect",
-              enabled: true,
+          if (tabId != null && typeof NS.markTabProtected === "function") {
+            const pageKey = String(pageUrl || url || "").slice(0, 500);
+            const activeTxn = NS._activeRiskTxnByTab instanceof Map
+              ? NS._activeRiskTxnByTab.get(tabId)
+              : null;
+            NS.markTabProtected(tabId, pageKey, {
               mode: "full",
-              url: String(pageUrl || url || "").slice(0, 500),
-              tabId
-            }, () => { void chrome.runtime.lastError; });
+              analysisTxn: activeTxn && activeTxn.url === pageKey
+                ? String(activeTxn.analysisTxn || "")
+                : ""
+            });
           }
         } catch { /* ignore */ }
         void reportOpt;
@@ -6171,7 +6857,10 @@
         if (!gate || released) return;
         released = true;
         try {
-          NS.grantVtPassUrl(url, 120000);
+          NS.grantVtPassUrl(url, 120000, probeId);
+          if (verifiedResponseUrl && verifiedResponseUrl !== url) {
+            NS.grantVtPassUrl(verifiedResponseUrl, 120000, probeId);
+          }
           if (chrome.downloads && chrome.downloads.download) {
             chrome.downloads.download({
               url,
@@ -6179,16 +6868,28 @@
               conflictAction: "uniquify",
               saveAs: false
             }, (newDownloadId) => {
-              void chrome.runtime.lastError;
+              if (chrome.runtime.lastError) {
+                try { NS.revokeVtPassUrl(url, probeId); } catch { /* ignore */ }
+                try { if (verifiedResponseUrl && verifiedResponseUrl !== url) NS.revokeVtPassUrl(verifiedResponseUrl, probeId); } catch { /* ignore */ }
+                return;
+              }
               rememberReleasedDownloadId(newDownloadId);
             });
+          } else {
+            try { NS.revokeVtPassUrl(url, probeId); } catch { /* ignore */ }
+            try { if (verifiedResponseUrl && verifiedResponseUrl !== url) NS.revokeVtPassUrl(verifiedResponseUrl, probeId); } catch { /* ignore */ }
           }
-        } catch { /* ignore */ }
+        } catch {
+          try { NS.revokeVtPassUrl(url, probeId); } catch { /* ignore */ }
+          try { if (verifiedResponseUrl && verifiedResponseUrl !== url) NS.revokeVtPassUrl(verifiedResponseUrl, probeId); } catch { /* ignore */ }
+        }
       };
 
       const writePartial = (stage, pr) => {
         try {
+          if (!probeIsCurrent()) return;
           pr = pr || {};
+          if (pr.responseUrl) verifiedResponseUrl = String(pr.responseUrl || "");
           const pe = pr.pe || null;
           const sig = pr.signature || null;
           const vt = pr.vt || null;
@@ -6225,7 +6926,7 @@
                 pageUrl,
                 pageHost,
                 sha256: pr.sha256 || "",
-                peSigned: !!(pe && pe.signed) || !!(sig && sig.trust && sig.trust !== "none"),
+                peSigned: !!(pe && pe.signed) || !!(sig && signatureTrustIsPositive(sig.trust)),
                 peSigner,
                 peSigTrust: (sig && sig.trust) || (vt && vt.sigTrustFromVt) || "",
                 pe,
@@ -6294,7 +6995,7 @@
               pageUrl,
               pageHost,
               sha256: pr.sha256 || "",
-              peSigned: !!(pe && pe.signed) || !!(sig && sig.trust && sig.trust !== "none"),
+              peSigned: !!(pe && pe.signed) || !!(sig && signatureTrustIsPositive(sig.trust)),
               peSigner,
               peSigTrust: (sig && sig.trust) || (vt && vt.sigTrustFromVt) || "",
               pe,
@@ -6327,7 +7028,7 @@
             pageUrl,
             pageHost,
             sha256: pr.sha256 || "",
-            peSigned: !!(pe && pe.signed) || !!(sig && sig.trust && sig.trust !== "none"),
+            peSigned: !!(pe && pe.signed) || !!(sig && signatureTrustIsPositive(sig.trust)),
             peSigner,
             peSigTrust: (sig && sig.trust) || "",
             pe,
@@ -6361,6 +7062,7 @@
           }
           pageUrl = ctx.pageUrl || "";
           pageHost = ctx.pageHost || "";
+          if (!probeIsCurrent()) return;
 
           writeVt({
             status: "checking",
@@ -6384,6 +7086,8 @@
           const report = await raceMs(
             NS.inspectPackageUrl(url, {
               filename,
+              probeKey: `${tabId != null ? tabId : "tab"}:${probeGen || 0}:${Number.isInteger(downloadId) ? downloadId : "download"}`,
+              expectedBytes: Math.max(0, Number(item.totalBytes) || Number(item.fileSize) || 0),
               deferUpload: true,
               skipNestedVt: false,
               nestedVtBudgetMs: gate ? 30000 : 25000,
@@ -6395,6 +7099,7 @@
             90000,
             null
           );
+          if (!probeIsCurrent()) return;
           if (!report) {
             writeVt({
               status: "error",
@@ -6414,6 +7119,7 @@
             if (gate) releaseDownload();
             return;
           }
+          if (report.responseUrl && !report.responseMismatch) verifiedResponseUrl = String(report.responseUrl || "");
           try { annotateArchiveVtFromNested(report); } catch { /* ignore */ }
           const message = formatInspectNotice(report, opts);
           const bestNestFinal = pickBestNestedVtHit(report.nested);
@@ -6453,7 +7159,16 @@
             }
           }
 
-          if (gate) {
+          if (report.responseMismatch) {
+            // The extension's replay did not return the bytes Edge is
+            // downloading. Do not label that response unsigned, query its
+            // hash in VT, block, or delete the user's actual file.
+            allowed = true;
+            status = "error";
+            title = "下载响应无法验证";
+            finalMsg = report.error || "重新获取的响应与下载文件不一致";
+            if (gate && !released) releaseDownload();
+          } else if (gate) {
             if (hard.block) {
               allowed = false;
               status = "blocked";
@@ -6528,7 +7243,8 @@
             pageUrl,
             pageHost,
             sha256: report.sha256 || "",
-            peSigned: !!(report.pe && report.pe.signed) || !!(report.signature && report.signature.trust !== "none" && report.signature.trust),
+            peSigned: !!(report.pe && report.pe.signed)
+              || !!(report.signature && signatureTrustIsPositive(report.signature.trust)),
             peSigner,
             peSigTrust: (report.signature && report.signature.trust) || "",
             pe: report.pe || null,
@@ -6558,6 +7274,10 @@
             allowed,
             success: !!report.success
           });
+          // A newer refresh/re-download may have invalidated this probe while
+          // it was reading bytes or querying VT. Never let a rejected stale
+          // write continue with runtime messages, notifications, or notices.
+          if (!finalVtEntry || !probeIsCurrent()) return;
 
           // popup 读取完整报告；高危 VT 共识同时由上面的 showPageVtToast 发到来源页右上角。
           try {
@@ -6591,6 +7311,7 @@
               await NS.showBlockedNotification(title, finalMsg || filename, tabId);
             } catch { /* ignore */ }
           }
+          if (!probeIsCurrent()) return;
 
           // 拦截说明写入 latestNotice，popup 顶部也能看到
           if (gate && !allowed) {
@@ -6601,6 +7322,12 @@
                   message: finalMsg || filename,
                   tabId,
                   url: pageUrl || url,
+                  guardKind: "package",
+                  sha256: report.sha256 || "",
+                  downloadUrl: url,
+                  downloadId: Number.isInteger(downloadId) ? downloadId : null,
+                  probeGen,
+                  probeId,
                   timestamp: Date.now()
                 }
               });

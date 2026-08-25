@@ -57,6 +57,33 @@
     }
   };
 
+  // Every top-level document/SPA route owns an isolated report transaction.
+  // A token is intentionally independent from host: two pages on the same
+  // host must never inherit each other's completed score or elected brand.
+  function currentAnalysisUrl() {
+    try { return String(location.href || ""); } catch { return ""; }
+  }
+
+  function createAnalysisTxnToken(startedAt, sequence) {
+    let randomPart = "";
+    try {
+      if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+        randomPart = globalThis.crypto.randomUUID().replace(/-/g, "");
+      }
+    } catch { /* use the local fallback */ }
+    if (!randomPart) {
+      randomPart = `${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`;
+    }
+    return `sf-${Number(startedAt).toString(36)}-${Number(sequence).toString(36)}-${randomPart.slice(0, 24)}`;
+  }
+
+  const initialAnalysisTxnStartedAt = Date.now();
+  const initialAnalysisTxnSequence = 1;
+  const initialAnalysisTxn = createAnalysisTxnToken(
+    initialAnalysisTxnStartedAt,
+    initialAnalysisTxnSequence
+  );
+
   /** 全局分析状态。 */
   NS.state = {
     score: 0,
@@ -71,14 +98,33 @@
     icpInfo: "", whoisInfo: "", sslInfo: null, pageDeclaredIcp: "", contextCache: null, contextCacheAt: 0,
     protectedTargets: [], protectionNoticeSent: false, icpMatchedHost: "",
     _perfBenign: false, _perfBenignAt: 0, _scanBusy: false, _lastFastScanAt: 0,
+    // 页面结构已经完成一次扫描、且呈现为正规下载中心时，仅暂停重复全页扫描；
+    // 这不是身份信任，ICP/WHOIS/SSL 与最终品牌裁决仍必须跑完。
+    _officialDownloadScanQuiet: false, _officialDownloadScanQuietUrl: "",
+    _officialDownloadForceScanAllowed: false,
+    _provisionalDownloadAnalysisGeneration: 0,
+    // 性能静默与“下载前等待身份”必须是两个状态。只有后者才允许暂缓用户点击。
+    _provisionalDownloadIdentityHold: false,
+    _provisionalDownloadIdentityUrl: "",
+    _provisionalDownloadIdentityDeadlineAt: 0,
+    _identityVerificationUnavailable: false,
+    _identityVerificationUnavailableUrl: "",
     _analysisDone: false, _analysisDoneAt: 0,
+    _analysisTxn: initialAnalysisTxn,
+    _analysisTxnUrl: currentAnalysisUrl(),
+    _analysisTxnStartedAt: initialAnalysisTxnStartedAt,
+    _analysisTxnSequence: initialAnalysisTxnSequence,
     _icpQuerySettled: false, _icpQueryFailed: false,
+    _icpForcedMissingByFallbackWhois: false, _icpForcedMissingHost: "",
     _icpPageMismatch: false, _unverifiedPageIcpClaim: false, _unverifiedIcpIdentityThreat: false,
     _brandSpoofNoticeSent: false, _brandSpoofNoticeKey: "",
-    _lastGuardNoticeKind: "", _lastGuardNoticeKey: "",
+    _lastGuardNoticeKind: "", _lastGuardNoticeKey: "", _lastGuardNoticeVersion: "",
     _spoofBrandReconciledAt: 0, _spoofPinyinUpgradeScheduled: false, _spoofPinyinUpgradeDone: false,
     _spoofBrandChineseLocked: false,
     _brandSpoofFinalPresented: false, _brandSpoofFinalizeScheduled: false,
+    // The popup, page toast and system notification must all consume this
+    // same versioned final decision.  Candidate text is never a UI source.
+    _brandSpoofFinalSnapshot: null, _brandSpoofNoticeSequence: 0,
     _brandSpoofPresentationDeferred: false,
     // 情报管道收口后才为 true：未确认官网前禁止软仿冒 toast
     _softBrandIdentityReady: false, _softBrandIdentityUrl: "",
@@ -86,7 +132,7 @@
     _brandSpoofDecisionGeneration: 0, _brandSpoofDecisionUrl: "",
     _trustedBrandIdentityUrl: "", _trustedBrandIdentityAt: 0,
     _sslIdentityUrl: "", _sslIdentityStartedAt: 0,
-    _sslIdentityObserved: false, _sslIdentitySettled: false,
+    _sslIdentityObserved: false, _sslIdentitySettled: false, _sslIdentityTimedOut: false,
     _guardArmedAt: 0, _softLiftGeneration: 0,
     _pageBootAt: Date.now(),
     _pendingEncryptedSpa: false, _encryptedSpaRescanArmed: false,
@@ -111,10 +157,26 @@
     _highVolArchive: null, _highVolArchiveAt: 0,
     _skipHeavy: null, _skipHeavyAt: 0,
     _primaryKw: null, _primaryKwAt: 0, _primaryKwUrl: "",
+    _provisionalDownloadController: null,
     probeCache: new Map(),
     pageToastLastAt: new Map(),
     sentNoticeKeys: new Set(),
     sentNoticeLastAt: new Map()
+  };
+
+  NS.rotateAnalysisTransaction = function (urlOpt, reason) {
+    const state = NS.state;
+    const previousStartedAt = Number(state._analysisTxnStartedAt) || 0;
+    const startedAt = Math.max(Date.now(), previousStartedAt + 1);
+    const sequence = (Number(state._analysisTxnSequence) || 0) + 1;
+    const url = String(urlOpt || currentAnalysisUrl());
+    state._analysisTxnStartedAt = startedAt;
+    state._analysisTxnSequence = sequence;
+    state._analysisTxn = createAnalysisTxnToken(startedAt, sequence);
+    state._analysisTxnUrl = url;
+    try { NS.caches.lastReportAt = 0; } catch { /* ignore */ }
+    try { NS.silverfoxLog("analysis-txn", "rotate", state._analysisTxn, url, reason || ""); } catch { /* ignore */ }
+    return state._analysisTxn;
   };
 
   // --- 调试日志 ---
@@ -186,6 +248,13 @@
         NS.state._stickyCompleteHost = "";
         NS.silverfoxLog("analysis-defer", "brand-election", reason || "");
         NS.emitRiskReport(true);
+        try {
+          queueMicrotask(() => {
+            if (typeof NS.nudgeProvisionalDownloadSettlement === "function") {
+              NS.nudgeProvisionalDownloadSettlement("brand-election-deferred");
+            }
+          });
+        } catch { /* ignore */ }
         return false;
       }
     } catch { /* fall through */ }
@@ -201,6 +270,13 @@
     NS.state._analysisDoneAt = Date.now();
     NS.state._scanBusy = false;
     NS.emitRiskReport(true);
+    try {
+      queueMicrotask(() => {
+        if (typeof NS.nudgeProvisionalDownloadSettlement === "function") {
+          NS.nudgeProvisionalDownloadSettlement("analysis-complete");
+        }
+      });
+    } catch { /* ignore */ }
     return true;
   };
 
@@ -214,6 +290,11 @@
     c._highVolArchive = null; c._highVolArchiveAt = 0;
     c._skipHeavy = null; c._skipHeavyAt = 0;
     c._primaryKw = null; c._primaryKwAt = 0; c._primaryKwUrl = "";
+    c._matureLegitProfile = null; c._matureLegitProfileKey = "";
+    c._matureLegitProfileQuickKey = ""; c._matureLegitProfileAt = 0;
+    c._proactiveTargets = null; c._proactiveTargetsAt = 0; c._proactiveTargetsUrl = "";
+    c._downloadProbePageContext = null; c._downloadProbePageContextAt = 0;
+    c._downloadProbePageContextUrl = "";
   };
 
   NS.scheduleIdle = function (fn, timeoutMs = 1200) {

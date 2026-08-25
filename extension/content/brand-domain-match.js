@@ -301,17 +301,24 @@
         segs.forEach(add);
         add(segs.join(""));
       }
+      let apexLeft = "";
       try {
         const apex = (typeof NS.getRegistrableDomain === "function" ? NS.getRegistrableDomain(host) : "") || host;
-        const apexLeft = (String(apex).split(".")[0] || "").toLowerCase();
+        apexLeft = (String(apex).split(".")[0] || "").toLowerCase();
         add(apexLeft.replace(/[^a-z0-9]/g, ""));
         add(apexLeft.replace(/-/g, "").replace(/[^a-z0-9]/g, ""));
+        // apex 连字符段（dingtalk-o → dingtalk + o）
+        if (/-/.test(apexLeft)) {
+          apexLeft.split("-").map((p) => p.replace(/[^a-z0-9]/g, "")).filter(Boolean).forEach(add);
+        }
       } catch { /* ignore */ }
-      // 轻量剥核：只做单标签 infer，避免 collect 内再 resolveHost 重计算
+      // 轻量剥核：首标签 + apex（pc.dingtalk-o → 须剥 dingtalk-o，不能只看 pc）
       try {
         if (typeof NS.inferMarketingPaddedBrandCore === "function") {
           add(NS.inferMarketingPaddedBrandCore(labelRaw));
+          if (apexLeft) add(NS.inferMarketingPaddedBrandCore(apexLeft));
         }
+        if (typeof NS.resolveHostBrandCore === "function") add(NS.resolveHostBrandCore(host));
       } catch { /* ignore */ }
       _hostFormsCacheKey = host;
       _hostFormsCache = out.slice();
@@ -469,10 +476,71 @@
     }
   };
 
+  /**
+   * 中英双名桥：页内中文拼音与主机剥核拉丁共享足够前缀。
+   * 例：钉钉→dingding ⇄ 主机 dingtalk / dingtalk-o（非固定品牌表）。
+   */
+  NS.chinesePinyinBridgesHostLatinCore = function (cnBrand, hostOpt) {
+    try {
+      const cn0 = String(cnBrand || "").trim().replace(/[^\u4e00-\u9fff]/g, "");
+      if (!cn0 || cn0.length < 2 || isStructuralWeakCnBrand(cn0)) return false;
+      let py = "";
+      try {
+        if (typeof NS.brandPinyin === "function") py = String(NS.brandPinyin(cn0) || "");
+        if (!py && typeof NS.chineseToPinyinFlat === "function") py = String(NS.chineseToPinyinFlat(cn0) || "");
+      } catch { py = ""; }
+      py = py.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (!py || py.length < 4) return false;
+
+      const forms = [];
+      const push = (x) => {
+        const t = String(x || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        if (t.length >= 4 && forms.indexOf(t) < 0) forms.push(t);
+      };
+      try {
+        if (typeof NS.resolveHostBrandCore === "function") push(NS.resolveHostBrandCore(hostOpt));
+        if (typeof NS.inferMarketingPaddedBrandCore === "function") {
+          const h = String(hostOpt || (typeof location !== "undefined" ? location.hostname : "") || "")
+            .toLowerCase().replace(/^www\./, "");
+          const apex = (typeof NS.getRegistrableDomain === "function" ? NS.getRegistrableDomain(h) : h) || h;
+          const left = (String(apex).split(".")[0] || "").toLowerCase();
+          push(NS.inferMarketingPaddedBrandCore(left));
+          push(left.replace(/-/g, ""));
+        }
+        if (typeof NS.collectHostLatinFormsForPinyin === "function") {
+          (NS.collectHostLatinFormsForPinyin(hostOpt) || []).forEach(push);
+        }
+      } catch { /* ignore */ }
+      if (!forms.length) return false;
+
+      for (let i = 0; i < forms.length; i++) {
+        const core = forms[i];
+        if (core === py) return true;
+        // 共享前缀 ≥4，长度接近（dingding ⇄ dingtalk）
+        let common = 0;
+        const n = Math.min(py.length, core.length);
+        while (common < n && py.charCodeAt(common) === core.charCodeAt(common)) common += 1;
+        if (common >= 4 && Math.abs(py.length - core.length) <= 3) return true;
+        // 主机核以拼音为前缀（短尾垫）
+        if (core.startsWith(py) && core.length - py.length <= 4) return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
   NS.chinesePinyinAlignsHost = function (cnBrand, hostOpt) {
     try {
       // 库未注入 / 选举进行中：禁止（防止主线程卡死全站无响应）
-      if (!getPinyinPro()) return false;
+      if (!getPinyinPro()) {
+        // 拼音库未到：仍允许中英双名桥（仅需 brandPinyin 轻量，或结构剥核）
+        try {
+          if (typeof NS.chinesePinyinBridgesHostLatinCore === "function"
+            && NS.chinesePinyinBridgesHostLatinCore(cnBrand, hostOpt)) return true;
+        } catch { /* ignore */ }
+        return false;
+      }
       try {
         if (NS.caches && NS.caches._primaryKwCollecting) return false;
       } catch { /* ignore */ }
@@ -510,6 +578,9 @@
         if (!py || py.length < 3) continue;
         if (NS.matchPinyinToHost(py, hostOpt, { allowLongAffix: true }).matched) return put(true);
       }
+      // ★ 钉钉(dingding) ⇄ dingtalk-o：全等/编辑距离失败时走中英双名桥
+      if (typeof NS.chinesePinyinBridgesHostLatinCore === "function"
+        && NS.chinesePinyinBridgesHostLatinCore(cn0, hostOpt)) return put(true);
       return put(false);
     } catch {
       return false;
@@ -532,10 +603,26 @@
       const latin = raw.toLowerCase().replace(/[^a-z0-9]/g, "");
       if (hasCn && !latin) {
         if (opts && opts.pinyinValidated === true) return true;
-        return !!(getPinyinPro() && NS.chinesePinyinAlignsHost(raw, hostOpt));
+        // 严格拼音对齐（含中英双名桥 dingding⇄dingtalk）
+        if (typeof NS.chinesePinyinAlignsHost === "function" && NS.chinesePinyinAlignsHost(raw, hostOpt)) {
+          return true;
+        }
+        // 页内拉丁已与主机互锁时，标题中文专名可并列保留（钉钉 + DingTalk @ dingtalk-o）
+        try {
+          if (typeof NS.pickHostAlignedLatinBrandFromPage === "function") {
+            const lat = String(NS.pickHostAlignedLatinBrandFromPage(hostOpt) || "").trim();
+            if (lat) return true;
+          }
+        } catch { /* ignore */ }
+        return false;
       }
 
       if (latin.length < 2) return false;
+      // 拒绝未剥干净的主机碎片展示（Dingtalko @ dingtalk-o）
+      try {
+        if (typeof NS.isHostShapedCompoundBrandToken === "function"
+          && NS.isHostShapedCompoundBrandToken(raw, hostOpt)) return false;
+      } catch { /* ignore */ }
       return !!(typeof NS.resolveMutualLatinBrandIdentity === "function"
         && NS.resolveMutualLatinBrandIdentity(raw, hostOpt).matched);
     } catch {
@@ -1037,7 +1124,10 @@
           domain: info.domain || "",
           domainWithoutSuffix: info.domainWithoutSuffix || "",
           subdomain: info.subdomain || "",
-          publicSuffix: info.publicSuffix || ""
+          publicSuffix: info.publicSuffix || "",
+          isPrivate: info.isPrivate === true,
+          isIcann: info.isIcann === true,
+          pslAvailable: true
         };
       }
       // 无 tldts 时回退到旧 eTLD+1 启发（com.cn / co.uk）
@@ -1051,7 +1141,10 @@
         domain: apex,
         domainWithoutSuffix: rootLabel,
         subdomain: left,
-        publicSuffix: apex.includes(".") ? apex.slice(rootLabel.length + 1) : ""
+        publicSuffix: apex.includes(".") ? apex.slice(rootLabel.length + 1) : "",
+        isPrivate: false,
+        isIcann: false,
+        pslAvailable: false
       };
     } catch {
       return null;

@@ -669,7 +669,8 @@
     try {
       const c = NS.caches || {};
       const now = Date.now();
-      if (c._skipHeavy != null && now - (c._skipHeavyAt || 0) < 4000) return !!c._skipHeavy;
+      const skipCacheTtl = c._skipHeavy ? 4000 : 450;
+      if (c._skipHeavy != null && now - (c._skipHeavyAt || 0) < skipCacheTtl) return !!c._skipHeavy;
       const title = document.title || "";
       const host = (location.hostname || "").toLowerCase();
       const path = (location.pathname || "").toLowerCase();
@@ -713,7 +714,8 @@
     try {
       const c = NS.caches || {};
       const now = Date.now();
-      if (c._highDensityDl != null && now - (c._highDensityDlAt || 0) < 5000) return !!c._highDensityDl;
+      const densityCacheTtl = c._highDensityDl ? 5000 : 450;
+      if (c._highDensityDl != null && now - (c._highDensityDlAt || 0) < densityCacheTtl) return !!c._highDensityDl;
       const title = document.title || "";
       const host = (location.hostname || "").toLowerCase();
       const path = (location.pathname || "").toLowerCase();
@@ -858,7 +860,11 @@
     try {
       const c = NS.caches || {};
       const now = Date.now();
-      if (c._highVolArchive != null && now - (c._highVolArchiveAt || 0) < 5000) return !!c._highVolArchive;
+      // A version table is commonly empty at document_start and filled by a
+      // single AJAX batch.  Positive results are stable; negative results are
+      // intentionally short-lived so the hydrated table is recognized.
+      const archiveCacheTtl = c._highVolArchive ? 5000 : 450;
+      if (c._highVolArchive != null && now - (c._highVolArchiveAt || 0) < archiveCacheTtl) return !!c._highVolArchive;
 
       // 海量可点下载（ISO 镜像 / 多源列表）→ 按高密度归档处理，整页跳过重扫
       if (typeof NS.pageLooksLikeHighDensityDownloadList === "function" && NS.pageLooksLikeHighDensityDownloadList()) {

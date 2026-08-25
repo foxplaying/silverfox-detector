@@ -81,6 +81,57 @@
       }
     }
 
+    /**
+     * Ordinary same-origin version/detail pages are navigation, not file
+     * delivery.  Keep this deliberately narrow so package endpoints and
+     * query-driven attachments remain guarded.
+     */
+    static isPlainSameOriginDocumentNavigation(href, element) {
+      try {
+        if (!element || String(element.tagName || "").toUpperCase() !== "A") return false;
+        if (element.hasAttribute("download") || element.hasAttribute("data-download")
+          || element.hasAttribute("data-down")) return false;
+        const raw = String(href || "").trim();
+        if (!raw || /^(?:javascript:|#|data:|blob:|mailto:|tel:)/i.test(raw)) return false;
+        const handler = `${element.getAttribute("onclick") || ""} ${element.getAttribute("onmousedown") || ""}`;
+        if (/window\.open|location\s*[.=]|fetch\s*\(|download|\.click\s*\(/i.test(handler)) return false;
+        const u = new URL(raw, location.href);
+        if (!/^https?:$/i.test(u.protocol) || u.origin !== location.origin) return false;
+        if (PackageHeuristics.isPackageFileUrl(u.href)
+          || PackageHeuristics.looksLikeOpaqueDownloadHopUrl(u.href)) return false;
+        if (/[?&](?:download|attachment|file(?:name)?|downurl|downloadurl|target|token|sig(?:nature)?|expires)=/i.test(u.search)) return false;
+        const path = String(u.pathname || "/").toLowerCase();
+        if (/\.(?:exe|msi|msix|dmg|pkg|apk|xapk|apks|zip|rar|7z|iso|bin)$/i.test(path)) return false;
+        const last = path.split("/").filter(Boolean).pop() || "";
+        const htmlDocument = /\.html?$/.test(last);
+        const detailRoute = /(?:^|\/)(?:info|details?|versions?|releases?|changelog)(?:\/|$)/i.test(path);
+        const versionListContext = htmlDocument && typeof element.closest === "function"
+          && !!element.closest("table, tbody, [class*='version'], [id*='version'], [class*='release'], [id*='release']");
+        return detailRoute || versionListContext;
+      } catch {
+        return false;
+      }
+    }
+
+    /** A Bootstrap/ARIA disclosure button opens local UI and has no network target. */
+    static isDeclarativeDisclosureControl(element) {
+      try {
+        if (!element) return false;
+        const toggle = String(element.getAttribute("data-bs-toggle")
+          || element.getAttribute("data-toggle") || "").trim().toLowerCase();
+        if (!/^(?:modal|collapse|offcanvas|dropdown|tab|pill)$/.test(toggle)) return false;
+        if (element.hasAttribute("download") || element.hasAttribute("data-download")
+          || element.hasAttribute("data-down")) return false;
+        const href = String(element.getAttribute("href") || element.getAttribute("data-href")
+          || element.getAttribute("data-url") || "").trim();
+        if (href && !href.startsWith("#")) return false;
+        const handler = `${element.getAttribute("onclick") || ""} ${element.getAttribute("onmousedown") || ""}`;
+        return !/window\.open|location\s*[.=]|fetch\s*\(|download|\.click\s*\(/i.test(handler);
+      } catch {
+        return false;
+      }
+    }
+
     static looksLikeAndroidPackageIdName(baseName) {
       let b = String(baseName || "").trim().replace(/\.(apk|xapk|apks|aab)$/i, "");
       if (b.length < 7 || b.length > 120) return false;
@@ -164,6 +215,16 @@
       if (base.length < 3 || base.length > 96) return false;
       if (PackageHeuristics.looksLikeAndroidPackageIdName(base) || PackageHeuristics.looksLikeAndroidPackageIdName(name)) return true;
       if (PackageHeuristics.isBenignShortInstallerName(name)) return true;
+      // 多词空格/波浪号可读名（谱面、曲包）：与 content/bg 副本一致
+      if (/\s|[~～()]/.test(base)) {
+        const words = base.match(/[a-zA-Z一-鿿]{3,}/g) || [];
+        const compact = base.replace(/[\s~～()[\]._-]+/g, "");
+        if (words.length >= 2
+          && !/(?:^|[\s._-])(?:setup|install|installer|client|official|官网|官方|安装包)(?:$|[\s._-])/i.test(base)
+          && !PackageHeuristics.hasGarbleDigitLetterSoup(compact)) {
+          return true;
+        }
+      }
       let stem = base.replace(/[._-](x64|x86|x86_64|amd64|arm64|arm|win32|win64|mac|linux)$/i, "");
       stem = stem.replace(/[._-]?v?\d+(?:\.\d+){1,5}$/i, "");
       if (!stem || stem.length < 2) stem = base.replace(/[._-](x64|x86|x86_64|amd64|arm64|arm|win32|win64|mac|linux)$/i, "");

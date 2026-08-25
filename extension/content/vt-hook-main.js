@@ -1,5 +1,5 @@
 /**
- * VirusTotal MAIN-world 钩子：在 SPA 发起 /ui/files 请求时截获响应体。
+ * VirusTotal MAIN-world 钩子：仅截获 SPA 的目标文件根报告 /ui/files/{sha256}。
  * run_at: document_start，保证先于页面脚本安装。
  * 扩展后台打开 gui/file/{hash} 后读取 window.__sfVtCapture / __sfVtCaptures。
  */
@@ -11,44 +11,59 @@
     window.__sfVtCapture = null;
     window.__sfVtCaptureStatus = 0;
     window.__sfVtCaptureUrl = "";
+    window.__sfVtCaptureQuality = -1;
     window.__sfVtCaptures = window.__sfVtCaptures || {};
 
-    const interestingUrl = (u) => {
-      const s = String(u || "");
-      // 文件报告、分析、搜索、行为摘要等都可能带 last_analysis_stats
-      return /\/ui\/files\//i.test(s)
-        || /\/ui\/file_behaviours\//i.test(s)
-        || /\/ui\/analyses\//i.test(s)
-        || (/\/ui\/search/i.test(s) && /query=/i.test(s));
+    const fileReportHashFromUrl = (u) => {
+      try {
+        const parsed = new URL(String(u || ""), location.origin);
+        const match = parsed.pathname.match(/^\/ui\/files\/([a-f0-9]{64})\/?$/i);
+        return match ? match[1].toLowerCase() : "";
+      } catch {
+        return "";
+      }
+    };
+
+    const interestingUrl = (u) => !!fileReportHashFromUrl(u);
+
+    const captureQuality = (text, key) => {
+      const s = String(text || "");
+      const targetIdentity = new RegExp('"(?:sha256|id)"\\s*:\\s*"' + key + '"', "i").test(s);
+      const hasStats = /"last_analysis_stats"\s*:\s*\{|"malicious"\s*:\s*\d+/i.test(s);
+      if (targetIdentity && hasStats) return 5;
+      if (/NotFoundError|Item not found/i.test(s)) return 4;
+      if (targetIdentity) return 3;
+      if (/RecaptchaRequired|captcha|verify (?:that )?you are human/i.test(s)) return 0;
+      return 1;
     };
 
     const capture = (url, status, body) => {
       try {
         const u = String(url || "");
-        if (!interestingUrl(u)) return;
+        const key = fileReportHashFromUrl(u);
+        if (!key) return;
         const text = String(body || "");
         if (text.length < 2) return;
-        // captcha 体也记下，便于后台区分「被拦」与「无数据」
-        window.__sfVtCapture = text.slice(0, 800000);
-        window.__sfVtCaptureStatus = status || 0;
-        window.__sfVtCaptureUrl = u;
-        const m = u.match(/\/ui\/files\/([a-f0-9]{64})/i)
-          || text.match(/"sha256"\s*:\s*"([a-f0-9]{64})"/i)
-          || text.match(/"id"\s*:\s*"([a-f0-9]{64})"/i);
-        if (m) {
-          const key = m[1].toLowerCase();
+        if (key) {
           const prev = window.__sfVtCaptures[key];
-          // 优先保留含 stats 的响应，避免被后续 captcha/空壳覆盖
-          const preferNew = !prev || !prev.text
-            || (/last_analysis_stats|"malicious"\s*:\s*\d+/i.test(text)
-              && !/last_analysis_stats|"malicious"\s*:\s*\d+/i.test(String(prev.text || "")))
-            || text.length >= String(prev.text || "").length;
+          const quality = captureQuality(text, key);
+          const previousQuality = prev && Number.isFinite(Number(prev.quality))
+            ? Number(prev.quality)
+            : captureQuality(prev && prev.text, key);
+          // 质量优先：目标 hash 的报告 > 明确 NotFound > 元数据 > 空壳 > captcha。
+          const preferNew = !prev || !prev.text || quality > previousQuality
+            || (quality === previousQuality && text.length >= String(prev.text || "").length);
           if (preferNew) {
+            window.__sfVtCapture = text.slice(0, 800000);
+            window.__sfVtCaptureStatus = status || 0;
+            window.__sfVtCaptureUrl = u;
+            window.__sfVtCaptureQuality = quality;
             window.__sfVtCaptures[key] = {
               text: text.slice(0, 800000),
               status: status || 0,
               at: Date.now(),
-              url: u.slice(0, 500)
+              url: u.slice(0, 500),
+              quality
             };
           }
         }
@@ -69,7 +84,8 @@
           try {
             if (interestingUrl(url) || interestingUrl(res && res.url)) {
               const c = res.clone();
-              c.text().then((t) => capture(url || (res && res.url), res.status, t)).catch(() => {});
+              const captureUrl = interestingUrl(url) ? url : (res && res.url);
+              c.text().then((t) => capture(captureUrl, res.status, t)).catch(() => {});
             }
           } catch { /* ignore */ }
           return res;

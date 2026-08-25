@@ -9,6 +9,8 @@
     try {
       const state = NS.state;
       if (state._fakeSpaDetected || state.downloadGuardInstalled) return false;
+      if (state._officialDownloadScanQuiet
+        && state._officialDownloadScanQuietUrl === String(location.href || "")) return false;
       if (NS.pageLooksLikeSearchEngineResultsPage()) return false;
       // 仅有 JS 提示的空 SPA：不是「待 hydrate 的加密下载页」
       if (typeof NS.pageLooksLikeBareJsAppShell === "function" && NS.pageLooksLikeBareJsAppShell()) return false;
@@ -21,11 +23,17 @@
         || /官网|官方下载|官方正版|官方网站|官方客户端|全平台官方/i.test(bodyHead);
 
       let nuxtHint = false;
+      let nuxtDataOnly = false;
       try {
-        nuxtHint = /windowsDownload|macDownload|linuxDownload|androidDownload|harmonyDownload/i.test(NS.getHtmlSlice(40000))
-          || /__NUXT_DATA__|download_uri\s*=/i.test(NS.getHtmlSlice(20000));
+        const html40 = NS.getHtmlSlice(40000) || "";
+        const html20 = html40.slice(0, 20000);
+        const dynamicDownloadConfig = /windowsDownload|macDownload|linuxDownload|androidDownload|harmonyDownload|download_uri\s*=/i.test(html40);
+        const encryptedPayload = /(?:CryptoJS|AES\.decrypt|decrypt(?:Payload|Config)|atob\s*\()[\s\S]{0,800}(?:download|windows|mac|android)/i.test(html40)
+          || /(?:payload|config|data)\s*[:=]\s*["'][A-Za-z0-9+/]{300,}={0,2}["']/i.test(html40);
+        nuxtDataOnly = /__NUXT_DATA__/i.test(html20) && !dynamicDownloadConfig && !encryptedPayload;
+        nuxtHint = dynamicDownloadConfig || encryptedPayload;
       } catch { /* ignore */ }
-      if (!officialClaim && !nuxtHint) return false;
+      if (!officialClaim && !nuxtHint && !nuxtDataOnly) return false;
 
       try {
         if (NS.countTransparentProductPackages(NS.getHtmlSlice(40000)) >= 1) return false;
@@ -35,7 +43,10 @@
       try { spaRoot = !!document.querySelector("#__nuxt, #__NUXT__, #__NUXT_DATA__, #app, #root, #__next, [data-v-app]"); } catch { /* ignore */ }
       let dlCta = false;
       try { dlCta = NS.getAllDownloadIntentElements().length >= 1; } catch { /* ignore */ }
-      return !!(nuxtHint || (officialClaim && (spaRoot || dlCta)));
+      // __NUXT_DATA__、#app 和可见下载按钮都是正常 Nuxt 下载中心的常态，不能据此
+      // 排五轮强制扫描。只有真实动态/加密下载配置，或尚未 hydrate 的极薄壳才等待。
+      const thinNuxtShell = !!(nuxtDataOnly && spaRoot && !dlCta && bodyHead.length < 500);
+      return !!(nuxtHint || thinNuxtShell);
     } catch {
       return false;
     }
@@ -58,12 +69,19 @@
   NS.armEncryptedSpaLateRescan = function () {
     const state = NS.state;
     if (state._encryptedSpaRescanArmed) return;
+    if (state._officialDownloadScanQuiet
+      && state._officialDownloadScanQuietUrl === String(location.href || "")) return;
     if (!NS.pageLooksLikePendingEncryptedDownloadSpa()) return;
     state._encryptedSpaRescanArmed = true;
     state._pendingEncryptedSpa = true;
     [800, 1800, 3200, 5200, 8500].forEach((ms) => {
       setTimeout(() => {
         try {
+          if (state._officialDownloadScanQuiet
+            && state._officialDownloadScanQuietUrl === String(location.href || "")) {
+            state._pendingEncryptedSpa = false;
+            return;
+          }
           if (state._fakeSpaDetected || state.downloadGuardInstalled) { state._pendingEncryptedSpa = false; return; }
           if (!NS.pageLooksLikePendingEncryptedDownloadSpa() && !/官网|官方下载|官方网站/i.test(document.title || "")) {
             state._pendingEncryptedSpa = false;

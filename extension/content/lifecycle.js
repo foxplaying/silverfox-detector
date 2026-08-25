@@ -4,6 +4,23 @@
 ;(function (NS) {
   "use strict";
 
+  function restoreForcedMissingIcpState() {
+    try {
+      const state = NS.state;
+      const preserve = typeof NS.shouldPreserveForcedMissingIcp === "function"
+        ? NS.shouldPreserveForcedMissingIcp()
+        : !!state._icpForcedMissingByFallbackWhois;
+      if (!preserve) return false;
+      state.icpInfo = "未查询到备案信息";
+      state.icpMatchedHost = "";
+      state._icpQueryFailed = false;
+      if (typeof NS.addSignal === "function") {
+        NS.addSignal("无ICP备案信息", 6, `当前域名 ${location.hostname} 未查询到备案信息`);
+      }
+      return true;
+    } catch { return false; }
+  }
+
   NS.finalize = function () {
     const state = NS.state;
     const c = NS.caches;
@@ -36,6 +53,60 @@
   NS.resetAnalysisStateForPageChange = function (reason) {
     const state = NS.state;
     const c = NS.caches;
+    try {
+      if (state._brandSpoofFinalSnapshot
+        && typeof NS.invalidateBrandSpoofNoticeSnapshot === "function") {
+        NS.invalidateBrandSpoofNoticeSnapshot(state._brandSpoofFinalSnapshot, reason || "page-url-changed");
+      }
+    } catch { /* ignore */ }
+    // Rotate before every early-return branch.  A same-host SPA route is a new
+    // report transaction even when its trusted identity/intel can be reused.
+    try {
+      if (typeof NS.rotateAnalysisTransaction === "function") {
+        NS.rotateAnalysisTransaction(String(location.href || ""), reason || "page-url-changed");
+      }
+    } catch { /* keep reset operational */ }
+    // Navigation owns the identity transaction boundary. Invalidate the old
+    // hold before any keep-light/keep-trusted early return, otherwise an SPA
+    // can leave a download route and later revive its orphaned waiting lock.
+    state._provisionalDownloadAnalysisGeneration = Number(state._provisionalDownloadAnalysisGeneration || 0) + 1;
+    state._provisionalDownloadIdentityHold = false;
+    state._provisionalDownloadIdentityUrl = "";
+    state._provisionalDownloadIdentityDeadlineAt = 0;
+    state._identityVerificationUnavailable = false;
+    state._identityVerificationUnavailableUrl = "";
+    try {
+      if (c._provisionalDownloadController && typeof c._provisionalDownloadController.cancel === "function") {
+        c._provisionalDownloadController.cancel("page-change");
+      }
+    } catch { /* ignore */ }
+    c._provisionalDownloadController = null;
+    state._officialDownloadScanQuiet = false;
+    state._officialDownloadScanQuietUrl = "";
+    try {
+      if (c && typeof c._stopSuspiciousLiveWatch === "function") c._stopSuspiciousLiveWatch();
+    } catch { /* ignore */ }
+    try {
+      if (c && c._brandElectionHydrationWatch
+        && typeof c._brandElectionHydrationWatch.stop === "function") {
+        c._brandElectionHydrationWatch.stop();
+      }
+    } catch { /* ignore */ }
+    if (c) c._brandElectionHydrationWatch = null;
+    state._brandElectionIdentityFingerprint = "";
+    state._brandElectionIdentityFingerprintUrl = "";
+    state._brandElectionIdentityFingerprintAt = 0;
+    state._brandElectionIdentityRevision = 0;
+    try {
+      if (state._brandElectionHydrationStableTimer) clearTimeout(state._brandElectionHydrationStableTimer);
+    } catch { /* ignore */ }
+    state._brandElectionHydrationStableTimer = null;
+    state._brandElectionHydrationNudgeBusy = false;
+    state._brandElectionHydrationResumeScheduled = false;
+    state._brandPinyinRequestSequence = Number(state._brandPinyinRequestSequence || 0) + 1;
+    state._brandPinyinRequestFingerprint = "";
+    state._brandSpoofFinalSnapshot = null;
+    state._brandSpoofNoticeSequence = 0;
     const prevHost = state._analyzedHost || "";
     const hostChanged = !prevHost || prevHost !== (location.hostname || "");
     // 在清威胁标志之前判定是否同站 keep-light（依赖当前 state）
@@ -71,6 +142,11 @@
         if (typeof NS.markAnalysisComplete === "function") NS.markAnalysisComplete(keepTrustedOnce ? "reset-keep-trusted" : "reset-keep-light");
         else NS.emitRiskReport(true);
       } catch { /* ignore */ }
+      // The route has a fresh report transaction and an exact URL. Re-run the
+      // (normally cached) identity pipeline so the serializer can complete
+      // that new transaction; never reuse the previous path's completion bit.
+      try { NS.startIcpWhoisIntelEarly(keepTrustedOnce ? "reset-keep-trusted" : "reset-keep-light"); } catch { /* ignore */ }
+      try { NS.ensureBrandElectionHydrationWatch(); } catch { /* ignore */ }
       NS.silverfoxLog && NS.silverfoxLog("nav-reset", "keep-light-or-trusted-once", reason || "", keepTrustedOnce ? "trusted" : "light");
       return;
     }
@@ -81,6 +157,10 @@
     state._trustedBrandIdentityAt = 0;
     state.score = 0; state.details = [];
     if (state.signalSet && typeof state.signalSet.clear === "function") state.signalSet.clear(); else state.signalSet = new Set();
+    // A same-host SPA reset clears signals, but it must not erase a previously
+    // proven fallback-WHOIS rejection. Rebuild the host-level verdict now;
+    // a later definitive ICP result may still replace it.
+    if (!hostChanged) restoreForcedMissingIcpState();
     state.mutationCount = 0; state.iframeCount = 0; state.hiddenCount = 0; state.overlayCount = 0;
     state.scriptInjectionCount = 0; state.dynamicExecCount = 0; state.popupCount = 0; state.redirectCount = 0;
     state.fetchCount = 0; state.crossOriginCount = 0;
@@ -90,12 +170,14 @@
     state.remoteDownloadDispatchDetected = false; state.downloadGuardInstalled = false;
     state.protectedTargets = []; state.protectionNoticeSent = false; state.spoofBrand = "";
     state._brandSpoofNoticeSent = false; state._brandSpoofNoticeKey = "";
-    state._lastGuardNoticeKind = ""; state._lastGuardNoticeKey = "";
+    state._lastGuardNoticeKind = ""; state._lastGuardNoticeKey = ""; state._lastGuardNoticeVersion = "";
     state._spoofBrandReconciledAt = 0;
     state._spoofPinyinUpgradeScheduled = false;
     state._spoofPinyinUpgradeDone = false;
     state._spoofBrandChineseLocked = false;
     state._brandSpoofFinalPresented = false;
+    state._brandSpoofFinalSnapshot = null;
+    state._brandSpoofNoticeSequence = 0;
     state._brandSpoofFinalizeScheduled = false;
     state._brandSpoofPresentationDeferred = false;
     state._softBrandIdentityReady = false;
@@ -114,11 +196,14 @@
     state._brandSpoofLatinUpgradeAttempts = 0;
     state._brandPinyinEvidence = null;
     state._brandPinyinHostMatch = "";
+    try { NS.ensureBrandElectionHydrationWatch(); } catch { /* ignore */ }
     try {
       if (typeof NS.clearChinesePinyinMatchCache === "function") NS.clearChinesePinyinMatchCache();
     } catch { /* ignore */ }
     state.contextCache = null; state.contextCacheAt = 0;
     state._perfBenign = false; state._perfBenignAt = 0;
+    state._officialDownloadScanQuiet = false; state._officialDownloadScanQuietUrl = "";
+    state._officialDownloadForceScanAllowed = false;
     state._intelLightMode = false; state._serpLightNotified = false;
     state._analysisDone = false; state._analysisDoneAt = 0;
     // 仅换主机时清粘性 complete；同站 soft-nav 全量 reset 也清（否则永远不复扫）
@@ -129,6 +214,8 @@
     if (hostChanged) {
       state._icpQuerySettled = false;
       state._icpQueryFailed = false;
+      state._icpForcedMissingByFallbackWhois = false;
+      state._icpForcedMissingHost = "";
       state.icpInfo = "";
       state.whoisInfo = "";
       state.sslInfo = null;
@@ -136,6 +223,7 @@
       state._sslIdentityStartedAt = 0;
       state._sslIdentityObserved = false;
       state._sslIdentitySettled = false;
+      state._sslIdentityTimedOut = false;
       state.icpMatchedHost = "";
       state.pageDeclaredIcp = "";
       state._icpPageMismatch = false;
@@ -147,6 +235,7 @@
       state._sslIdentityStartedAt = 0;
       state._sslIdentityObserved = !!state.sslInfo;
       state._sslIdentitySettled = !!state.sslInfo;
+      state._sslIdentityTimedOut = false;
     }
     state._pageBootAt = Date.now(); state._pendingEncryptedSpa = false; state._encryptedSpaRescanArmed = false;
     state._scanBusy = false; state._lastFastScanAt = 0;
@@ -167,8 +256,18 @@
     } catch { /* ignore */ }
     try {
       if (chrome?.runtime?.id) {
-        chrome.runtime.sendMessage({ type: "page-analysis-reset", url: location.href, reason: reason || "page-url-changed" }, () => { void chrome.runtime.lastError; });
-        chrome.runtime.sendMessage({ type: "set-tab-protect", enabled: false, force: hostChanged, url: location.href }, () => { void chrome.runtime.lastError; });
+        chrome.runtime.sendMessage({
+          type: "page-analysis-reset",
+          url: location.href,
+          reason: reason || "page-url-changed",
+          analysisTxn: state._analysisTxn || "",
+          analysisTxnStartedAt: Number(state._analysisTxnStartedAt) || Date.now()
+        }, () => { void chrome.runtime.lastError; });
+        chrome.runtime.sendMessage({
+          type: "set-tab-protect", enabled: false, force: hostChanged, url: location.href,
+          analysisTxn: state._analysisTxn || "",
+          analysisTxnStartedAt: Number(state._analysisTxnStartedAt) || Date.now()
+        }, () => { void chrome.runtime.lastError; });
       }
     } catch { /* ignore */ }
     try { c.sentNoticeKeys.clear(); c.sentNoticeLastAt.clear(); c.pageToastLastAt.clear(); } catch { /* ignore */ }
@@ -181,6 +280,20 @@
   NS.scheduleRescanAfterPageChange = function () {
     const c = NS.caches;
     const state = NS.state;
+    // SPA 首页进入 /download 时不会重新执行 document_start boot；复用同一性能静默
+    // 与身份收口流程，禁止再排 120/900/1400ms 三轮全页扫描。
+    try {
+      if (typeof NS.looksLikeProvisionalDownloadPathShape === "function"
+        && NS.looksLikeProvisionalDownloadPathShape()
+        && typeof NS.startProvisionalDownloadRouteAnalysis === "function") {
+        if (c.pageNavRescanTimer) {
+          try { clearTimeout(c.pageNavRescanTimer); } catch { /* ignore */ }
+          c.pageNavRescanTimer = null;
+        }
+        NS.startProvisionalDownloadRouteAnalysis("spa-download-route");
+        return;
+      }
+    } catch { /* ignore */ }
     // 已 light / 成熟正规站 / 大型内容 SPA：不排队多轮重扫
     try {
       const trustedOnce = typeof NS.pageHasStrongTrustedIdentity === "function"
@@ -271,7 +384,10 @@
       let prevHost = "";
       try { prevHost = c.lastAnalyzedUrl ? new URL(c.lastAnalyzedUrl).hostname : (state._analyzedHost || ""); } catch { prevHost = state._analyzedHost || ""; }
       const newHost = location.hostname || "";
-      const sameHost = !!(prevHost && newHost && prevHost.replace(/^www\./, "") === newHost.replace(/^www\./, ""));
+      // Identity/report transactions use the exact hostname.  www and bare
+      // hosts may have different ICP attribution and cannot share a shortcut.
+      const sameHost = !!(prevHost && newHost
+        && prevHost.toLowerCase().replace(/\.+$/g, "") === newHost.toLowerCase().replace(/\.+$/g, ""));
       const trustedOnce = sameHost && typeof NS.pageHasStrongTrustedIdentity === "function"
         && NS.pageHasStrongTrustedIdentity()
         && !(typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat());
@@ -280,6 +396,29 @@
         || (typeof NS.shouldKeepLightOnSameHostSoftNav === "function" && NS.shouldKeepLightOnSameHostSoftNav())
       );
       if (keep) {
+        // A light/trusted SPA shortcut is still a new page transaction. Tear
+        // down the previous route's bounded click hold/controller first; its
+        // timer must not wake later and mutate or release protection for this
+        // URL.
+        state._provisionalDownloadAnalysisGeneration = Number(state._provisionalDownloadAnalysisGeneration || 0) + 1;
+        state._provisionalDownloadIdentityHold = false;
+        state._provisionalDownloadIdentityUrl = "";
+        state._provisionalDownloadIdentityDeadlineAt = 0;
+        state._identityVerificationUnavailable = false;
+        state._identityVerificationUnavailableUrl = "";
+        try {
+          if (c._provisionalDownloadController && typeof c._provisionalDownloadController.cancel === "function") {
+            c._provisionalDownloadController.cancel("soft-nav-keep");
+          }
+        } catch { /* ignore */ }
+        c._provisionalDownloadController = null;
+        state._officialDownloadScanQuiet = false;
+        state._officialDownloadScanQuietUrl = "";
+        try {
+          if (typeof NS.rotateAnalysisTransaction === "function") {
+            NS.rotateAnalysisTransaction(key, reason || "soft-nav-keep-light");
+          }
+        } catch { /* keep navigation operational */ }
         c.lastAnalyzedUrl = key;
         state._analyzedHost = newHost;
         state._perfBenign = true;
@@ -295,6 +434,7 @@
             NS.emitRiskReport(true);
           }
         } catch { try { NS.emitRiskReport(true); } catch { /* ignore */ } }
+        try { NS.startIcpWhoisIntelEarly(trustedOnce ? "soft-nav-trusted-once" : "soft-nav-keep-light"); } catch { /* ignore */ }
         NS.silverfoxLog && NS.silverfoxLog("nav-skip", trustedOnce ? "soft-nav-trusted-once" : "soft-nav-keep-light", reason || "");
         return;
       }
@@ -326,6 +466,37 @@
               try { sendResponse({ ok: true }); } catch { /* ignore */ }
               return false;
             }
+            if (msg && msg.type === "silverfox-request-risk-report") {
+              const requestedUrl = String(msg.url || "");
+              if (requestedUrl && requestedUrl !== String(location.href || "")) {
+                try { sendResponse({ ok: false, stale: true }); } catch { /* ignore */ }
+                return false;
+              }
+              // Popup may be opened after Edge froze this tab's timers. Wake the
+              // event-driven identity controller and emit a fresh snapshot; no
+              // report is never equivalent to a clean 0-score conclusion.
+              try { NS.nudgeProvisionalDownloadSettlement("popup-request"); } catch { /* ignore */ }
+              try { NS.nudgeBrandElectionAfterHydration("popup-request"); } catch { /* ignore */ }
+              try {
+                if (!NS.state._analysisDone
+                  && NS.state._icpQuerySettled === true
+                  && NS.caches.intelDoneForUrl === String(location.href || "")) {
+                  NS.invalidateHtmlCache();
+                  NS.markAnalysisComplete("popup-request");
+                } else {
+                  NS.emitRiskReport(true);
+                }
+              } catch { /* ignore */ }
+              try {
+                sendResponse({
+                  ok: true,
+                  complete: !!NS.state._analysisDone,
+                  analysisTxn: NS.state._analysisTxn || "",
+                  url: NS.state._analysisTxnUrl || String(location.href || "")
+                });
+              } catch { /* ignore */ }
+              return false;
+            }
             if (msg && msg.type === "show-page-threat-toast") {
               // 后台下载取消或子 frame 拦截统一在顶层页面显示，避免 Toast 落在隐藏 iframe。
               try {
@@ -333,7 +504,11 @@
                   NS.showPageToast(
                     String(msg.title || "已拦截可疑下载文件"),
                     String(msg.message || "可疑下载已被拦截"),
-                    { force: msg.force !== false }
+                    {
+                      force: msg.force !== false,
+                      guardKind: String(msg.guardKind || ""),
+                      brandSnapshot: msg.brandSnapshot || null
+                    }
                   );
                 }
               } catch { /* ignore */ }
@@ -384,7 +559,9 @@
                       type: "set-tab-protect",
                       enabled: true,
                       mode: "full",
-                      url: location.href
+                      url: location.href,
+                      analysisTxn: NS.state._analysisTxn || "",
+                      analysisTxnStartedAt: Number(NS.state._analysisTxnStartedAt) || Date.now()
                     }, () => { void chrome.runtime.lastError; });
                   }
                 } catch { /* ignore */ }
@@ -406,7 +583,9 @@
                     type: "set-tab-protect",
                     enabled: true,
                     mode: "full",
-                    url: location.href
+                    url: location.href,
+                    analysisTxn: NS.state._analysisTxn || "",
+                    analysisTxnStartedAt: Number(NS.state._analysisTxnStartedAt) || Date.now()
                   }, () => { void chrome.runtime.lastError; });
                 } else if (typeof NS.pageHasStrongTrustedIdentity === "function"
                   && NS.pageHasStrongTrustedIdentity()
@@ -542,7 +721,9 @@
               type: "trusted-download-intent",
               href: data.href,
               url: location.href,
-              identityVerified: trusted
+              identityVerified: trusted,
+              analysisTxn: state._analysisTxn || "",
+              analysisTxnStartedAt: Number(state._analysisTxnStartedAt) || Date.now()
             }, () => { void chrome.runtime.lastError; });
           }
         } catch { /* ignore */ }
@@ -653,7 +834,6 @@
           if (hrefHit || nameHit) return;
         } catch { /* ignore */ }
         NS.armBackgroundProtect("full");
-        try { chrome.runtime.sendMessage({ type: "request-guard-bg", mode: "full", url: location.href, reason: data.reason || "" }, () => { void chrome.runtime.lastError; }); } catch { /* ignore */ }
         const rr = String(data.reason || "");
         const hard = /下载壳|远程|API|download_uri|强制弹窗|SEO|乱码|绑定可疑|仿冒/i.test(rr);
         if (hard) state.remoteDownloadDispatchDetected = true;
@@ -704,26 +884,60 @@
       state.icpInfo = ""; state.icpMatchedHost = "";
       state._icpQueryFailed = true;
       try {
-        let pageIcp = { declared: [], unverifiedClaim: false, remoteMissing: true };
+        let pageIcp = { declared: [], unverifiedClaim: false, remoteMissing: false };
         let rec0 = "";
-        let miss0 = true;
+        let miss0 = false;
+        let fallbackWhoisRejected0 = false;
         try {
-          const icpCheck0 = await icpPromise;
+          let icpCheck0 = await icpPromise;
           if (gen !== c.intelGeneration || location.href !== urlKey) return;
+          if (!(icpCheck0 && icpCheck0.success) && restoreForcedMissingIcpState()) {
+            icpCheck0 = { success: true, icpRecord: "", icpMissing: true, attributionRejected: true, queriedHost: pageHost, source: "preserved-fallback-whois" };
+          }
           if (icpCheck0 && icpCheck0.success) {
+            // A definitive ICP response (record or missing) is not a query
+            // failure, even when the parallel WHOIS lookup had no result.
+            state._icpQueryFailed = false;
+            fallbackWhoisRejected0 = icpCheck0.attributionRejected === true;
             rec0 = (icpCheck0.icpRecord && NS.looksLikeIcpLicense(icpCheck0.icpRecord)) ? icpCheck0.icpRecord : "";
             miss0 = !rec0 && !!(icpCheck0.icpMissing || !icpCheck0.icpRecord);
+            const matched0 = icpCheck0.matchedHost || icpCheck0.queriedHost || pageHost;
+            const recordHost0 = icpCheck0.domainExplicit === true && icpCheck0.domain
+              ? icpCheck0.domain
+              : (icpCheck0.recordHost || matched0);
+            let fallbackSupported0 = true;
+            if (rec0 && typeof NS.icpFallbackHasWhoisSupport === "function") {
+              fallbackSupported0 = await NS.icpFallbackHasWhoisSupport(recordHost0, pageHost, whois);
+              // Always check navigation after the async proof, including the
+              // successful branch; otherwise an old page may write into a new one.
+              if (gen !== c.intelGeneration || location.href !== urlKey) return;
+            }
+            if (rec0 && !fallbackSupported0) {
+              NS.silverfoxLog("intel-icp", "reject-fallback-without-whois", recordHost0, "page=", pageHost);
+              rec0 = "";
+              miss0 = true;
+              fallbackWhoisRejected0 = true;
+            }
+            if (fallbackWhoisRejected0) {
+              state._icpForcedMissingByFallbackWhois = true;
+              state._icpForcedMissingHost = pageHost;
+            } else {
+              state._icpForcedMissingByFallbackWhois = false;
+              state._icpForcedMissingHost = "";
+            }
             if (typeof NS.reconcilePageIcpClaim === "function") {
               pageIcp = NS.reconcilePageIcpClaim(rec0, miss0);
             }
             if (rec0) {
               state.icpInfo = rec0;
-              state.icpMatchedHost = NS.normalizeDomain(icpCheck0.matchedHost || pageHost);
+              state.icpMatchedHost = typeof NS.normalizeHostForIntel === "function"
+                ? NS.normalizeHostForIntel(recordHost0 || pageHost)
+                : String(recordHost0 || pageHost).toLowerCase();
               state._icpQueryFailed = false;
               if (typeof NS.clearPendingIcpClaimSignals === "function") NS.clearPendingIcpClaimSignals();
               if (typeof NS.clearFakeIcpClaimSignals === "function") NS.clearFakeIcpClaimSignals();
             } else if (pageIcp.declared && pageIcp.declared.length) {
-              // 与主路径一致：占位→假冒；正常年份号→待核验（勿一律假冒宣称）
+              // 查询明确未备案时直接收口为假冒；查询失败才保留待核验。
               const ph = pageIcp.declared.some((d) =>
                 typeof NS.looksLikePlaceholderIcpLicense === "function" && NS.looksLikePlaceholderIcpLicense(d)
               );
@@ -731,7 +945,7 @@
                 const n = typeof NS.normalizeIcpLicense === "function" ? NS.normalizeIcpLicense(d) : String(d || "");
                 return /[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼]ICP备20\d{2}\d{4,12}/i.test(n);
               });
-              if (ph) {
+              if (ph || miss0) {
                 state.icpInfo = `假冒宣称 ${pageIcp.declared.join(" / ")}`;
                 state._unverifiedPageIcpClaim = true;
               } else if (normal || pageIcp.unverifiedClaim) {
@@ -743,14 +957,17 @@
               if (typeof NS.clearMissingIcpSignal === "function") NS.clearMissingIcpSignal();
             } else if (miss0) {
               state.icpInfo = "未查询到备案信息";
+              if (typeof NS.addSignal === "function") {
+                NS.addSignal("无ICP备案信息", 6, `当前域名 ${location.hostname} 未查询到备案信息`);
+              }
             }
           } else if (typeof NS.reconcilePageIcpClaim === "function") {
             rec0 = "";
-            miss0 = true;
+            miss0 = false;
             state.icpInfo = icpCheck0 && icpCheck0.partialMissing
               ? "查询未确认（部分来源未找到备案记录）"
               : "备案查询失败";
-            pageIcp = NS.reconcilePageIcpClaim("", true);
+            pageIcp = NS.reconcilePageIcpClaim("", false);
             if (pageIcp.declared && pageIcp.declared.length) {
               const ph = pageIcp.declared.some((d) =>
                 typeof NS.looksLikePlaceholderIcpLicense === "function" && NS.looksLikePlaceholderIcpLicense(d)
@@ -768,11 +985,11 @@
           }
         } catch {
           rec0 = "";
-          miss0 = true;
+          miss0 = false;
           if (!state.icpInfo) state.icpInfo = "备案查询失败";
           try {
             if (typeof NS.reconcilePageIcpClaim === "function") {
-              pageIcp = NS.reconcilePageIcpClaim("", true);
+              pageIcp = NS.reconcilePageIcpClaim("", false);
               if (pageIcp.declared && pageIcp.declared.length) {
                 const normal = pageIcp.declared.some((d) => {
                   const n = typeof NS.normalizeIcpLicense === "function" ? NS.normalizeIcpLicense(d) : String(d || "");
@@ -804,8 +1021,8 @@
       } catch {
         state._icpQuerySettled = true;
         if (!state.icpInfo) state.icpInfo = "备案查询失败";
-        try { if (typeof NS.finalizeIcpClaimSignals === "function") NS.finalizeIcpClaimSignals("", true); } catch { /* ignore */ }
-        try { if (typeof NS.scheduleDeferredIcpClaimRescan === "function") NS.scheduleDeferredIcpClaimRescan("", true); } catch { /* ignore */ }
+        try { if (typeof NS.finalizeIcpClaimSignals === "function") NS.finalizeIcpClaimSignals("", false); } catch { /* ignore */ }
+        try { if (typeof NS.scheduleDeferredIcpClaimRescan === "function") NS.scheduleDeferredIcpClaimRescan("", false); } catch { /* ignore */ }
       }
       if (gen === c.intelGeneration) c.intelDoneForUrl = urlKey;
       try {
@@ -834,8 +1051,11 @@
     try {
       if (!pageHost) { state.icpInfo = ""; state.icpMatchedHost = ""; state._icpQuerySettled = true; state._icpQueryFailed = false; if (gen === c.intelGeneration) c.intelDoneForUrl = urlKey; NS.maybeLiftDownloadGuard(); NS.emitRiskReport(true); return; }
       // ICP 与 WHOIS 同一 pageHost（含 www）
-      const icpCheck = await icpPromise;
+      let icpCheck = await icpPromise;
       if (gen !== c.intelGeneration || location.href !== urlKey) return;
+      if (!(icpCheck && icpCheck.success) && restoreForcedMissingIcpState()) {
+        icpCheck = { success: true, icpRecord: "", icpMissing: true, attributionRejected: true, queriedHost: pageHost, source: "preserved-fallback-whois" };
+      }
       if (!icpCheck.success) {
         // API 失败：仍核对页脚自称/占位号，避免仿冒页假备案漏检
         NS.silverfoxLog("intel-icp", "api-fail-settle-missing");
@@ -845,10 +1065,10 @@
         state.icpMatchedHost = "";
         state._icpQueryFailed = true; state._icpQuerySettled = true;
         try {
-          if (typeof NS.finalizeIcpClaimSignals === "function") NS.finalizeIcpClaimSignals("", true);
-          else if (typeof NS.reconcilePageIcpClaim === "function") NS.reconcilePageIcpClaim("", true);
+          if (typeof NS.finalizeIcpClaimSignals === "function") NS.finalizeIcpClaimSignals("", false);
+          else if (typeof NS.reconcilePageIcpClaim === "function") NS.reconcilePageIcpClaim("", false);
         } catch { /* ignore */ }
-        try { if (typeof NS.scheduleDeferredIcpClaimRescan === "function") NS.scheduleDeferredIcpClaimRescan("", true); } catch { /* ignore */ }
+        try { if (typeof NS.scheduleDeferredIcpClaimRescan === "function") NS.scheduleDeferredIcpClaimRescan("", false); } catch { /* ignore */ }
         if (gen === c.intelGeneration) c.intelDoneForUrl = urlKey;
         try {
           state._softBrandIdentityReady = true;
@@ -874,8 +1094,35 @@
       }
       let record = (icpCheck.icpRecord && NS.looksLikeIcpLicense(icpCheck.icpRecord)) ? icpCheck.icpRecord : "";
       const matched = icpCheck.matchedHost || icpCheck.queriedHost || pageHost;
-      if (record && !NS.intelHostIsValidAttribution(matched, pageHost)) record = "";
-      const missing = !record && (icpCheck.icpMissing || !icpCheck.icpRecord);
+      const recordHost = icpCheck.domainExplicit === true && icpCheck.domain
+        ? icpCheck.domain
+        : (icpCheck.recordHost || matched);
+      let fallbackWhoisRejected = icpCheck.attributionRejected === true;
+      if (record && !NS.intelHostIsValidAttribution(recordHost, pageHost)) {
+        record = "";
+        fallbackWhoisRejected = true;
+      }
+      let fallbackSupported = true;
+      if (record && typeof NS.icpFallbackHasWhoisSupport === "function") {
+        fallbackSupported = await NS.icpFallbackHasWhoisSupport(recordHost, pageHost, whois);
+        // The lookup may finish after a SPA navigation or full navigation.
+        if (gen !== c.intelGeneration || location.href !== urlKey) return;
+      }
+      if (record && !fallbackSupported) {
+        NS.silverfoxLog("intel-icp", "reject-fallback-without-whois", recordHost, "page=", pageHost,
+          "whois=", whois && whois.queriedHost || "-");
+        record = "";
+        fallbackWhoisRejected = true;
+      }
+      const missing = !record && (fallbackWhoisRejected || icpCheck.icpMissing || !icpCheck.icpRecord);
+      const forcedMissing = fallbackWhoisRejected;
+      if (forcedMissing) {
+        state._icpForcedMissingByFallbackWhois = true;
+        state._icpForcedMissingHost = pageHost;
+      } else {
+        state._icpForcedMissingByFallbackWhois = false;
+        state._icpForcedMissingHost = "";
+      }
       // 权威源已命中：立刻清掉历史「备案待核验 / 假冒」残留，避免 UI 卡在待核验
       if (record) {
         try {
@@ -888,15 +1135,19 @@
         ? NS.extractPageDeclaredIcpLicenses()
         : [];
       const pageIcp = typeof NS.reconcilePageIcpClaim === "function"
-        ? NS.reconcilePageIcpClaim(record, missing || !record, declaredNow.length ? declaredNow : undefined)
+        ? NS.reconcilePageIcpClaim(record, missing, declaredNow.length ? declaredNow : undefined)
         : { declared: declaredNow, mismatch: false, unverifiedClaim: false };
       declaredNow = pageIcp.declared || declaredNow;
-      state.icpMatchedHost = record ? NS.normalizeDomain(matched || pageHost) : "";
+      state.icpMatchedHost = record
+        ? (typeof NS.normalizeHostForIntel === "function"
+          ? NS.normalizeHostForIntel(recordHost || pageHost)
+          : String(recordHost || pageHost).toLowerCase())
+        : "";
       const tried = Array.isArray(icpCheck.triedHosts) ? icpCheck.triedHosts : [];
-      const recordLabel = record && matched && matched !== pageHost ? `${record}（主域 ${matched}）` : record;
+      const recordLabel = record && recordHost && recordHost !== pageHost ? `${record}（主域 ${recordHost}）` : record;
       // OV/EV 组织证书：不展示「未查询到备案信息」（境外正规站常见）
       const orgSsl = typeof NS.hasOrganizationValidatedSsl === "function" && NS.hasOrganizationValidatedSsl();
-      // 页脚有宣称 + 权威 missing：占位号→假冒；正常年份号→待核验（勿一律「假冒宣称」）
+      // 页脚有宣称 + 来源明确 missing：无论号码外观是否正常，都属于当前域名的假冒声明。
       const looksNormalDeclared = (list) => (list || []).some((d) => {
         const n = typeof NS.normalizeIcpLicense === "function" ? NS.normalizeIcpLicense(d) : String(d || "");
         return /[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼]ICP备20\d{2}\d{4,12}/i.test(n);
@@ -904,18 +1155,14 @@
       const anyPlaceholderDeclared = (list) => (list || []).some((d) =>
         typeof NS.looksLikePlaceholderIcpLicense === "function" && NS.looksLikePlaceholderIcpLicense(d)
       );
-      const fakeIcp = !!(pageIcp.unverifiedClaim && anyPlaceholderDeclared(declaredNow));
-      const pendingIcp = !!(!record && declaredNow && declaredNow.length && missing
-        && looksNormalDeclared(declaredNow) && !anyPlaceholderDeclared(declaredNow));
+      const fakeIcp = !!(pageIcp.unverifiedClaim && declaredNow && declaredNow.length && missing);
       state.icpInfo = record
         ? recordLabel
         : (fakeIcp && declaredNow.length
           ? `假冒宣称 ${declaredNow.join(" / ")}`
-          : (pendingIcp
-            ? `页脚宣称 ${declaredNow.join(" / ")}（第三方待核验）`
-            : (missing && !orgSsl ? "未查询到备案信息" : "")));
+          : (missing && (forcedMissing || !orgSsl) ? "未查询到备案信息" : ""));
       state._icpQuerySettled = true; state._icpQueryFailed = false;
-      NS.silverfoxLog("intel-icp", record ? "valid" : (fakeIcp ? "fake-claim" : (pendingIcp ? "pending-claim" : (missing ? "missing" : "empty"))), String(state.icpInfo || "").slice(0, 80), "host=", pageHost, "declared=", (declaredNow || []).join(",") || "-");
+      NS.silverfoxLog("intel-icp", record ? "valid" : (fakeIcp ? "fake-claim" : (missing ? "missing" : "empty")), String(state.icpInfo || "").slice(0, 80), "host=", pageHost, "declared=", (declaredNow || []).join(",") || "-");
       const ageDays = NS.getWhoisAgeDays();
       const needsBrandAuthorityForIcp = typeof NS.hostNeedsAuthoritativeBrandIdentity === "function"
         && NS.hostNeedsAuthoritativeBrandIdentity(pageHost);
@@ -927,7 +1174,7 @@
       // 收口：再抽页脚；按 record/missing 真实状态核验（禁止强行 remoteMissing=true）
       try {
         const fin = typeof NS.finalizeIcpClaimSignals === "function"
-          ? NS.finalizeIcpClaimSignals(record, missing || !record)
+          ? NS.finalizeIcpClaimSignals(record, missing)
           : null;
         if (fin) {
           pageIcp.unverifiedClaim = !!fin.unverifiedClaim || pageIcp.unverifiedClaim;
@@ -941,12 +1188,12 @@
       if (declaredFinal.length) {
         if (typeof NS.clearMissingIcpSignal === "function") NS.clearMissingIcpSignal();
         if (typeof NS.reconcilePageIcpClaim === "function") {
-          NS.reconcilePageIcpClaim(record, !!(missing || !record), declaredFinal);
+          NS.reconcilePageIcpClaim(record, !!missing, declaredFinal);
         }
         if (!record) {
           const ph = anyPlaceholderDeclared(declaredFinal);
           const normal = looksNormalDeclared(declaredFinal);
-          if (ph) {
+          if (ph || missing) {
             state.icpInfo = `假冒宣称 ${declaredFinal.join(" / ")}`;
             state._unverifiedPageIcpClaim = true;
           } else if (normal) {
@@ -958,7 +1205,7 @@
           }
           state.pageDeclaredIcp = declaredFinal.join(" / ");
         }
-      } else if (missing && !skipMissingIcp && !pageIcp.unverifiedClaim) {
+      } else if (missing && (forcedMissing || !skipMissingIcp) && !pageIcp.unverifiedClaim) {
         const whoisNote = whois.queriedHost && whois.queriedHost !== pageHost ? `，WHOIS 经 ${whois.queriedHost}` : "";
         const triedNote = tried.length ? `，ICP 候选 ${tried.join(" -> ")}` : "";
         NS.addSignal("无ICP备案信息", 6, `当前域名 ${location.hostname}${whoisNote}${triedNote} 未查询到备案信息`);
@@ -973,7 +1220,7 @@
       // 页脚晚挂载 / 隐藏节点：延迟再抽，避免只剩「无ICP备案信息」
       try {
         if (typeof NS.scheduleDeferredIcpClaimRescan === "function") {
-          NS.scheduleDeferredIcpClaimRescan(record, missing || !record);
+          NS.scheduleDeferredIcpClaimRescan(record, missing);
         }
       } catch { /* ignore */ }
       // 高置信身份欺诈组合：新注册域名 + 权威源确认未备案 + 页脚自称备案。
@@ -1080,7 +1327,11 @@
       state._softBrandIdentityUrl = urlKey;
     } catch { /* ignore */ }
     NS.maybeLiftDownloadGuard();
+    try { NS.nudgeProvisionalDownloadSettlement("intel-pipeline-done"); } catch { /* ignore */ }
+    const recoveredIdentity = typeof NS.recoverIdentityVerificationAvailability === "function"
+      && NS.recoverIdentityVerificationAvailability("intel-pipeline-late-recovery");
     // 情报结束必须 complete，禁止只 emit incomplete 覆盖 popup
+    if (recoveredIdentity) return;
     if (!state._analysisDone) NS.markAnalysisComplete("intel-pipeline-done");
     else NS.emitRiskReport(true);
   }
@@ -1121,7 +1372,297 @@
     NS.state._intelUrlKey = urlKey;
     const gen = c.intelGeneration;
     c.intelBusy = true;
-    Promise.resolve().then(() => runIcpWhoisIntel(gen, urlKey)).catch(() => {}).finally(() => { if (gen === c.intelGeneration) c.intelBusy = false; });
+    Promise.resolve().then(() => runIcpWhoisIntel(gen, urlKey)).catch((error) => {
+      // An unexpected provider/parser failure used to be swallowed here.  The
+      // tab then kept `intelBusy`/identity pending forever (especially after
+      // Edge froze and later restored a background tab).  Close this analysis
+      // transaction as explicitly unavailable; never turn it into a clean
+      // completed report, and still allow a late SSL/identity result to recover.
+      if (gen !== c.intelGeneration || String(location.href) !== urlKey) return;
+      const state = NS.state;
+      state._icpQuerySettled = true;
+      state._icpQueryFailed = true;
+      if (!state.icpInfo) state.icpInfo = "备案查询失败";
+      c.intelDoneForUrl = urlKey;
+      state._softBrandIdentityReady = true;
+      state._softBrandIdentityUrl = urlKey;
+      state._identityVerificationUnavailable = true;
+      state._identityVerificationUnavailableUrl = urlKey;
+      try { NS.debugLog("intel-pipeline-error", error && error.message ? error.message : String(error || "unknown")); } catch { /* ignore */ }
+      try { NS.nudgeProvisionalDownloadSettlement("intel-pipeline-error"); } catch { /* ignore */ }
+      try {
+        if (!state._analysisDone) NS.markAnalysisComplete("intel-pipeline-error");
+        else NS.emitRiskReport(true);
+      } catch { /* ignore */ }
+    }).finally(() => { if (gen === c.intelGeneration) c.intelBusy = false; });
+  };
+
+  /**
+   * 下载目录的有界性能静默。它只暂停重复 DOM 全扫，绝不直接认定官网；
+   * ICP/WHOIS/SSL 全部结束后，可信站收口，不可信站恰好执行一次最终扫描。
+   */
+  NS.nudgeProvisionalDownloadSettlement = function (reason) {
+    try {
+      const controller = NS.caches && NS.caches._provisionalDownloadController;
+      if (!controller || controller.active !== true || typeof controller.settle !== "function") return false;
+      controller.settle(reason || "external-nudge");
+      return true;
+    } catch { return false; }
+  };
+
+  NS.recoverIdentityVerificationAvailability = function (reason) {
+    try {
+      const state = NS.state;
+      const c = NS.caches;
+      const urlKey = String(location.href || "");
+      if (!state._identityVerificationUnavailable
+        || state._identityVerificationUnavailableUrl !== urlKey) return false;
+      const intelReady = !!(state._icpQuerySettled === true
+        && state._icpQueryFailed !== true
+        && c && c.intelDoneForUrl === urlKey);
+      const sslReady = !/^https:/i.test(String(location.protocol || ""))
+        || (state._sslIdentitySettled === true && state._sslIdentityTimedOut !== true);
+      if (!intelReady || !sslReady) return false;
+      state._identityVerificationUnavailable = false;
+      state._identityVerificationUnavailableUrl = "";
+      state._brandElectionSettledUrl = "";
+      state._brandElectionSettledAt = 0;
+      state._analysisDone = false;
+      state._stickyComplete = false;
+      state._stickyCompleteHost = "";
+      try { NS.invalidateHtmlCache(); } catch { /* ignore */ }
+      try { NS.markAnalysisComplete(reason || "identity-verification-recovered"); } catch { /* ignore */ }
+      return true;
+    } catch { return false; }
+  };
+
+  function releaseBackgroundProvisionalProtection(urlKey, reason, analysisTxn) {
+    try {
+      if (!chrome?.runtime?.id) return;
+      chrome.runtime.sendMessage({
+        type: "release-provisional-tab-protect",
+        url: String(urlKey || location.href || ""),
+        reason: String(reason || "provisional-identity-terminal"),
+        analysisTxn: String(analysisTxn || (NS.state && NS.state._analysisTxn) || "")
+      }, () => { void chrome.runtime.lastError; });
+    } catch { /* ignore */ }
+  }
+
+  NS.startProvisionalDownloadRouteAnalysis = function (reason) {
+    const state = NS.state;
+    const c = NS.caches;
+    const urlKey = String(location.href || "");
+    const previous = c && c._provisionalDownloadController;
+    if (previous && previous.active === true && previous.url === urlKey) {
+      try { previous.settle(`${String(reason || "clean-download")}-reuse`); } catch { /* ignore */ }
+      return true;
+    }
+    try {
+      if (previous && typeof previous.cancel === "function") previous.cancel("superseded");
+    } catch { /* ignore */ }
+    const generation = Number(state._provisionalDownloadAnalysisGeneration || 0) + 1;
+    const ownerAnalysisTxn = String(state._analysisTxn || "");
+    state._provisionalDownloadAnalysisGeneration = generation;
+    NS.silverfoxLog && NS.silverfoxLog("boot", "provisional-clean-download", location.hostname, location.pathname, reason || "");
+    let quietEntered = false;
+    try {
+      quietEntered = typeof NS.enterOfficialDownloadScanQuiet === "function"
+        && NS.enterOfficialDownloadScanQuiet(reason || "clean-download-path");
+    } catch { quietEntered = false; }
+    // 已有真实硬威胁/guard 时性能静默会拒绝进入；此时必须立刻回到正常裁决，
+    // 不能因调用方已 return 而让页面永久停在“正在核验”。
+    if (!quietEntered) {
+      try { NS.startIcpWhoisIntelEarly(`${String(reason || "clean-download")}-quiet-rejected`); } catch { /* ignore */ }
+      state._officialDownloadForceScanAllowed = true;
+      try { NS.scanSuspiciousPackagesFast(true); } catch { /* ignore */ }
+      state._officialDownloadForceScanAllowed = false;
+      try { NS.markAnalysisComplete("clean-download-quiet-rejected"); } catch { /* ignore */ }
+      return false;
+    }
+    const provisionalDeadline = Date.now() + 26000;
+    state._provisionalDownloadIdentityHold = true;
+    state._provisionalDownloadIdentityUrl = urlKey;
+    state._provisionalDownloadIdentityDeadlineAt = provisionalDeadline;
+    state._identityVerificationUnavailable = false;
+    state._identityVerificationUnavailableUrl = "";
+    try { NS.armImmediatePackageBlock(); } catch { /* ignore */ }
+    // Bind a webNavigation-created provisional record to this exact content
+    // transaction. Otherwise a stale same-URL document could release an
+    // ownerless record belonging to a reload.
+    try {
+      if (typeof NS.armBackgroundProtect === "function") NS.armBackgroundProtect("provisional");
+    } catch { /* ignore */ }
+    try { NS.notifyBackgroundDownloadTrust(false, `${String(reason || "clean-download")}-pending-identity`); } catch { /* ignore */ }
+    try { NS.startIcpWhoisIntelEarly(`${String(reason || "clean-download")}-pending-identity`); } catch (e) { console.warn("early WHOIS/ICP start failed", e); }
+    try { NS.emitRiskReport(true); } catch { /* ignore */ }
+
+    let finished = false;
+    let settling = false;
+    let surfaceEvaluated = false;
+    let surfaceOk = false;
+    let timer = null;
+    const cleanupListeners = [];
+    const clearTimer = () => {
+      if (!timer) return;
+      try { clearTimeout(timer); } catch { /* ignore */ }
+      timer = null;
+    };
+    const clearOwnedHold = () => {
+      if (state._provisionalDownloadIdentityUrl === urlKey) {
+        state._provisionalDownloadIdentityHold = false;
+        state._provisionalDownloadIdentityUrl = "";
+        state._provisionalDownloadIdentityDeadlineAt = 0;
+      }
+    };
+    const cleanup = (clearQuiet) => {
+      clearTimer();
+      cleanupListeners.splice(0).forEach((off) => { try { off(); } catch { /* ignore */ } });
+      clearOwnedHold();
+      if (clearQuiet && state._officialDownloadScanQuietUrl === urlKey) {
+        state._officialDownloadScanQuiet = false;
+        state._officialDownloadScanQuietUrl = "";
+      }
+      if (c && c._provisionalDownloadController === controller) c._provisionalDownloadController = null;
+      controller.active = false;
+    };
+    const finishWithFinalScan = (finishReason, timedOut) => {
+      if (finished) return;
+      finished = true;
+      // Deadline only releases the click hold.  It is not a fabricated
+      // ICP/WHOIS/TLS verdict: keep the real source flags untouched and mark
+      // identity unavailable, so soft brand mismatch can neither toast nor arm
+      // a permanent guard.  Late callbacks clear this state and may re-elect.
+      if (timedOut) {
+        state._identityVerificationUnavailable = true;
+        state._identityVerificationUnavailableUrl = urlKey;
+      }
+      cleanup(true);
+      state._officialDownloadForceScanAllowed = true;
+      try { NS.invalidateHtmlCache(); } catch { /* ignore */ }
+      try { NS.scanSuspiciousPackagesFast(true); } catch { /* ignore */ }
+      state._officialDownloadForceScanAllowed = false;
+      const hardAfterScan = typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat();
+      if (!hardAfterScan) {
+        releaseBackgroundProvisionalProtection(urlKey, finishReason || "clean-download-final-scan", ownerAnalysisTxn);
+      }
+      try {
+        if (!state._analysisDone) NS.markAnalysisComplete(finishReason || "clean-download-final-scan");
+        else NS.emitRiskReport(true);
+      } catch { /* ignore */ }
+    };
+    const schedule = () => {
+      if (finished || timer) return;
+      timer = setTimeout(() => {
+        timer = null;
+        settle("timer");
+      }, 250);
+    };
+    const settle = (settleReason) => {
+      if (finished || settling) return;
+      settling = true;
+      try {
+      if (generation !== Number(state._provisionalDownloadAnalysisGeneration || 0)
+        || String(location.href || "") !== urlKey
+        || state._provisionalDownloadIdentityUrl !== urlKey) {
+        finished = true;
+        cleanup(false);
+        return;
+      }
+      const realHard = typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat();
+      const intelSettled = !!(state._icpQuerySettled === true
+        && NS.caches && NS.caches.intelDoneForUrl === urlKey);
+      const sslStartedForUrl = /^https:/i.test(String(location.protocol || ""))
+        && String(state._sslIdentityUrl || "") === urlKey
+        && Number(state._sslIdentityStartedAt || 0) > 0;
+      const sslObservedForUrl = /^https:/i.test(String(location.protocol || ""))
+        && String(state._sslIdentityUrl || "") === urlKey
+        && state._sslIdentityObserved === true;
+      const sslSettled = !/^https:/i.test(String(location.protocol || ""))
+        || (state._sslIdentitySettled === true
+          && state._sslIdentityTimedOut !== true
+          && (sslStartedForUrl || sslObservedForUrl));
+      const identitySettled = intelSettled && sslSettled;
+      const domReady = document.readyState !== "loading";
+      const deadlineReached = Date.now() >= provisionalDeadline;
+      if (realHard) {
+        finishWithFinalScan("clean-download-hard-threat", false);
+        return;
+      }
+      if ((!identitySettled || !domReady) && !deadlineReached) {
+        schedule();
+        return;
+      }
+
+      if (identitySettled && !surfaceEvaluated) {
+        surfaceEvaluated = true;
+        try { NS.invalidateHtmlCache(); } catch { /* ignore */ }
+        surfaceOk = !!(!realHard
+          && typeof NS.pageLooksLikeLegitimateOfficialDownload === "function"
+          && NS.pageLooksLikeLegitimateOfficialDownload());
+      }
+
+      let trusted = false;
+      if (!realHard && surfaceOk && identitySettled) {
+        const profile = typeof NS.evaluateMatureLegitimateSiteProfile === "function"
+          ? NS.evaluateMatureLegitimateSiteProfile() : null;
+        const authoritative = typeof NS.hasAuthoritativeMatureOrganizationIdentity === "function"
+          && NS.hasAuthoritativeMatureOrganizationIdentity(profile);
+        trusted = !!(profile && (profile.trusted || authoritative));
+      }
+
+      if (trusted) {
+        finished = true;
+        cleanup(true);
+        state._identityVerificationUnavailable = false;
+        state._identityVerificationUnavailableUrl = "";
+        releaseBackgroundProvisionalProtection(urlKey, "clean-download-identity-confirmed", ownerAnalysisTxn);
+        try { NS.enterIntelLightMode("clean-download-identity-confirmed"); } catch { /* ignore */ }
+        try { NS.notifyHooksOfficialSafe(true); } catch { /* ignore */ }
+        try { NS.maybeLiftDownloadGuard(); } catch { /* ignore */ }
+        try { NS.markAnalysisComplete("clean-download-identity-confirmed"); } catch { /* ignore */ }
+        return;
+      }
+      finishWithFinalScan(deadlineReached && !identitySettled
+        ? "clean-download-identity-timeout"
+        : "clean-download-final-scan", deadlineReached && !identitySettled);
+      } catch {
+        finishWithFinalScan("clean-download-settle-error", true);
+      } finally {
+        settling = false;
+      }
+    };
+    const controller = {
+      active: true,
+      url: urlKey,
+      generation,
+      deadlineAt: provisionalDeadline,
+      settle,
+      cancel: () => {
+        if (finished) return;
+        finished = true;
+        cleanup(false);
+        releaseBackgroundProvisionalProtection(urlKey, "provisional-controller-cancel", ownerAnalysisTxn);
+      }
+    };
+    if (c) c._provisionalDownloadController = controller;
+    const listen = (target, type, handler, options) => {
+      try {
+        target.addEventListener(type, handler, options);
+        cleanupListeners.push(() => target.removeEventListener(type, handler, options));
+      } catch { /* ignore */ }
+    };
+    listen(document, "visibilitychange", () => {
+      if (document.visibilityState === "visible") settle("visibility-visible");
+    }, true);
+    listen(window, "pageshow", () => settle("pageshow"), true);
+    listen(window, "focus", () => settle("focus"), true);
+    if (document.readyState === "loading") {
+      listen(document, "DOMContentLoaded", () => settle("dom-content-loaded"), { once: true });
+    }
+    // 立即裁决一次；timer 只是兜底，ICP/SSL、Popup 与页面恢复事件都会主动 nudge。
+    try { queueMicrotask(() => settle("start")); } catch { setTimeout(() => settle("start"), 0); }
+    schedule();
+    return true;
   };
 
   // 修复：startIcpWhoisIntelEarly 里引用了未定义的 state，用 NS.state
@@ -1133,19 +1674,16 @@
     try { NS.installParentGuardInheritance(); } catch (e) { console.warn("installParentGuardInheritance failed", e); }
     try { NS.installHooksMessageBridge(); } catch { /* ignore */ }
   } else {
+  // Install the bounded identity watcher even when document_start sees an
+  // empty SPA shell.  Waiting until pageNeedsFinalBrandElection() is true
+  // would miss the exact first-load case where title/H1/CTA hydrate later.
+  try { NS.ensureBrandElectionHydrationWatch(); } catch { /* ignore */ }
   const bootIsSearchUrl = (() => { try { return typeof NS.isSearchUrlShapeOnly === "function" && NS.isSearchUrlShapeOnly(); } catch { return false; } })();
   const bootIsPrivateLocal = (() => {
     try {
       return typeof NS.isPrivateOrLocalNetworkHost === "function" && NS.isPrivateOrLocalNetworkHost();
     } catch { return false; }
   })();
-  // AdGuard Home 等局域网 SPA：不跑下载壳/加密 SPA/全量 intel
-  const bootIsBareJsShell = (() => {
-    try {
-      return typeof NS.pageLooksLikeBareJsAppShell === "function" && NS.pageLooksLikeBareJsAppShell();
-    } catch { return false; }
-  })();
-
   // /download 路径和干净英文主域仅作佐证。document_start 时 WHOIS 与页面
   // 正规性尚未就绪，禁止据此进入轻量模式。
   const bootIsCleanOfficialDownload = (() => {
@@ -1157,6 +1695,14 @@
       return !!(pathHint && profile && profile.trusted);
     } catch { return false; }
   })();
+  // 仅用于性能调度：干净品牌根结构 + 下载路径可在 document_start 暂停重型观察器，
+  // 但绝不据此认定官网；身份、品牌、ICP/WHOIS/SSL 仍按完整流水线收口。
+  const bootIsProvisionalCleanDownload = (() => {
+    try {
+      return typeof NS.looksLikeProvisionalDownloadPathShape === "function"
+        && NS.looksLikeProvisionalDownloadPathShape();
+    } catch { return false; }
+  })();
 
   if (bootIsSearchUrl) {
     const state = NS.state;
@@ -1166,7 +1712,7 @@
     try { NS.installPageNavigationWatchers(); } catch (e) { console.warn("installPageNavigationWatchers failed", e); }
     try { NS.markAnalysisComplete("boot-search-light"); } catch { /* ignore */ }
     try { NS.startIcpWhoisIntelEarly("boot-search-light"); } catch (e) { console.warn("early WHOIS/ICP start failed", e); }
-  } else if (bootIsPrivateLocal || bootIsBareJsShell) {
+  } else if (bootIsPrivateLocal) {
     const state = NS.state;
     state._perfBenign = true; state._perfBenignAt = Date.now();
     state._intelLightMode = true;
@@ -1174,7 +1720,7 @@
     try { NS.postToHooks({ type: "set-official-safe", enabled: true }); } catch { /* ignore */ }
     try { NS.installPageNavigationWatchers(); } catch (e) { console.warn("installPageNavigationWatchers failed", e); }
     try {
-      NS.markAnalysisComplete(bootIsPrivateLocal ? "boot-private-local" : "boot-js-app-shell");
+      NS.markAnalysisComplete("boot-private-local");
     } catch { /* ignore */ }
   } else if (bootIsCleanOfficialDownload) {
     const state = NS.state;
@@ -1193,6 +1739,11 @@
     try { NS.installHooksMessageBridge(); } catch { /* ignore */ }
     try { NS.markAnalysisComplete(bootReason); } catch { /* ignore */ }
     try { NS.startIcpWhoisIntelEarly(bootReason); } catch (e) { console.warn("early WHOIS/ICP start failed", e); }
+  } else if (bootIsProvisionalCleanDownload) {
+    try { NS.installPageNavigationWatchers(); } catch (e) { console.warn("installPageNavigationWatchers failed", e); }
+    try { NS.installHooksMessageBridge(); } catch { /* ignore */ }
+    try { NS.installParentGuardInheritance(); } catch { /* ignore */ }
+    NS.startProvisionalDownloadRouteAnalysis("boot-clean-download-path");
   } else {
     const state = NS.state;
     NS.detectMutationBomb();
@@ -1213,8 +1764,17 @@
             return;
           }
           if (NS.pageLooksLikeLegitimateOfficialDownload() || NS.looksLikeMatureOfficialPortal()) {
-            NS.notifyHooksOfficialSafe(true);
-            if (state.downloadGuardInstalled || state._earlyShellArmed) NS.clearDownloadGuard("boot-official-portal");
+            const trustedNow = typeof NS.pageHasStrongTrustedIdentity === "function"
+              && NS.pageHasStrongTrustedIdentity();
+            if (trustedNow) {
+              NS.notifyHooksOfficialSafe(true);
+              NS.maybeLiftDownloadGuard();
+            } else if (!state._analysisDone
+              && typeof NS.startProvisionalDownloadRouteAnalysis === "function") {
+              // 页面结构只能触发“性能静默 + 有界身份等待”，不能提前宣告官网、
+              // 清除 guard，或留下一个没有 owner 的永久 quiet 状态。
+              NS.startProvisionalDownloadRouteAnalysis("boot-official-surface-400ms");
+            }
           }
         } catch { /* ignore */ }
       }, 400);
@@ -1226,8 +1786,15 @@
             return;
           }
           if (NS.pageLooksLikeLegitimateOfficialDownload() || NS.looksLikeMatureOfficialPortal() || NS.shouldNeverArmProtection()) {
-            NS.notifyHooksOfficialSafe(true);
-            NS.maybeLiftDownloadGuard();
+            const trustedNow = typeof NS.pageHasStrongTrustedIdentity === "function"
+              && NS.pageHasStrongTrustedIdentity();
+            if (trustedNow || NS.shouldNeverArmProtection()) {
+              NS.notifyHooksOfficialSafe(true);
+              NS.maybeLiftDownloadGuard();
+            } else if (!state._analysisDone
+              && typeof NS.startProvisionalDownloadRouteAnalysis === "function") {
+              NS.startProvisionalDownloadRouteAnalysis("boot-official-surface-2000ms");
+            }
           }
         } catch { /* ignore */ }
       }, 2000);
@@ -1237,7 +1804,11 @@
       if (chrome?.runtime?.id) {
         // 新文档先撤销旧页面下载信任；情报核验完成后再显式建立。
         NS.notifyBackgroundDownloadTrust(false, "boot-reset-download-trust");
-        chrome.runtime.sendMessage({ type: "set-tab-protect", enabled: false, url: location.href }, () => { void chrome.runtime.lastError; });
+        chrome.runtime.sendMessage({
+          type: "set-tab-protect", enabled: false, url: location.href,
+          analysisTxn: state._analysisTxn || "",
+          analysisTxnStartedAt: Number(state._analysisTxnStartedAt) || Date.now()
+        }, () => { void chrome.runtime.lastError; });
       }
     } catch { /* ignore */ }
 
@@ -1251,12 +1822,25 @@
           try { const t = e && e.target; const tag = t && (t.tagName || "").toUpperCase(); if (tag === "INPUT" || tag === "TEXTAREA") return; } catch { /* ignore */ }
           const now = Date.now(); if (now - lastPauseAt < 400) return; lastPauseAt = now;
           if (!chrome?.runtime?.id) return;
-          chrome.runtime.sendMessage({ type: "pause-nav-blocking", reason: "user-gesture", url: location.href }, () => { void chrome.runtime.lastError; });
+          chrome.runtime.sendMessage({
+            type: "pause-nav-blocking",
+            reason: "user-gesture",
+            url: location.href,
+            analysisTxn: state._analysisTxn || "",
+            analysisTxnStartedAt: Number(state._analysisTxnStartedAt) || Date.now()
+          }, () => { void chrome.runtime.lastError; });
         } catch { /* ignore */ }
       };
       const gOpts = { capture: true, passive: true };
       for (const t of ["pointerdown", "mousedown", "keydown", "touchstart"]) window.addEventListener(t, pauseDnrOnGesture, gOpts);
-      window.addEventListener("pagehide", () => { try { chrome.runtime.sendMessage({ type: "pause-nav-blocking", reason: "pagehide", clearProtect: false, url: location.href }, () => { void chrome.runtime.lastError; }); } catch { /* ignore */ } }, { capture: true });
+      window.addEventListener("pagehide", () => { try { chrome.runtime.sendMessage({
+        type: "pause-nav-blocking",
+        reason: "pagehide",
+        clearProtect: false,
+        url: location.href,
+        analysisTxn: state._analysisTxn || "",
+        analysisTxnStartedAt: Number(state._analysisTxnStartedAt) || Date.now()
+      }, () => { void chrome.runtime.lastError; }); } catch { /* ignore */ } }, { capture: true });
     } catch { /* ignore */ }
 
     try {
@@ -1287,13 +1871,15 @@
         NS.markAnalysisComplete("boot-skip-heavy");
       } else if ((typeof NS.pageLooksLikeContentInfoPortal === "function" && NS.pageLooksLikeContentInfoPortal())
         || (typeof NS.pageLooksLikeHeavyContentSpa === "function" && NS.pageLooksLikeHeavyContentSpa())) {
-        // 天气/资讯/大型内容站：light + complete，不挂 live 观察（CSS/广告脚本狂变）
+        // 天气/资讯/大型内容站：light + complete；仅保留精准包证据观察，
+        // 不做定时/全页重扫，避免 CSS/广告/Quill 水合拖慢主线程。
         state._perfBenign = true; state._perfBenignAt = Date.now(); state._intelLightMode = true;
         try {
           if (typeof NS.enterIntelLightMode === "function") NS.enterIntelLightMode("boot-content-portal");
           else NS.postToHooks({ type: "set-light-page", enabled: true });
         } catch { /* ignore */ }
         NS.markAnalysisComplete("boot-content-portal");
+        try { NS.watchSuspiciousPackagesLive({ evidenceOnly: true }); } catch { /* ignore */ }
       } else if (
         // 成熟门户 / 永不保护：light + complete（干净 /download 已在上方独立 boot 分支处理）
         ((typeof NS.looksLikeMatureOfficialPortal === "function" && NS.looksLikeMatureOfficialPortal())
@@ -1306,6 +1892,7 @@
           else NS.postToHooks({ type: "set-light-page", enabled: true });
         } catch { /* ignore */ }
         NS.markAnalysisComplete("boot-mature-portal");
+        try { NS.watchSuspiciousPackagesLive({ evidenceOnly: true }); } catch { /* ignore */ }
       } else { NS.watchSuspiciousPackagesLive(); }
     } catch (e) {
       console.warn("watchSuspiciousPackagesLive failed", e);
@@ -1468,10 +2055,21 @@
             NS.markAnalysisComplete("load-timeout-threat");
             return;
           }
-          state._perfBenign = true;
-          state._intelLightMode = true;
           state._scanBusy = false;
-          NS.markAnalysisComplete("load-timeout-force-complete");
+          const urlKey = String(location.href || "");
+          const intelSettled = state._icpQuerySettled === true
+            && NS.caches && NS.caches.intelDoneForUrl === urlKey;
+          const sslSettled = !/^https:/i.test(String(location.protocol || ""))
+            || (state._sslIdentitySettled === true
+              && state._sslIdentityTimedOut !== true
+              && String(state._sslIdentityUrl || "") === urlKey);
+          if (intelSettled && sslSettled) {
+            NS.markAnalysisComplete("load-timeout-identity-settled");
+          } else {
+            // Keep the report incomplete; the ICP/WHOIS/TLS callbacks (or
+            // their bounded watchdogs) own the eventual terminal decision.
+            NS.emitRiskReport(true);
+          }
         } catch { /* ignore */ }
       }, 2500);
     }, { once: true });
@@ -1479,6 +2077,8 @@
     let visibilityTimer = null;
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState !== "visible") return;
+      try { NS.nudgeProvisionalDownloadSettlement("visibility-resume"); } catch { /* ignore */ }
+      try { NS.nudgeBrandElectionAfterHydration("visibility-resume"); } catch { /* ignore */ }
       if (state._analysisDone && !state.downloadGuardInstalled) return;
       if (state._perfBenign && !state.downloadGuardInstalled) return;
       if (visibilityTimer) clearTimeout(visibilityTimer);

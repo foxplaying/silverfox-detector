@@ -331,7 +331,8 @@
    * 解决抽号时序/空白写法/隐藏节点导致只亮「无ICP备案信息」的问题。
    *
    * 重要：若权威源已命中备案号（或 state.icpInfo 已是真号），绝不可再以
-   * remoteMissing=true / 空 remote 降级成「备案待核验 / 页脚宣称…」。
+   * remoteMissing=true 表示来源已明确返回未备案；查询失败必须显式传 false，
+   * 不能把“查不到结果”和“确认未备案”混成同一状态。
    */
   NS.finalizeIcpClaimSignals = function (remoteRecord, remoteMissing) {
     try {
@@ -364,12 +365,14 @@
         return null;
       }
       if (!declared.length) return null;
+      const confirmedMissing = remoteMissing === true;
       const check = typeof NS.reconcilePageIcpClaim === "function"
-        ? NS.reconcilePageIcpClaim("", remoteMissing !== false, declared)
+        ? NS.reconcilePageIcpClaim("", confirmedMissing, declared)
         : { declared, unverifiedClaim: true };
       if (typeof NS.clearMissingIcpSignal === "function") NS.clearMissingIcpSignal();
       state.pageDeclaredIcp = declared.join(" / ");
-      // 展示：占位→假冒；正常年份号→待核验；勿一律假冒宣称
+      // 明确未备案 + 页脚仍声明任何备案号 → 最终判为假冒；
+      // 只有查询失败、尚无明确结论时，正常格式号码才显示“待核验”。
       const ph = declared.some((d) =>
         typeof NS.looksLikePlaceholderIcpLicense === "function" && NS.looksLikePlaceholderIcpLicense(d)
       );
@@ -377,7 +380,7 @@
         const n = typeof NS.normalizeIcpLicense === "function" ? NS.normalizeIcpLicense(d) : String(d || "");
         return /[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼]ICP备20\d{2}\d{4,12}/i.test(n);
       });
-      if (ph) {
+      if (ph || confirmedMissing) {
         state.icpInfo = `假冒宣称 ${declared.join(" / ")}`;
         state._unverifiedPageIcpClaim = true;
       } else if (normal) {
@@ -409,7 +412,7 @@
       const hostAt = String(location.hostname || "");
       const hrefAt = String(location.href || "");
       const rec = remoteRecord || "";
-      const miss = remoteMissing !== false;
+      const miss = remoteMissing === true;
       [600, 1800, 4000].forEach((ms) => {
         const tid = setTimeout(() => {
           try {
@@ -438,8 +441,8 @@
                 const ph = fin.declared.some((d) =>
                   typeof NS.looksLikePlaceholderIcpLicense === "function" && NS.looksLikePlaceholderIcpLicense(d)
                 );
-                // 正常年份号用「待核验」，勿被 deferred 刷成假冒宣称
-                state.icpInfo = (ph || !normal)
+                // 已明确未备案时必须收口为假冒；只有查询失败才保留待核验。
+                state.icpInfo = (ph || !normal || miss)
                   ? `假冒宣称 ${fin.declared.join(" / ")}`
                   : `页脚宣称 ${fin.declared.join(" / ")}（第三方待核验）`;
               }
@@ -600,7 +603,7 @@
       }
     }
 
-    // 占位号 → 高置信假冒；正常年份主体号 + 仅第三方 missing → 低权「待核验」勿称假冒
+    // 占位号无需远程结论即可确认是假号。
     if (placeholders.length && typeof NS.addSignal === "function") {
       const declaredLabel = placeholders.join(" / ");
       NS.addSignal(
@@ -613,22 +616,31 @@
       return check;
     }
 
-    if (check.unverifiedClaim && check.declared.length && typeof NS.addSignal === "function") {
+    if (!check.remoteFound && check.declared.length && typeof NS.addSignal === "function") {
       const declaredLabel = check.declared.join(" / ");
       const looksNormal = check.declared.some((d) => {
         const n = typeof NS.normalizeIcpLicense === "function" ? NS.normalizeIcpLicense(d) : String(d || "");
         return /[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼]ICP备20\d{2}\d{4,12}/i.test(n);
       });
-      if (looksNormal) {
-        // 低权：第三方未命中，可能源滞后；展示用「待核验」而非「假冒宣称」
-        // 避免重复堆积同一待核验信号
+      if (check.remoteMissing) {
+        // 查询已完成并明确未备案：正常格式并不能证明号码属于当前域名，必须收口。
+        if (typeof NS.clearPendingIcpClaimSignals === "function") NS.clearPendingIcpClaimSignals();
+        NS.addSignal(
+          `假冒ICP备案信息：${declaredLabel}`,
+          NS.UNVERIFIED_PAGE_ICP_CLAIM_WEIGHT,
+          `页面页脚声明 ${declaredLabel}，备案查询已确认当前域名无对应记录`
+        );
+        state._unverifiedPageIcpClaim = true;
+        if (typeof NS.clearMissingIcpSignal === "function") NS.clearMissingIcpSignal();
+      } else if (looksNormal) {
+        // 查询失败/尚未结束：只保留低权待核验，不把网络失败误判成假备案。
         if (typeof NS.clearPendingIcpClaimSignals === "function") NS.clearPendingIcpClaimSignals();
         NS.addSignal(
           `备案待核验：${declaredLabel}`,
           8,
-          `页脚声明 ${declaredLabel}，第三方源暂未命中（非占位号；请以工信部为准）`
+          `页脚声明 ${declaredLabel}，第三方查询尚未取得明确结论（请以工信部为准）`
         );
-        state._unverifiedPageIcpClaim = false; // 不走高置信假备案拦截
+        state._unverifiedPageIcpClaim = false;
         if (typeof NS.clearMissingIcpSignal === "function") NS.clearMissingIcpSignal();
         if (typeof NS.clearFakeIcpClaimSignals === "function") NS.clearFakeIcpClaimSignals();
       } else {
@@ -856,12 +868,105 @@
     } catch { return false; }
   };
 
+  /** A fallback ICP rejected for lack of exact WHOIS must stay visible. */
+  NS.shouldPreserveForcedMissingIcp = function () {
+    try {
+      const state = NS.state || {};
+      if (state._icpForcedMissingByFallbackWhois !== true) return false;
+      const currentHost = typeof NS.normalizeHostForIntel === "function"
+        ? NS.normalizeHostForIntel(location.hostname)
+        : String(location.hostname || "").trim().toLowerCase().replace(/\.+$/g, "");
+      const forcedHost = typeof NS.normalizeHostForIntel === "function"
+        ? NS.normalizeHostForIntel(state._icpForcedMissingHost || "")
+        : String(state._icpForcedMissingHost || "").trim().toLowerCase().replace(/\.+$/g, "");
+      return !!currentHost && forcedHost === currentHost;
+    } catch { return false; }
+  };
+
+  /**
+   * 当前主机已绑定的组织证书。EV 也必须有实时叶证书/SNI 链/未过期且
+   * CN·SAN 命中之一，不能只凭 CT 列表里的 validation 与 O= 取得站点身份。
+   */
+  NS.hasBoundOrganizationValidatedSsl = function (infoOpt) {
+    try {
+      const info = infoOpt || (NS.state && NS.state.sslInfo) || null;
+      if (!info || !/^(?:OV|EV)$/i.test(String(info.validation || ""))) return false;
+      const org = String(info.organization || "").trim();
+      if (!org || /internet\s*widgits|some[-\s]?state|default\s+company/i.test(org)) return false;
+      const currentHost = String((typeof location !== "undefined" && location.hostname) || "")
+        .toLowerCase().replace(/^www\./, "").replace(/\.$/, "");
+      const infoHost = String(info.host || info.queriedHost || "")
+        .toLowerCase().replace(/^www\./, "").replace(/\.$/, "");
+      if (currentHost && infoHost !== currentHost) return false;
+      return info.sniChainVerified === true || info.liveTlsLeafVerified === true
+        || info.unexpiredHostVerified === true;
+    } catch { return false; }
+  };
+
+  /**
+   * 页面主品牌与注册域根的组织级关系证据。
+   * 允许 brand.com 与 brand+非营销名称.com（页面候选主动确认），拒绝
+   * brand-docs / brand-download / 单字符污染等仿冒常见形态；域名不生成品牌。
+   */
+  NS.pageBrandIdentityAlignsOrganizationApex = function (hostOpt) {
+    try {
+      const host = typeof NS.normalizeDomain === "function"
+        ? NS.normalizeDomain(hostOpt || location.hostname)
+        : String(hostOpt || location.hostname || "").toLowerCase().replace(/^www\./, "");
+      const apex = (typeof NS.getRegistrableDomain === "function" ? NS.getRegistrableDomain(host) : host) || host;
+      const apexRaw = String(apex.split(".")[0] || "").toLowerCase();
+      const apexFlat = apexRaw.replace(/[^a-z0-9]/g, "");
+      if (!apexFlat || /[-_]/.test(apexRaw)) return false;
+      if (typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
+        && NS.apexLabelLooksLikeMarketingPaddedBrand(apexRaw)) return false;
+
+      const slots = [
+        { primary: true, text: document.title || "" },
+        { primary: true, text: document.querySelector("h1")?.textContent || "" },
+        { primary: true, text: document.querySelector('meta[property="og:site_name"]')?.getAttribute("content") || "" },
+        { primary: true, text: document.querySelector('meta[name="application-name"]')?.getAttribute("content") || "" },
+        { primary: true, text: document.querySelector('meta[property="og:title"]')?.getAttribute("content") || "" },
+        { primary: false, text: document.querySelector(".logo, [class*='logo']")?.textContent || "" }
+      ].map((slot) => ({ ...slot, text: String(slot.text || "").trim() })).filter((slot) => slot.text);
+      if (!slots.length) return false;
+      const candidates = new Map();
+      slots.forEach((slot) => (slot.text.match(/[A-Za-z][A-Za-z0-9]{3,23}/g) || []).forEach((raw) => {
+        const token = raw.toLowerCase().replace(/[^a-z0-9]/g, "");
+        if (token.length < 4 || token.length > 20) return;
+        if (NS.BRAND_TOKEN_STOP_RE && NS.BRAND_TOKEN_STOP_RE.test(token)) return;
+        if (typeof NS.looksLikeAssetGarbageToken === "function" && NS.looksLikeAssetGarbageToken(token)) return;
+        const prev = candidates.get(token) || { sources: 0, primary: 0, lead: 0 };
+        prev.sources += 1;
+        if (slot.primary) prev.primary += 1;
+        const at = slot.text.toLowerCase().indexOf(raw.toLowerCase());
+        if (slot.primary && at >= 0 && at <= 24) prev.lead += 1;
+        candidates.set(token, prev);
+      }));
+      const structural = /^(?:docs?|documentation|help|support|manual|soft|safe|downloads?|client|setup|install(?:er)?|official|free|apps?|desktop|services?|pc|win|vip|pro)$/i;
+      return Array.from(candidates.entries()).some(([brand, evidence]) => {
+        // 页面强候选：至少处于一个主身份槽的前部，或由两个独立身份槽复现。
+        if (!(evidence.lead >= 1 || (evidence.primary >= 2 && evidence.sources >= 2))) return false;
+        if (brand === apexFlat) return true;
+        let affix = "";
+        if (apexFlat.startsWith(brand)) affix = apexFlat.slice(brand.length);
+        else if (apexFlat.endsWith(brand)) affix = apexFlat.slice(0, apexFlat.length - brand.length);
+        else return false;
+        if (affix.length < 3 || affix.length > 14 || structural.test(affix)) return false;
+        if (typeof NS.isMarketingHostPrefixToken === "function"
+          && NS.isMarketingHostPrefixToken(affix, { strict: true })) return false;
+        return /^[a-z][a-z0-9]+$/i.test(affix)
+          && apexFlat.length <= Math.max(brand.length + 6, brand.length * 3);
+      });
+    } catch { return false; }
+  };
+
   /** 写入报告用的 ICP 文案：取得可展示的组织字段时才隐藏「未查询到备案信息」 */
   NS.formatIcpInfoForReport = function (icpRaw) {
     try {
       const s = String(icpRaw != null ? icpRaw : (NS.state && NS.state.icpInfo) || "").trim();
       if (!s) return "";
-      if (/未查询到|查询失败|暂无/.test(s) && NS.hasOrganizationValidatedSsl()) return "";
+      if (/未查询到|查询失败|暂无/.test(s) && NS.hasOrganizationValidatedSsl()
+        && !NS.shouldPreserveForcedMissingIcp()) return "";
       return s;
     } catch {
       return String(icpRaw || "");
@@ -874,6 +979,55 @@
     if (u === "OV") return 2;
     if (u === "DV") return 1;
     return 0;
+  }
+
+  const SSL_IDENTITY_WATCHDOG_MS = 26000;
+
+  /**
+   * TLS is one input of the provisional download-route controller.  Wake that
+   * controller on every terminal TLS path instead of making it wait for its
+   * 250ms polling timer (which Edge may heavily throttle in a background tab).
+   */
+  function announceSslIdentitySettlement(reason) {
+    try {
+      if (typeof NS.recoverIdentityVerificationAvailability === "function") {
+        NS.recoverIdentityVerificationAvailability(reason || "ssl-identity-settled");
+      }
+    } catch { /* ignore */ }
+    try {
+      if (typeof NS.nudgeProvisionalDownloadSettlement === "function") {
+        NS.nudgeProvisionalDownloadSettlement(reason || "ssl-identity-settled");
+      }
+    } catch { /* ignore */ }
+    try {
+      const currentUrl = String(location.href || "");
+      const intelReady = NS.state && NS.state._icpQuerySettled === true
+        && NS.caches && NS.caches.intelDoneForUrl === currentUrl;
+      if (intelReady && typeof NS.markAnalysisComplete === "function") {
+        // This also lets the explicit unavailable terminal replace a popup's
+        // previous waiting snapshot when a normal (non-/download) tab was
+        // frozen until the TLS watchdog fired.
+        NS.markAnalysisComplete(reason || "ssl-identity-settled");
+      } else if (typeof NS.emitRiskReport === "function") {
+        NS.emitRiskReport(true);
+      }
+    } catch { /* ignore */ }
+  }
+
+  function settleImmediateSslIdentity(reason, observed) {
+    try {
+      const state = NS.state;
+      // An immediate terminal path supersedes any older in-flight callback for
+      // the same URL.  Rotate the token as well as the timestamp so that a
+      // cached/non-HTTPS decision cannot later be overwritten by that callback.
+      state._sslIdentityRequestToken = Number(state._sslIdentityRequestToken || 0) + 1;
+      state._sslIdentityUrl = String(location.href || "");
+      state._sslIdentityStartedAt = Date.now();
+      state._sslIdentityObserved = observed === true;
+      state._sslIdentitySettled = true;
+      state._sslIdentityTimedOut = false;
+    } catch { /* still wake the provisional controller below */ }
+    announceSslIdentitySettlement(reason);
   }
 
   /** 已废弃：不再提前写 DV 占位（探测完成前不展示 SSL） */
@@ -949,6 +1103,7 @@
         // background 的单次 resolve 已跑完当前源集合；DV 也是本轮最终响应。
         // 后台仍可异步升级 OV/EV，届时 apply 会再次触发权威身份闭环。
         NS.state._sslIdentitySettled = true;
+        NS.state._sslIdentityTimedOut = false;
       } catch { /* ignore */ }
       // mature profile 的旧缓存可能是在 DV/无证书阶段生成；证书升级后必须立即失效。
       try {
@@ -959,7 +1114,7 @@
         }
       } catch { /* ignore */ }
       // OV/EV 时清掉「未查询到备案」展示与软信号
-      if (NS.hasOrganizationValidatedSsl()) {
+      if (NS.hasOrganizationValidatedSsl() && !NS.shouldPreserveForcedMissingIcp()) {
         if (/未查询到|查询失败|暂无/.test(String(NS.state.icpInfo || ""))) {
           NS.state.icpInfo = "";
         }
@@ -989,6 +1144,7 @@
           NS.markAnalysisComplete("ssl-identity-settled");
         }
       } catch { /* ignore */ }
+      announceSslIdentitySettlement("ssl-info-applied");
       try { NS.emitRiskReport(true); } catch { /* ignore */ }
       return true;
     } catch { return false; }
@@ -997,12 +1153,13 @@
   /** 向 background 拉取当前主机证书分类（CT + Subject 解析）；完成前不展示 SSL */
   NS.requestSslCertInfo = function (force) {
     try {
-      if (!chrome?.runtime?.id) return;
+      if (!chrome?.runtime?.id) {
+        settleImmediateSslIdentity("ssl-runtime-unavailable", false);
+        return;
+      }
       if (!/^https:/i.test(String(location.protocol || ""))) {
         NS.state.sslInfo = null;
-        NS.state._sslIdentityUrl = String(location.href || "");
-        NS.state._sslIdentityObserved = true;
-        NS.state._sslIdentitySettled = true;
+        settleImmediateSslIdentity("ssl-non-https", true);
         return;
       }
       // 保留 www：www.gov.cn 叶子是 *.www.gov.cn，剥掉 www 会整链 miss → 假 DV
@@ -1011,9 +1168,7 @@
       if (!force && NS.hasOrganizationValidatedSsl && NS.hasOrganizationValidatedSsl()) {
         const org = String((NS.state.sslInfo && NS.state.sslInfo.organization) || "").trim();
         if (org) {
-          NS.state._sslIdentityUrl = String(location.href || "");
-          NS.state._sslIdentityObserved = true;
-          NS.state._sslIdentitySettled = true;
+          settleImmediateSslIdentity("ssl-cache-organization", true);
           try { NS.emitRiskReport(true); } catch { /* ignore */ }
           return;
         }
@@ -1024,65 +1179,125 @@
         const src = String(NS.state.sslInfo.source || "");
         const org = String(NS.state.sslInfo.organization || "").trim();
         if (v === "EV" && org && src !== "page-https" && src !== "https-reachability") {
-          NS.state._sslIdentityUrl = String(location.href || "");
-          NS.state._sslIdentityObserved = true;
-          NS.state._sslIdentitySettled = true;
+          settleImmediateSslIdentity("ssl-cache-ev", true);
           return;
         }
         // OV 有机构名：短时内跳过；无机构名必须继续探
         if (v === "OV" && org && !force && NS.state.sslInfo.at
           && Date.now() - Number(NS.state.sslInfo.at) < 1500) {
-          NS.state._sslIdentityUrl = String(location.href || "");
-          NS.state._sslIdentityObserved = true;
-          NS.state._sslIdentitySettled = true;
+          settleImmediateSslIdentity("ssl-cache-ov", true);
           return;
         }
         // DV 短时内仍允许 force 升级；非 force 时 1.5s 内不重复刷
         if (v === "DV" && src !== "https-assumed" && src !== "page-https"
           && src !== "https-reachability" && !force && NS.state.sslInfo.at
           && Date.now() - Number(NS.state.sslInfo.at) < 1500) {
-          NS.state._sslIdentityUrl = String(location.href || "");
-          NS.state._sslIdentityObserved = true;
-          NS.state._sslIdentitySettled = true;
+          settleImmediateSslIdentity("ssl-cache-dv", true);
           return;
         }
       }
       const requestUrl = String(location.href || "");
       const requestStartedAt = Date.now();
+      const requestToken = Number(NS.state._sslIdentityRequestToken || 0) + 1;
+      NS.state._sslIdentityRequestToken = requestToken;
       NS.state._sslIdentityUrl = requestUrl;
       NS.state._sslIdentityStartedAt = requestStartedAt;
       NS.state._sslIdentityObserved = false;
       NS.state._sslIdentitySettled = false;
-      chrome.runtime.sendMessage({
-        type: "get-ssl-cert",
-        host,
-        force: !!force,
-        https: true
-      }, (resp) => {
-        const err = chrome.runtime.lastError;
+      NS.state._sslIdentityTimedOut = false;
+
+      let watchdogTimer = null;
+      let settlementAnnounced = false;
+      const watchdogDeadline = requestStartedAt + SSL_IDENTITY_WATCHDOG_MS;
+      const isCurrentRequest = () => {
         try {
-          // soft-nav 或后发强制补查已开始：旧响应不得结算新 URL/新一轮。
-          if (String(location.href || "") !== requestUrl
-            || String(NS.state._sslIdentityUrl || "") !== requestUrl
-            || Number(NS.state._sslIdentityStartedAt || 0) > requestStartedAt) return;
-          if (resp && resp.success && resp.sslInfo) {
-            NS.applySslCertInfo(resp.sslInfo, !!force);
-          } else {
-            // runtimeError / API 失败同样是“本轮 TLS 已结束”，不能让所有
-            // DV 或离线页面永久卡在品牌身份待定。
-            void err;
-            NS.state._sslIdentityObserved = false;
-            NS.state._sslIdentitySettled = true;
-            try {
-              if (NS.state._analysisCompletionDeferredForBrand
-                && typeof NS.markAnalysisComplete === "function") {
-                NS.markAnalysisComplete("ssl-identity-query-settled");
-              }
-            } catch { /* ignore */ }
+          return String(location.href || "") === requestUrl
+            && String(NS.state._sslIdentityUrl || "") === requestUrl
+            && Number(NS.state._sslIdentityStartedAt || 0) === requestStartedAt
+            && Number(NS.state._sslIdentityRequestToken || 0) === requestToken;
+        } catch { return false; }
+      };
+      const settleCurrentRequest = (reason, observed, timedOut) => {
+        if (!isCurrentRequest()) return false;
+        NS.state._sslIdentityObserved = observed === true;
+        NS.state._sslIdentitySettled = true;
+        NS.state._sslIdentityTimedOut = timedOut === true;
+        if (timedOut === true) {
+          NS.state._identityVerificationUnavailable = true;
+          NS.state._identityVerificationUnavailableUrl = requestUrl;
+        }
+        if (!settlementAnnounced) {
+          settlementAnnounced = true;
+          announceSslIdentitySettlement(reason || "ssl-identity-query-settled");
+        }
+        return true;
+      };
+      const clearWatchdog = () => {
+        if (!watchdogTimer) return;
+        try { clearTimeout(watchdogTimer); } catch { /* ignore */ }
+        watchdogTimer = null;
+      };
+      const watchdog = () => {
+        if (!isCurrentRequest()) { clearWatchdog(); return; }
+        const remaining = watchdogDeadline - Date.now();
+        if (remaining > 0) {
+          watchdogTimer = setTimeout(watchdog, remaining);
+          return;
+        }
+        clearWatchdog();
+        NS.silverfoxLog && NS.silverfoxLog("intel-ssl", "content-watchdog", host, requestUrl);
+        // The background probe may still deliver a stronger late result.  This
+        // only ends the waiting state; it does not fabricate a certificate.
+        settleCurrentRequest("ssl-identity-watchdog", !!NS.state.sslInfo, true);
+      };
+      watchdogTimer = setTimeout(watchdog, SSL_IDENTITY_WATCHDOG_MS);
+
+      try {
+        chrome.runtime.sendMessage({
+          type: "get-ssl-cert",
+          host,
+          force: !!force,
+          https: true
+        }, (resp) => {
+          const err = chrome.runtime.lastError;
+          let observed = false;
+          try {
+            // soft-nav 或后发强制补查已开始：旧响应不得结算新 URL/新一轮。
+            if (!isCurrentRequest()) return;
+            if (resp && resp.success && resp.sslInfo) {
+              // Only a real certificate response supersedes the watchdog's
+              // settled-unknown state. A late failure is still unavailable.
+              NS.state._sslIdentityTimedOut = false;
+              const applied = NS.applySslCertInfo(resp.sslInfo, !!force) === true;
+              // A weaker/stale-grade result may be deliberately rejected while
+              // a stronger certificate already exists.  The request still
+              // reached a terminal response and must settle.
+              observed = applied || !!NS.state.sslInfo;
+            } else {
+              // runtimeError / API 失败同样是“本轮 TLS 已结束”，不能让所有
+              // DV 或离线页面永久卡在品牌身份待定。
+              void err;
+              observed = !!NS.state.sslInfo;
+            }
+          } catch { observed = !!NS.state.sslInfo; }
+          finally {
+            clearWatchdog();
+            settleCurrentRequest(
+              resp && resp.success && resp.sslInfo
+                ? "ssl-identity-query-response"
+                : "ssl-identity-query-failed",
+              observed,
+              !(resp && resp.success && resp.sslInfo)
+            );
           }
-        } catch { /* ignore */ }
-      });
-    } catch { /* ignore */ }
+        });
+      } catch {
+        clearWatchdog();
+        settleCurrentRequest("ssl-identity-send-failed", !!NS.state.sslInfo, true);
+      }
+    } catch {
+      settleImmediateSslIdentity("ssl-identity-request-error", !!(NS.state && NS.state.sslInfo));
+    }
   };
 
   /** 纯 WHOIS 年龄 ≥10 年（百度/pcsoft 等）——不因套件标志失效 */
@@ -1576,6 +1791,12 @@
     try {
       const state = NS.state;
       if (!state) return 0;
+      try {
+        if (state._brandSpoofFinalSnapshot
+          && typeof NS.invalidateBrandSpoofNoticeSnapshot === "function") {
+          NS.invalidateBrandSpoofNoticeSnapshot(state._brandSpoofFinalSnapshot, reason || "trusted-identity");
+        }
+      } catch { /* ignore */ }
       const generation = Number(state._brandSpoofDecisionGeneration || 0) + 1;
       state._brandSpoofDecisionGeneration = generation;
       state._brandSpoofDecisionUrl = String(location.href || "");
@@ -1583,6 +1804,7 @@
       state._brandSpoofPresentationDeferred = false;
       state._brandSpoofFinalizeScheduled = false;
       state._brandSpoofFinalPresented = false;
+      state._brandSpoofFinalSnapshot = null;
       state._brandSpoofLatinOnly = false;
       state._brandSpoofLatinUpgradeAttempts = 0;
       state._spoofPinyinUpgradeScheduled = false;
@@ -1602,6 +1824,7 @@
       state._brandSpoofNoticeKey = "";
       state._lastGuardNoticeKind = "";
       state._lastGuardNoticeKey = "";
+      state._lastGuardNoticeVersion = "";
       NS.silverfoxLog && NS.silverfoxLog(
         "brand-decision-cancel", String(reason || "trusted-identity"), "generation=", generation
       );
@@ -1618,6 +1841,8 @@
   NS.forceLiftSoftProtectionForTrustedPortal = function (reason) {
     try {
       const state = NS.state;
+      const preserveNoIcp = typeof NS.shouldPreserveForcedMissingIcp === "function"
+        && NS.shouldPreserveForcedMissingIcp();
       if (typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat()) return false;
       const profile = typeof NS.evaluateMatureLegitimateSiteProfile === "function"
         ? NS.evaluateMatureLegitimateSiteProfile() : null;
@@ -1654,6 +1879,7 @@
       try {
         state.details = (state.details || []).filter((d) => {
           if (!d) return false;
+          if (preserveNoIcp && d.name === "无ICP备案信息") return true;
           if (/已启用安装包下载拦截|已启用仿冒站|已启用异常跳转|非用户手势|可疑安装包|页面嵌入可疑|探测到下载|仿冒品牌官网|主动探测仿冒|主动探测：|无ICP备案|跨域跳转|自动跳转|自动下载|与标题品牌|疑似仿冒官网/i.test(d.name || "")
             || /主动探测仿冒|与标题品牌|疑似仿冒官网/i.test(d.reason || "")) return false;
           return true;
@@ -1744,7 +1970,9 @@
         type: "set-tab-download-trust",
         enabled: !!enabled,
         url: location.href,
-        reason: String(reason || "")
+        reason: String(reason || ""),
+        analysisTxn: NS.state._analysisTxn || "",
+        analysisTxnStartedAt: Number(NS.state._analysisTxnStartedAt) || Date.now()
       }, () => { void chrome.runtime.lastError; });
     } catch { /* ignore */ }
   };
@@ -1758,7 +1986,9 @@
   NS.clearBrandSpoofFalsePositive = function (reason, opts) {
     const state = NS.state;
     const liftReason = String(reason || "clear-brand-spoof");
-    const preserveNoIcp = !!(opts && opts.preserveNoIcp);
+    const preserveNoIcp = !!(opts && opts.preserveNoIcp)
+      || (typeof NS.shouldPreserveForcedMissingIcp === "function"
+        && NS.shouldPreserveForcedMissingIcp());
     // 真硬套件（不含纯软 brand-spoof 标志）
     const authoritativeIdentity = typeof NS.hasAuthoritativeMatureOrganizationIdentity === "function"
       && NS.hasAuthoritativeMatureOrganizationIdentity();
@@ -1810,7 +2040,13 @@
         NS.clearDownloadGuard(liftReason);
       } else {
         try {
-          chrome.runtime.sendMessage({ type: "clear-threat-notice", url: location.href, reason: liftReason }, () => { void chrome.runtime.lastError; });
+          chrome.runtime.sendMessage({
+            type: "clear-threat-notice",
+            url: location.href,
+            reason: liftReason,
+            analysisTxn: state._analysisTxn || "",
+            analysisTxnStartedAt: Number(state._analysisTxnStartedAt) || Date.now()
+          }, () => { void chrome.runtime.lastError; });
         } catch { /* ignore */ }
         try { NS.reEnableAllThreatDisabledElements(); } catch { /* ignore */ }
       }
@@ -1860,8 +2096,12 @@
   NS.evaluateMatureLegitimateSiteProfile = function () {
     const empty = {
       trusted: false, matureWhois: false, cleanPage: false, regularPage: false,
-      icp: false, orgSsl: false, cleanHostHint: false, brandShapeWarning: false,
-      cdnHeavyRegular: false, sameApexAssets: 0, externalCdnAssets: 0,
+      icp: false, orgSsl: false, boundOrgSsl: false, cleanHostHint: false, brandShapeWarning: false,
+      officialProductSubdomain: false, pageApexBrandIdentity: false,
+      organizationBackedBrandPortal: false,
+      cdnHeavyOrganizationRegular: false,
+      cdnHeavyRegular: false, cdnHeavyIcpRegular: false,
+      sameApexAssets: 0, externalCdnAssets: 0,
       regularScore: 0, ageDays: null
     };
     try {
@@ -1873,6 +2113,23 @@
         state._desktopForceDlKit, state._remoteGarbleDlDetected, state._indexNowPhishTemplate,
         state._unverifiedIcpIdentityThreat
       ].map((x) => x ? 1 : 0).join("");
+      const ssl = state.sslInfo || {};
+      const sslKey = [
+        String(ssl.validation || "").toUpperCase(),
+        String(ssl.organization || "").trim(),
+        ssl.sniChainVerified === true ? 1 : 0,
+        ssl.liveTlsLeafVerified === true ? 1 : 0,
+        ssl.unexpiredHostVerified === true ? 1 : 0
+      ].join(":");
+      const c = NS.caches || {};
+      const now = Date.now();
+      // 页面级画像会被下载按钮判定反复调用。先用不触碰大 DOM 的状态键命中短缓存，
+      // 避免每个按钮都重新读取 body.innerText 和最多 600 个资源节点。
+      const quickCacheKey = `${location.href}|${days}|${icp ? 1 : 0}|${state.icpMatchedHost || ""}|${sslKey}|${flagsKey}|${document.readyState}`;
+      if (c._matureLegitProfile && c._matureLegitProfileQuickKey === quickCacheKey
+        && now - Number(c._matureLegitProfileAt || 0) < 800) {
+        return c._matureLegitProfile;
+      }
       const bodyText = String((document.body && (document.body.innerText || document.body.textContent)) || "")
         .replace(/\s+/g, " ").trim();
       const assetNodes = (() => {
@@ -1896,17 +2153,7 @@
           ).length;
         } catch { return 0; }
       })();
-      const ssl = state.sslInfo || {};
-      const sslKey = [
-        String(ssl.validation || "").toUpperCase(),
-        String(ssl.organization || "").trim(),
-        ssl.sniChainVerified === true ? 1 : 0,
-        ssl.liveTlsLeafVerified === true ? 1 : 0,
-        ssl.unexpiredHostVerified === true ? 1 : 0
-      ].join(":");
       const cacheKey = `${location.href}|${days}|${icp ? 1 : 0}|${state.icpMatchedHost || ""}|${sslKey}|${flagsKey}|${document.readyState}|${Math.floor(bodyText.length / 100)}|${assetNodes.length}:${siteShellCount}:${identityNodeCount}`;
-      const c = NS.caches || {};
-      const now = Date.now();
       if (c._matureLegitProfile && c._matureLegitProfileKey === cacheKey
         && now - Number(c._matureLegitProfileAt || 0) < 800) {
         return c._matureLegitProfile;
@@ -1916,6 +2163,8 @@
       const matureWhois = days != null && days >= 1825;
       const orgSsl = typeof NS.hasOrganizationValidatedSsl === "function"
         && NS.hasOrganizationValidatedSsl();
+      const boundOrgSsl = typeof NS.hasBoundOrganizationValidatedSsl === "function"
+        && NS.hasBoundOrganizationValidatedSsl(ssl);
       const cleanHostHint = typeof NS.looksLikeCleanOfficialBrandHost === "function"
         && NS.looksLikeCleanOfficialBrandHost();
       const brandShapeWarning = typeof NS.hostNeedsAuthoritativeBrandIdentity === "function"
@@ -2029,26 +2278,55 @@
       // 大型组织官网常把所有 JS/CSS/图片放在独立 CDN，既没有 same-apex
       // 静态资源，也可能不给 canonical。此处以完整站点骨架 + 多个稳定外部
       // 资源替代该硬门，但仅限 WHOIS/ICP/OV·EV 已同时核验的页面。
-      const cdnHeavyRegular = !!(matureWhois && icp && orgSsl
+      // 权威同站 ICP 本身就是组织身份来源。对全部静态资源都放在独立 CDN、证书仅 DV 的
+      // 大型国内站，不应再强制要求 OV/EV；仍须同时满足成熟 WHOIS、干净页面和完整站点结构。
+      const cdnHeavyIcpRegular = !!(matureWhois && icp
         && bodyText.length >= 350
         && externalCdnAssets >= 4
         && externalAssetApexes.size >= 1
         && (completeSiteChrome || (hasSiteChrome && legalIdentity))
         && (legalIdentity || structuredSite || bodyText.length >= 1500)
-        && regularScore >= 6);
+        && regularScore >= 7);
+      const cdnHeavyRegular = !!(matureWhois && icp && ((orgSsl
+        && bodyText.length >= 350
+        && externalCdnAssets >= 4
+        && externalAssetApexes.size >= 1
+        && (completeSiteChrome || (hasSiteChrome && legalIdentity))
+        && (legalIdentity || structuredSite || bodyText.length >= 1500)
+        && regularScore >= 6) || cdnHeavyIcpRegular));
       const regularPage = selfConsistent || cdnHeavyRegular || (
         bodyText.length >= 180
         && (sameApexAssets >= 2 || canonicalIdentity)
         && regularScore >= 4
       );
+      const officialProductSubdomain = typeof NS.hostLooksLikeOfficialProductSubdomain === "function"
+        && NS.hostLooksLikeOfficialProductSubdomain(location.hostname);
+      const pageApexBrandIdentity = typeof NS.pageBrandIdentityAlignsOrganizationApex === "function"
+        && NS.pageBrandIdentityAlignsOrganizationApex(location.hostname);
+      const cdnHeavyOrganizationRegular = !!(bodyText.length >= 350
+        && externalCdnAssets >= 4 && externalAssetApexes.size >= 1
+        && completeSiteChrome && legalIdentity
+        && (structuredSite || bodyText.length >= 1500)
+        && regularScore >= 6);
+      // 无 ICP 的境外组织站只能走严格特例：WHOIS≥10 年 + 由 SNI 链、实时
+      // 叶证书或未过期匹配证书绑定当前 host 的 OV/EV + 正规/CDN-heavy 结构
+      // + 产品子域 + 页面强品牌↔apex。
+      // 普通成熟域或任一单项均不能进入该闭环。
+      const organizationBackedBrandPortal = !!(days != null && days >= 3650
+        && cleanPage && boundOrgSsl && (regularPage || cdnHeavyOrganizationRegular)
+        && officialProductSubdomain && pageApexBrandIdentity);
       const out = {
-        trusted: !!(matureWhois && cleanPage && regularPage),
-        matureWhois, cleanPage, regularPage, icp, orgSsl, cleanHostHint,
-        brandShapeWarning, cdnHeavyRegular, sameApexAssets, externalCdnAssets,
+        trusted: !!(matureWhois && cleanPage && (regularPage || organizationBackedBrandPortal)),
+        matureWhois, cleanPage, regularPage, icp, orgSsl, boundOrgSsl, cleanHostHint,
+        officialProductSubdomain, pageApexBrandIdentity,
+        organizationBackedBrandPortal, cdnHeavyOrganizationRegular,
+        brandShapeWarning, cdnHeavyRegular, cdnHeavyIcpRegular,
+        sameApexAssets, externalCdnAssets,
         regularScore, ageDays: days
       };
       c._matureLegitProfile = out;
       c._matureLegitProfileKey = cacheKey;
+      c._matureLegitProfileQuickKey = quickCacheKey;
       c._matureLegitProfileAt = now;
       return out;
     } catch {
@@ -2080,8 +2358,10 @@
       const officialProductSubdomain = typeof NS.hostLooksLikeOfficialProductSubdomain === "function"
         && NS.hostLooksLikeOfficialProductSubdomain(location.hostname);
       const verified = !!(!realHard && !state._unverifiedIcpIdentityThreat
-        && p.matureWhois && p.icp && p.orgSsl
-        && (p.regularPage || officialProductSubdomain));
+        && p.matureWhois && (
+          (p.icp && p.orgSsl && (p.regularPage || officialProductSubdomain))
+          || p.organizationBackedBrandPortal === true
+        ));
       if (verified) {
         state._trustedBrandIdentityUrl = identityUrl;
         state._trustedBrandIdentityAt = Date.now();
@@ -2090,8 +2370,35 @@
     } catch { return false; }
   };
 
+  /**
+   * 年轻且未核验注册域：无有效 ICP，且 WHOIS 未回或年龄 < 365 天。
+   * 此类站不得走「关键词强对齐 / exact 正站」捷径——必须过仿冒与下载壳检测。
+   * （成熟门本身要 WHOIS≥5 年；本函数补上「不成熟就禁止放行捷径」。）
+   */
+  NS.isYoungUnverifiedRegistration = function () {
+    try {
+      if (typeof NS.hasValidIcpRecord === "function" && NS.hasValidIcpRecord()) return false;
+      const days = typeof NS.getWhoisAgeDays === "function" ? NS.getWhoisAgeDays() : null;
+      // WHOIS 未结算前也视为未核验（避免情报前被强对齐洗白）
+      if (days == null) {
+        try {
+          if (NS.state && NS.state._icpQuerySettled !== true && !NS.state.whoisInfo) return true;
+        } catch { /* fall through */ }
+        // 已查 WHOIS 但无年龄 / 失败：仍按年轻未核验（有备案的上面已 return false）
+        return true;
+      }
+      return days < 365;
+    } catch {
+      return true;
+    }
+  };
+
   NS.looksLikeMatureOfficialPortal = function () {
     try {
+      // 年轻无备案：绝不当成熟门户
+      if (typeof NS.isYoungUnverifiedRegistration === "function" && NS.isYoungUnverifiedRegistration()) {
+        return false;
+      }
       const profile = NS.evaluateMatureLegitimateSiteProfile();
       return !!(profile && (profile.trusted
         || (typeof NS.hasAuthoritativeMatureOrganizationIdentity === "function"
@@ -2102,6 +2409,9 @@
   /** 真实长生命周期门户硬安全门：永不 arm guard / 灰按钮 / 视自动包导航为威胁。 */
   NS.shouldNeverArmProtection = function () {
     try {
+      if (typeof NS.isYoungUnverifiedRegistration === "function" && NS.isYoungUnverifiedRegistration()) {
+        return false;
+      }
       const state = NS.state;
       const profile = NS.evaluateMatureLegitimateSiteProfile();
       const authoritativeIdentity = typeof NS.hasAuthoritativeMatureOrganizationIdentity === "function"
@@ -2310,6 +2620,9 @@
 
   NS.looksLikeSelfConsistentOfficialSite = function () {
     try {
+      // 年轻夹带域的精美下载壳（JSON-LD + 顶栏底栏）不能自证为正站
+      if (typeof NS.shouldRejectOfficialDownloadShortcut === "function"
+        && NS.shouldRejectOfficialDownloadShortcut()) return false;
       const pageApex = NS.guessApexDomain(location.hostname);
       if (!pageApex) return false;
       const htmlSlice = NS.getThreatScanHtml(140000);
@@ -2347,6 +2660,8 @@
 
   NS.looksLikeOfficialBrandDownloadPage = function (html) {
     try {
+      if (typeof NS.shouldRejectOfficialDownloadShortcut === "function"
+        && NS.shouldRejectOfficialDownloadShortcut()) return false;
       if (typeof NS.hostNeedsAuthoritativeBrandIdentity === "function"
         && NS.hostNeedsAuthoritativeBrandIdentity()) return false;
       const full = html ? String(html).slice(0, 120000) : NS.getHtmlSlice(100000);
@@ -2377,6 +2692,8 @@
   };
 
   NS.looksLikeOfficialClientDownloadPage = function () {
+    if (typeof NS.shouldRejectOfficialDownloadShortcut === "function"
+      && NS.shouldRejectOfficialDownloadShortcut()) return false;
     if (typeof NS.hostNeedsAuthoritativeBrandIdentity === "function"
       && NS.hostNeedsAuthoritativeBrandIdentity()) return false;
     const title = (document.title || "").trim();
@@ -2445,6 +2762,40 @@
   };
 
   /**
+   * 只用于 document_start 的性能静默，不代表官网或可信身份。
+   * 该判断不得读取页面品牌，也不得调用 hostNeedsAuthoritativeBrandIdentity；
+   * 否则冷启动时页面身份尚未出现，会重新掉回重型 DOM 扫描。
+   */
+  NS.looksLikeProvisionalDownloadPathShape = function () {
+    try {
+      if (!/^https?:$/i.test(String(location.protocol || ""))) return false;
+      const path = String(location.pathname || "").toLowerCase();
+      if (!/\/(?:download|downloads|client|install)(?:\/|$|\.)/i.test(path)
+        && !/\/(?:pc|desktop|mobile)\/(?:download|client)(?:\/|$|\.)/i.test(path)) {
+        return false;
+      }
+      const host = String(location.hostname || "").toLowerCase().replace(/\.$/, "").replace(/^www\./, "");
+      if (!host || !host.includes(".") || /^(?:localhost|\d{1,3}(?:\.\d{1,3}){3})$/i.test(host) || host.includes(":")) return false;
+      const apex = typeof NS.getRegistrableDomain === "function"
+        ? (NS.getRegistrableDomain(host) || host) : host;
+      const left = (String(apex || "").split(".")[0] || "").toLowerCase();
+      if (/^(?:com|net|org|gov|edu|ac|mil)\.(?:cn|uk|jp|kr|au|nz)$/i.test(String(apex || ""))) return false;
+      if (!/^[a-z][a-z0-9]{2,17}$/i.test(left) || /\d{2,}/.test(left) || /^xn--/i.test(left)) return false;
+      if (typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
+        && NS.apexLabelLooksLikeMarketingPaddedBrand(left)) return false;
+      if (typeof NS.parseHostChineseProductCategoryPad === "function"
+        && NS.parseHostChineseProductCategoryPad(left)) return false;
+      if (host !== apex && host.endsWith(`.${apex}`)) {
+        const subs = host.slice(0, -(apex.length + 1)).split(".").filter(Boolean);
+        if (subs.some((sub) => /^(?:win|pc|download|down|dl|soft|vip|free|get|safe|official|cdn|static)$/i.test(sub))) return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
    * 廉价判断：干净品牌根 + /download|/client 路径（dingtalk.com/download）。
    * 不扫大 HTML，供 boot/scan 门控，避免正站下载中心卡死。
    */
@@ -2463,10 +2814,84 @@
     }
   };
 
+  /**
+   * 下载 CTA 是否大面积指向搜索引擎首页/落地（仿冒 download.html 典型）。
+   * 正站捷径与 lift 门控共用，避免「长得像官网」洗白。
+   */
+  NS.pageDownloadCtasMostlySearchEngineTraps = function () {
+    try {
+      const trapFn = typeof NS.looksLikeSearchEngineTrapUrl === "function"
+        ? NS.looksLikeSearchEngineTrapUrl
+        : (typeof NS.looksLikeSearchEngineLandingUrl === "function"
+          ? NS.looksLikeSearchEngineLandingUrl
+          : null);
+      if (!trapFn) return false;
+      const nodes = document.querySelectorAll(
+        "a.js-download[href], a[data-dl][href], a.btn-download[href], a.download-btn[href], "
+        + "a.btn-blue[href], a.btn[href], a[class*='download'][href]"
+      );
+      let dl = 0;
+      let trap = 0;
+      const lim = Math.min(nodes.length, 40);
+      for (let i = 0; i < lim; i++) {
+        const el = nodes[i];
+        const href = (el.getAttribute("href") || "").trim();
+        if (!href || href === "#" || /^javascript:/i.test(href)) continue;
+        const text = (el.textContent || "").replace(/\s+/g, " ").trim();
+        const cls = String(el.className || "");
+        const isDl = /js-download|data-dl|download-btn|btn-download/i.test(`${cls} ${el.getAttribute("data-dl") || ""}`)
+          || /立即下载|免费下载|官方下载|客户端下载|下载\s*(?:Windows|macOS|Mac|Linux|Android|iOS|Win)/i.test(text)
+          || (/下载/.test(text) && text.length <= 28 && /btn|download/i.test(cls));
+        if (!isDl) continue;
+        dl++;
+        try {
+          if (trapFn.call(NS, href)) trap++;
+        } catch { /* ignore */ }
+      }
+      // ≥2 个下载 CTA 且全部/几乎全部指向搜索引擎
+      return dl >= 2 && trap >= 2 && trap >= Math.ceil(dl * 0.75);
+    } catch {
+      return false;
+    }
+  };
+
+  /** 下载页「正站」捷径的否决：年轻无备案 / 营销夹带 apex / 品牌错配 / 搜索引擎假下载 */
+  NS.shouldRejectOfficialDownloadShortcut = function () {
+    try {
+      if (typeof NS.isYoungUnverifiedRegistration === "function"
+        && NS.isYoungUnverifiedRegistration()) return true;
+      if (typeof NS.hostNeedsAuthoritativeBrandIdentity === "function"
+        && NS.hostNeedsAuthoritativeBrandIdentity()) return true;
+      if (typeof NS.hostLooksLikeBrandMarketingSpoof === "function"
+        && NS.hostLooksLikeBrandMarketingSpoof()) return true;
+      try {
+        const ap = typeof NS.getRegistrableDomain === "function"
+          ? NS.getRegistrableDomain(location.hostname) : location.hostname;
+        const left = (String(ap || "").split(".")[0] || "").toLowerCase();
+        if (typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
+          && NS.apexLabelLooksLikeMarketingPaddedBrand(left)) return true;
+      } catch { /* ignore */ }
+      try {
+        const corr = typeof NS.evaluateTitleHostBrandCorrelation === "function"
+          ? NS.evaluateTitleHostBrandCorrelation() : null;
+        if (corr && (corr.mismatch || corr.hostMatch === "padded" || corr.hostMatch === "typo"
+          || corr.hostMatch === "hyphen")) return true;
+      } catch { /* ignore */ }
+      // ★ 用户样例：download.html 上 Windows/macOS/…「立即下载」全链 https://www.bing.com/
+      try {
+        if (typeof NS.pageDownloadCtasMostlySearchEngineTraps === "function"
+          && NS.pageDownloadCtasMostlySearchEngineTraps()) return true;
+      } catch { /* ignore */ }
+      return false;
+    } catch { return false; }
+  };
+
   NS.pageLooksLikeLegitimateOfficialDownload = function () {
     try {
-      // 干净主域 + /download 只是一条弱佐证，不能在页面/WHOIS 情报之前
-      // 单独把站点定性为官方网站。
+      // ★ todesk-ze.com.cn/download.html：仿冒下载中心长得像正站，
+      // 绝不能因 /download + ToDesk 话术就跳过仿冒链（首页能检、下载页不能检的根因）。
+      if (typeof NS.shouldRejectOfficialDownloadShortcut === "function"
+        && NS.shouldRejectOfficialDownloadShortcut()) return false;
       // 发行版 ISO/镜像列表：合法下载页，非银狐 exe 壳
       if (typeof NS.pageLooksLikeOsDistroIsoDownload === "function" && NS.pageLooksLikeOsDistroIsoDownload()) return true;
       try { const corr = NS.evaluateTitleHostBrandCorrelation(); if (corr && corr.mismatch) return false; } catch { /* ignore */ }
@@ -2496,6 +2921,8 @@
   NS.isTrustedOfficialDownloadContext = function () {
     try {
       if (typeof NS.hasHardThreatKitLocked === "function" && NS.hasHardThreatKitLocked()) return false;
+      if (typeof NS.shouldRejectOfficialDownloadShortcut === "function"
+        && NS.shouldRejectOfficialDownloadShortcut()) return false;
       if (NS.hostLooksLikeBrandMarketingSpoof()) return false;
       if (NS.state && NS.state._fakeBrandShellDetected) return false;
       if (NS.looksLikeMatureOfficialPortal()) return true;
@@ -2505,6 +2932,13 @@
       if (NS.looksLikeOfficialClientDownloadPage()) return true;
       const pageApex = NS.getRegistrableDomain(location.hostname);
       if (!pageApex) return false;
+      // ★ 禁止「同 apex 静态资源≥3 + 标题含下载」单独放行——仿冒 download.html 极易命中
+      const whoisOld = /已注册\s*(\d+)\s*天/.exec(NS.state.whoisInfo || "");
+      const days = whoisOld ? parseInt(whoisOld[1], 10) : null;
+      const hasIcp = typeof NS.hasValidIcpRecord === "function"
+        ? NS.hasValidIcpRecord()
+        : !!(NS.state.icpInfo && !/未查询到|查询失败|查询未确认|暂无/.test(NS.state.icpInfo));
+      if (!hasIcp || days == null || days < 365) return false;
       let sameApexAssets = 0;
       try {
         document.querySelectorAll('script[src], link[rel="stylesheet"][href], link[rel="preconnect"][href]').forEach((el) => {
@@ -2514,14 +2948,8 @@
       const title = document.title || "";
       const headText = `${title} ${(document.querySelector('meta[name="description"]')?.content || "")}`.slice(0, 500);
       const brandish = /安全|杀毒|防护|下载|产品|软件|客户端|企业|官网|官方/i.test(headText);
-      const whoisOld = /已注册\s*(\d+)\s*天/.exec(NS.state.whoisInfo || "");
-      const days = whoisOld ? parseInt(whoisOld[1], 10) : null;
-      const hasIcp = typeof NS.hasValidIcpRecord === "function"
-        ? NS.hasValidIcpRecord()
-        : !!(NS.state.icpInfo && !/未查询到|查询失败|查询未确认|暂无/.test(NS.state.icpInfo));
-      if (sameApexAssets >= 3 && brandish) return true;
-      if (hasIcp && days != null && days >= 365 && brandish) return true;
-      if (hasIcp && days != null && days >= 365 && sameApexAssets >= 2) return true;
+      if (hasIcp && days >= 365 && brandish && sameApexAssets >= 2) return true;
+      if (hasIcp && days >= 365 && sameApexAssets >= 3) return true;
       return false;
     } catch { return false; }
   };
@@ -2529,6 +2957,8 @@
   NS.looksLikeSafeOfficialContext = function () {
     try {
       const state = NS.state;
+      if (typeof NS.shouldRejectOfficialDownloadShortcut === "function"
+        && NS.shouldRejectOfficialDownloadShortcut()) return false;
       const matureProfile = typeof NS.evaluateMatureLegitimateSiteProfile === "function"
         ? NS.evaluateMatureLegitimateSiteProfile() : null;
       if (matureProfile && matureProfile.trusted) return true;
