@@ -174,7 +174,7 @@
       if (h === "crt.sh") return "crtsh";
       if (h === "ctl.shodan.io") return "shodan";
       if (h === "networkcalc.com") return "networkcalc";
-      if (h === "myssl.com" || h === "www.myssl.com") return "myssl";
+      if (h === "myssl.com") return "myssl";
       if (h === "api.edgeone.ai") return "edgeone";
     } catch { /* ignore */ }
     return "";

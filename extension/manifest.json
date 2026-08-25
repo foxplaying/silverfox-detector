@@ -78,6 +78,16 @@
         "https://www.virustotal.com/*",
         "https://virustotal.com/*"
       ],
+      "js": ["vendor/tldts/tldts.umd.min.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "exclude_matches": [
+        "https://www.virustotal.com/*",
+        "https://virustotal.com/*"
+      ],
       "js": [
         "content/state.js",
         "content/package-heuristics.js",

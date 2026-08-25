@@ -145,6 +145,282 @@
     ));
   }
 
+  function identityVerificationUnavailableForCurrentUrl(stateOpt) {
+    try {
+      const state = stateOpt || NS.state || {};
+      const urlKey = String(location.href || "");
+      return state._identityVerificationUnavailable === true
+        && String(state._identityVerificationUnavailableUrl || "") === urlKey;
+    } catch { return false; }
+  }
+
+  const BRAND_IDENTITY_SELECTOR = [
+    "title", "h1",
+    'meta[name="keywords"]', 'meta[name="description"]',
+    'meta[name="application-name"]', 'meta[property="og:title"]',
+    'meta[property="og:site_name"]', '[itemprop="name"]',
+    '[class*="logo"]', '[id*="logo"]'
+  ].join(",");
+
+  function normalizeBrandIdentityFingerprintPart(value) {
+    return String(value || "").replace(/\s+/g, " ").trim().slice(0, 240);
+  }
+
+  /**
+   * A deliberately small identity snapshot.  It follows only fields used by
+   * brand election and a boolean download-CTA bit, so ordinary SPA content
+   * mutations cannot keep reopening a settled decision.
+   */
+  NS.captureBrandElectionIdentityFingerprint = function () {
+    try {
+      const parts = [normalizeBrandIdentityFingerprintPart(document.title || "")];
+      const selectors = [
+        "h1",
+        'meta[name="keywords"]', 'meta[name="description"]',
+        'meta[name="application-name"]', 'meta[property="og:title"]',
+        'meta[property="og:site_name"]'
+      ];
+      selectors.forEach((selector) => {
+        const node = document.querySelector(selector);
+        parts.push(normalizeBrandIdentityFingerprintPart(
+          node && (node.getAttribute?.("content") || node.textContent || "")
+        ));
+      });
+      const identityNodes = document.querySelectorAll(
+        '[itemprop="name"], [class*="logo"], [id*="logo"]'
+      );
+      for (let index = 0; index < Math.min(identityNodes.length, 4); index++) {
+        const node = identityNodes[index];
+        parts.push(normalizeBrandIdentityFingerprintPart(
+          node.getAttribute?.("alt") || node.getAttribute?.("title") || node.textContent || ""
+        ));
+      }
+      let hasDownloadCta = false;
+      try {
+        hasDownloadCta = !!document.querySelector(
+          'a[href*="download"], button[class*="download"], [id*="download"], .download-btn'
+        );
+      } catch { /* ignore */ }
+      parts.push(hasDownloadCta ? "download:1" : "download:0");
+      return parts.join("|");
+    } catch { return ""; }
+  };
+
+  function mutationTouchesBrandIdentity(mutations) {
+    try {
+      for (const mutation of mutations || []) {
+        let target = mutation && mutation.target;
+        if (target && target.nodeType === 3) target = target.parentElement;
+        if (target && (target.matches?.(BRAND_IDENTITY_SELECTOR)
+          || target.closest?.(BRAND_IDENTITY_SELECTOR))) return true;
+        if (mutation && mutation.type === "attributes") {
+          const attr = String(mutation.attributeName || "");
+          if (/^(?:content|alt|title)$/i.test(attr)) return true;
+          if (attr === "href" && target
+            && /download/i.test(`${String(mutation.oldValue || "")} ${String(target.getAttribute?.("href") || "")}`)) {
+            return true;
+          }
+        }
+        const added = (mutation && mutation.addedNodes) || [];
+        for (let index = 0; index < Math.min(added.length, 8); index++) {
+          const node = added[index];
+          if (!node || node.nodeType !== 1) continue;
+          if (node.matches?.(BRAND_IDENTITY_SELECTOR)
+            || node.querySelector?.(BRAND_IDENTITY_SELECTOR)
+            || node.matches?.('a[href*="download"], button[class*="download"], [id*="download"], .download-btn')
+            || node.querySelector?.('a[href*="download"], button[class*="download"], [id*="download"], .download-btn')) {
+            return true;
+          }
+        }
+      }
+    } catch { /* ignore */ }
+    return false;
+  }
+
+  function clearBrandElectionRetryTimers(state) {
+    try {
+      if (state._brandElectionRetryTimer) clearTimeout(state._brandElectionRetryTimer);
+      if (state._brandElectionHydrationStableTimer) clearTimeout(state._brandElectionHydrationStableTimer);
+    } catch { /* ignore */ }
+    state._brandElectionRetryTimer = null;
+    state._brandElectionHydrationStableTimer = null;
+    state._brandElectionRetryPending = false;
+  }
+
+  function scheduleBrandElectionResume(reason) {
+    const state = NS.state;
+    if (!state || state._brandElectionHydrationResumeScheduled) return;
+    state._brandElectionHydrationResumeScheduled = true;
+    try {
+      queueMicrotask(() => {
+        state._brandElectionHydrationResumeScheduled = false;
+        try {
+          if (typeof NS.markAnalysisComplete === "function") {
+            NS.markAnalysisComplete(reason || "brand-identity-hydrated");
+          }
+        } catch { /* ignore */ }
+      });
+    } catch {
+      state._brandElectionHydrationResumeScheduled = false;
+    }
+  }
+
+  /**
+   * Re-open only the current URL's bounded final election when its primary
+   * identity fingerprint changes.  Visibility and popup nudges also release a
+   * retry whose timer was frozen while Edge kept the tab in the background.
+   */
+  NS.nudgeBrandElectionAfterHydration = function (reason) {
+    const state = NS.state;
+    if (!state || state._brandElectionHydrationNudgeBusy) return false;
+    try {
+      const urlKey = String(location.href || "");
+      const fingerprint = NS.captureBrandElectionIdentityFingerprint();
+      const previousUrl = String(state._brandElectionIdentityFingerprintUrl || "");
+      const previous = String(state._brandElectionIdentityFingerprint || "");
+      const explicitWake = /(?:visibility|pageshow|focus|popup)/i.test(String(reason || ""));
+      if (previousUrl !== urlKey || !previous) {
+        state._brandElectionIdentityFingerprintUrl = urlKey;
+        state._brandElectionIdentityFingerprint = fingerprint;
+        state._brandElectionIdentityFingerprintAt = Date.now();
+        return false;
+      }
+      const changed = fingerprint !== previous;
+      if (!changed) {
+        if (explicitWake && (state._brandElectionRetryPending
+          || state._brandElectionAwaitingDom
+          || (state._brandSpoofFinalizeScheduled && !state._brandSpoofFinalPresented))) {
+          state._brandElectionHydrationNudgeBusy = true;
+          clearBrandElectionRetryTimers(state);
+          state._brandElectionAwaitingDom = false;
+          state._brandElectionSettledUrl = "";
+          scheduleBrandElectionResume(`brand-election-${String(reason || "wake")}`);
+          return true;
+        }
+        return false;
+      }
+
+      state._brandElectionHydrationNudgeBusy = true;
+      const hardThreat = typeof NS.hasRealHardKitThreat === "function" && NS.hasRealHardKitThreat();
+      const hadFinalSoftDecision = !hardThreat && state._brandSpoofFinalPresented === true;
+      if (hadFinalSoftDecision && typeof NS.clearBrandSpoofFalsePositive === "function") {
+        try {
+          NS.clearBrandSpoofFalsePositive("brand-primary-identity-changed", { preserveNoIcp: true });
+        } catch { /* ignore */ }
+      }
+      invalidateBrandSpoofDecision(state, "brand-primary-identity-changed");
+      state._brandPinyinRequestSequence = Number(state._brandPinyinRequestSequence || 0) + 1;
+      state._brandElectionIdentityFingerprint = fingerprint;
+      state._brandElectionIdentityFingerprintUrl = urlKey;
+      state._brandElectionIdentityFingerprintAt = Date.now();
+      state._brandElectionIdentityRevision = Number(state._brandElectionIdentityRevision || 0) + 1;
+      state._brandElectionSettledUrl = "";
+      state._brandElectionSettledAt = 0;
+      state._brandElectionFinalAttempts = 0;
+      state._brandElectionAwaitingDom = false;
+      clearBrandElectionRetryTimers(state);
+      // Keep analysis pending until the current URL's real identity sources
+      // can run the newly hydrated brand snapshot through final election.
+      state._brandElectionRetryPending = true;
+      try {
+        if (typeof NS.rotateAnalysisTransaction === "function") {
+          NS.rotateAnalysisTransaction(urlKey, "brand-primary-identity-changed");
+        }
+      } catch { /* ignore */ }
+      if (NS.caches) {
+        NS.caches._primaryKw = null;
+        NS.caches._primaryKwAt = 0;
+        NS.caches._primaryKwUrl = "";
+        NS.caches._mutualLatinBrandIdentity = null;
+      }
+      // Hydration invalidates the display identity even when a real hard
+      // download threat remains armed.  Keep the protection flags, but remove
+      // the stale named brand and its toast until the new fingerprint wins a
+      // final election.
+      try {
+        if (state._brandSpoofFinalSnapshot || state._lastGuardNoticeKind === "brand-spoof") {
+          if (typeof NS.invalidateBrandSpoofNoticeSnapshot === "function") {
+            NS.invalidateBrandSpoofNoticeSnapshot(state._brandSpoofFinalSnapshot, "brand-primary-identity-changed");
+          } else if (typeof NS.dismissPageToast === "function") NS.dismissPageToast("brand-spoof");
+        }
+      } catch { /* ignore */ }
+      state._brandSpoofFinalSnapshot = null;
+      state._brandSpoofFinalPresented = false;
+      state._brandSpoofFinalizeScheduled = false;
+      state._spoofBrandChineseLocked = false;
+      state._spoofPinyinUpgradeDone = false;
+      state._brandSpoofLatinOnly = false;
+      state._brandSpoofNoticeSent = false;
+      state._brandSpoofNoticeKey = "";
+      state._lastGuardNoticeKey = "";
+      state._lastGuardNoticeVersion = "";
+      state.spoofBrand = "";
+      if (!hardThreat) {
+        state._brandSpoofPresentationDeferred = false;
+        state._pendingSoftBrandSpoof = false;
+        state._analysisDone = false;
+        state._stickyComplete = false;
+        state._stickyCompleteHost = "";
+      }
+      scheduleBrandElectionResume("brand-primary-identity-changed");
+      return true;
+    } catch { return false; }
+    finally { if (state) state._brandElectionHydrationNudgeBusy = false; }
+  };
+
+  NS.ensureBrandElectionHydrationWatch = function () {
+    try {
+      if (typeof NS.isTopFrame === "function" && !NS.isTopFrame()) return false;
+      if (typeof NS.isSearchUrlShapeOnly === "function" && NS.isSearchUrlShapeOnly()) return false;
+      if (typeof NS.isPrivateOrLocalNetworkHost === "function"
+        && NS.isPrivateOrLocalNetworkHost()) return false;
+      const state = NS.state;
+      const cache = NS.caches || {};
+      const urlKey = String(location.href || "");
+      const previous = cache._brandElectionHydrationWatch;
+      if (previous && previous.url === urlKey && previous.active) return true;
+      try { previous && previous.stop && previous.stop(); } catch { /* ignore */ }
+      state._brandElectionIdentityFingerprintUrl = urlKey;
+      state._brandElectionIdentityFingerprint = NS.captureBrandElectionIdentityFingerprint();
+      state._brandElectionIdentityFingerprintAt = Date.now();
+      let active = true;
+      let debounce = null;
+      let deadlineTimer = null;
+      const observer = typeof MutationObserver === "function"
+        ? new MutationObserver((mutations) => {
+          if (!active || !mutationTouchesBrandIdentity(mutations)) return;
+          if (debounce) return;
+          debounce = setTimeout(() => {
+            debounce = null;
+            if (!active || String(location.href || "") !== urlKey) return;
+            NS.nudgeBrandElectionAfterHydration("dom-hydration");
+          }, 80);
+        }) : null;
+      const stop = () => {
+        if (!active) return;
+        active = false;
+        try { observer && observer.disconnect(); } catch { /* ignore */ }
+        try { if (debounce) clearTimeout(debounce); } catch { /* ignore */ }
+        try { if (deadlineTimer) clearTimeout(deadlineTimer); } catch { /* ignore */ }
+        if (cache._brandElectionHydrationWatch === watch) cache._brandElectionHydrationWatch = null;
+      };
+      const watch = { active: true, url: urlKey, stop };
+      cache._brandElectionHydrationWatch = watch;
+      try {
+        observer && observer.observe(document.documentElement || document, {
+          subtree: true,
+          childList: true,
+          characterData: true,
+          attributes: true,
+          attributeFilter: ["content", "alt", "title", "href"],
+          attributeOldValue: true
+        });
+      } catch { /* ignore */ }
+      deadlineTimer = setTimeout(stop, 15000);
+      return true;
+    } catch { return false; }
+  };
+
   /**
    * 页面独立拉丁身份与“干净注册域左标”完全互证。
    *
@@ -213,6 +489,7 @@
       invalidateBrandSpoofDecision(state, reasonOpt || "mutual-latin-clean-apex-exact");
       state._brandSpoofFinalizeScheduled = false;
       state._brandSpoofFinalPresented = false;
+      state._brandSpoofFinalSnapshot = null;
       state._brandElectionRetryPending = false;
       state._pendingSoftBrandSpoof = false;
       state._brandSpoofPresentationDeferred = false;
@@ -421,6 +698,10 @@
     try {
       const state = NS.state || {};
       const urlKey = String(location.href || "");
+      // A bounded identity timeout is terminal for analysis, but it is not
+      // positive evidence.  canPresentSoftBrandSpoofNotice() keeps soft UI and
+      // the permanent brand guard suppressed for this exact URL.
+      if (identityVerificationUnavailableForCurrentUrl(state)) return true;
       const sslIdentityStartedForCurrentUrl = /^https:/i.test(String(location.protocol || ""))
         && String(state._sslIdentityUrl || "") === urlKey
         && Number(state._sslIdentityStartedAt || 0) > 0;
@@ -456,6 +737,7 @@
         // 真硬套件不走软仿冒门禁
         return true;
       }
+      if (identityVerificationUnavailableForCurrentUrl(state)) return false;
       if (!(typeof NS.isBrandSpoofIdentityVerificationSettled === "function"
         && NS.isBrandSpoofIdentityVerificationSettled())) return false;
       if (typeof NS.pageHasStrongTrustedIdentity === "function"
@@ -510,13 +792,42 @@
     const state = NS.state;
     if (!state) return false;
     const urlKey = String(location.href || "");
+    const settleVerifiedBenignElection = (settleReason, resumeAnalysis) => {
+      try {
+        if (typeof NS.cancelPendingSoftBrandDecision === "function") {
+          NS.cancelPendingSoftBrandDecision(settleReason || "brand-election-benign-settled");
+        } else {
+          state._pendingSoftBrandSpoof = false;
+          state._brandSpoofPresentationDeferred = false;
+          state._brandSpoofFinalizeScheduled = false;
+          state._brandSpoofFinalPresented = false;
+          state._brandElectionAwaitingDom = false;
+          state._brandElectionRetryPending = false;
+          state._analysisCompletionDeferredForBrand = false;
+          try {
+            if (state._brandElectionRetryTimer) clearTimeout(state._brandElectionRetryTimer);
+          } catch { /* ignore */ }
+          state._brandElectionRetryTimer = null;
+        }
+        state._brandElectionSettledUrl = urlKey;
+        state._brandElectionSettledAt = Date.now();
+        if (resumeAnalysis && typeof NS.markAnalysisComplete === "function") {
+          NS.markAnalysisComplete(settleReason || "brand-election-benign-settled");
+        }
+      } catch { /* ignore */ }
+    };
     // settled 标志可能来自 SPA 早期 DOM；晚到的页面拉丁身份必须先有机会
     // 撤销旧软锁，不能被上一轮 settled/armed 状态短路。
     if (NS.reconcileSoftBrandSpoofWithMutualLatinExact(
       location.hostname, "final-election-mutual-latin-exact"
     )) {
-      state._brandElectionSettledUrl = urlKey;
-      state._brandElectionSettledAt = Date.now();
+      settleVerifiedBenignElection("final-election-mutual-latin-exact", false);
+      return false;
+    }
+    const realHardThreat = typeof NS.hasRealHardKitThreat === "function"
+      && NS.hasRealHardKitThreat();
+    if (!realHardThreat && identityVerificationUnavailableForCurrentUrl(state)) {
+      settleVerifiedBenignElection("brand-election-identity-unavailable", false);
       return false;
     }
     if (state._brandElectionSettledUrl === urlKey) return !!state._brandSpoofPortalDetected;
@@ -538,6 +849,35 @@
       }
       return false;
     }
+    try { NS.ensureBrandElectionHydrationWatch(); } catch { /* ignore */ }
+    // Do not elect against a title/H1/meta snapshot that changed in this same
+    // turn.  The short stability gate is event-driven on resume and bounded by
+    // one timer; it does not extend the identity network deadline.
+    const fingerprintAt = String(state._brandElectionIdentityFingerprintUrl || "") === urlKey
+      ? Number(state._brandElectionIdentityFingerprintAt || 0) : 0;
+    const stableAge = fingerprintAt ? Date.now() - fingerprintAt : 0;
+    if (fingerprintAt && stableAge >= 0 && stableAge < 350) {
+      state._brandElectionRetryPending = true;
+      if (!state._brandElectionHydrationStableTimer) {
+        const stableGeneration = Number(state._brandSpoofDecisionGeneration || 0);
+        state._brandElectionHydrationStableTimer = setTimeout(() => {
+          state._brandElectionHydrationStableTimer = null;
+          try {
+            if (String(location.href || "") !== urlKey) return;
+            if (Number(state._brandSpoofDecisionGeneration || 0) !== stableGeneration) {
+              state._brandElectionRetryPending = false;
+              scheduleBrandElectionResume("brand-primary-identity-stability-superseded");
+              return;
+            }
+            state._brandElectionRetryPending = false;
+            if (typeof NS.markAnalysisComplete === "function") {
+              NS.markAnalysisComplete("brand-primary-identity-stable");
+            }
+          } catch { state._brandElectionRetryPending = false; }
+        }, Math.max(25, 350 - stableAge));
+      }
+      return false;
+    }
     try {
       if (NS.caches) {
         NS.caches._primaryKw = null;
@@ -548,11 +888,7 @@
       const trustedIdentity = typeof NS.pageHasStrongTrustedIdentity === "function"
         && NS.pageHasStrongTrustedIdentity();
       if (trustedIdentity) {
-        state._brandElectionRetryPending = false;
-        state._brandElectionSettledUrl = urlKey;
-        state._brandElectionSettledAt = Date.now();
-        state._pendingSoftBrandSpoof = false;
-        state._brandSpoofPresentationDeferred = false;
+        settleVerifiedBenignElection("final-election-trusted-identity", false);
         return false;
       }
       let hit = false;
@@ -574,16 +910,44 @@
             state._brandElectionRetryTimer = null;
             try {
               if (String(location.href || "") !== urlKey) return;
-              if (Number(state._brandSpoofDecisionGeneration || 0) !== retryGeneration) return;
+              if (Number(state._brandSpoofDecisionGeneration || 0) !== retryGeneration) {
+                // A newer brand transaction superseded this timer. Let the
+                // current generation re-evaluate completion instead of
+                // leaving this timer's retry latch permanently set.
+                if (typeof NS.markAnalysisComplete === "function") {
+                  NS.markAnalysisComplete("brand-election-retry-superseded");
+                }
+                return;
+              }
               if (NS.reconcileSoftBrandSpoofWithMutualLatinExact(
                 location.hostname, "final-election-retry-mutual-latin-exact"
-              )) return;
+              )) {
+                settleVerifiedBenignElection("brand-election-retry-mutual-latin-exact", true);
+                return;
+              }
               if (typeof NS.pageHasStrongTrustedIdentity === "function"
-                && NS.pageHasStrongTrustedIdentity()) return;
+                && NS.pageHasStrongTrustedIdentity()) {
+                settleVerifiedBenignElection("brand-election-retry-trusted-identity", true);
+                return;
+              }
               if (typeof NS.markAnalysisComplete === "function") {
                 NS.markAnalysisComplete("brand-election-stable-retry");
               }
-            } catch { /* ignore */ }
+            } catch {
+              // Preserve any real threat/finalizer state, but release this
+              // bounded retry's own latch so a helper failure cannot strand
+              // the report at analysisComplete:false.
+              state._brandElectionRetryPending = false;
+              state._brandElectionSettledUrl = urlKey;
+              state._brandElectionSettledAt = Date.now();
+              if (!(state._brandSpoofFinalizeScheduled && !state._brandSpoofFinalPresented)) {
+                state._pendingSoftBrandSpoof = false;
+                state._brandSpoofPresentationDeferred = false;
+              }
+              if (typeof NS.markAnalysisComplete === "function") {
+                NS.markAnalysisComplete("brand-election-retry-error");
+              }
+            }
           }, delay);
         }
         return false;
@@ -713,6 +1077,35 @@
         NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "presentation-deferred-can-present-false", host);
         return "";
       }
+      try { NS.ensureBrandElectionHydrationWatch(); } catch { /* ignore */ }
+      const identityFingerprintAt = String(state._brandElectionIdentityFingerprintUrl || "") === decisionUrl
+        ? Number(state._brandElectionIdentityFingerprintAt || 0) : 0;
+      const identityStableAge = identityFingerprintAt ? Date.now() - identityFingerprintAt : 0;
+      if (identityFingerprintAt
+        && identityStableAge >= 0 && identityStableAge < 350) {
+        state._brandSpoofPresentationDeferred = true;
+        state._pendingSoftBrandSpoof = true;
+        state._brandElectionRetryPending = true;
+        if (!state._brandElectionHydrationStableTimer) {
+          const commitGeneration = decisionGeneration;
+          state._brandElectionHydrationStableTimer = setTimeout(() => {
+            state._brandElectionHydrationStableTimer = null;
+            try {
+              if (String(location.href || "") !== decisionUrl) return;
+              if (Number(state._brandSpoofDecisionGeneration || 0) !== commitGeneration) {
+                state._brandElectionRetryPending = false;
+                scheduleBrandElectionResume("brand-presentation-stability-superseded");
+                return;
+              }
+              state._brandElectionRetryPending = false;
+              if (typeof NS.markAnalysisComplete === "function") {
+                NS.markAnalysisComplete("brand-presentation-identity-stable");
+              }
+            } catch { state._brandElectionRetryPending = false; }
+          }, Math.max(25, 350 - identityStableAge));
+        }
+        return "";
+      }
       state._brandSpoofPresentationDeferred = false;
       if (!decisionIsCurrent()) return "";
       // 新 generation 已使旧 timer/SW 回调失效；对应 scheduled 标志也必须
@@ -754,6 +1147,7 @@
         if (allowLatinToChineseRetry) {
           state._brandSpoofLatinUpgradeAttempts = Number(state._brandSpoofLatinUpgradeAttempts || 0) + 1;
           state._brandSpoofFinalPresented = false;
+          state._brandSpoofFinalSnapshot = null;
           state._brandSpoofFinalizeScheduled = false;
           state._brandSpoofNoticeSent = false;
           state._brandSpoofNoticeKey = "";
@@ -832,77 +1226,120 @@
         && NS.isForbiddenSpoofDisplayBrand(t);
       let brand = "";
       let hostAlignedLatin = "";
-      // 域名中已有拉丁核且页面身份槽明确出现时优先（WPS / ToDesk 等）。
       try {
         if (typeof NS.pickHostAlignedLatinBrandFromPage === "function") {
           hostAlignedLatin = String(NS.pickHostAlignedLatinBrandFromPage(host) || "").trim();
-          if (hostAlignedLatin && !forbid(hostAlignedLatin)) brand = hostAlignedLatin;
+          if (forbid(hostAlignedLatin)
+            || (typeof NS.isHostShapedCompoundBrandToken === "function"
+              && NS.isHostShapedCompoundBrandToken(hostAlignedLatin, host))) {
+            hostAlignedLatin = "";
+          }
         }
       } catch { hostAlignedLatin = ""; }
       try {
         const locked = typeof NS.getLockedSpoofDisplayBrand === "function"
           ? NS.getLockedSpoofDisplayBrand() : "";
-        if (!brand && locked && !forbid(locked)
+        if (locked && !forbid(locked)
           && typeof NS.spoofDisplayBrandAlignsHost === "function"
           && NS.spoofDisplayBrandAlignsHost(locked, host)) brand = locked;
       } catch { /* ignore */ }
-      // ★ 主机对齐页内拉丁（WPS）——优先于任何「中文」误抽
-      if (!brand && hostAlignedLatin) brand = hostAlignedLatin;
-      if (!brand && typeof NS.extractChineseBrandFromPageTitle === "function") {
-        const tb = String(NS.extractChineseBrandFromPageTitle() || "").trim();
-        if (tb && !forbid(tb)) brand = tb;
+      // 页内中文（钉钉）优先，但须能过互锁；失败则回退页内/剥核拉丁（ToDesk），禁止空品牌
+      let titleCn = "";
+      try {
+        if (typeof NS.extractChineseBrandFromPageTitle === "function") {
+          titleCn = String(NS.extractChineseBrandFromPageTitle() || "").trim();
+          if (forbid(titleCn)) titleCn = "";
+        }
+      } catch { titleCn = ""; }
+      if (!brand && titleCn
+        && typeof NS.spoofDisplayBrandAlignsHost === "function"
+        && NS.spoofDisplayBrandAlignsHost(titleCn, host)) {
+        brand = titleCn;
       }
-      if (!brand || NS.isPureLatinSpoofBrand(brand)) {
+      // 主机对齐页内拉丁（ToDesk @ totodesk / WPS）；拒绝 TotoDesk 主机碎片
+      if (!brand && hostAlignedLatin) brand = hostAlignedLatin;
+      if (!brand || (NS.isPureLatinSpoofBrand(brand) && !hostAlignedLatin)) {
         try {
           if (typeof NS.collectPrimaryBrandKeywords === "function") {
             const pk = (NS.caches && NS.caches._primaryKw)
               || NS.collectPrimaryBrandKeywords();
-            // 选举拉丁若与主机对齐，优先于错误中文
             if (pk && pk.latin && pk.latin.length && typeof NS.pickHostAlignedLatinBrandFromPage === "function") {
               const latHit2 = String(NS.pickHostAlignedLatinBrandFromPage(host) || "").trim();
-              if (latHit2 && !forbid(latHit2)) brand = latHit2;
+              if (latHit2 && !forbid(latHit2)
+                && !(typeof NS.isHostShapedCompoundBrandToken === "function"
+                  && NS.isHostShapedCompoundBrandToken(latHit2, host))) {
+                brand = latHit2;
+              }
             }
             if ((!brand || forbid(brand)) && pk && pk.display && /[\u4e00-\u9fff]{2,}/.test(pk.display)
-              && !forbid(pk.display)) {
+              && !forbid(pk.display)
+              && typeof NS.spoofDisplayBrandAlignsHost === "function"
+              && NS.spoofDisplayBrandAlignsHost(pk.display, host)) {
               brand = String(pk.display).trim();
             } else if ((!brand || forbid(brand)) && pk && pk.cn && pk.cn.length) {
               for (let i = 0; i < Math.min(pk.cn.length, 6); i++) {
                 const cn0 = String(pk.cn[i] || "").trim();
-                if (cn0 && /[\u4e00-\u9fff]{2,}/.test(cn0) && !forbid(cn0)) {
+                if (cn0 && /[\u4e00-\u9fff]{2,}/.test(cn0) && !forbid(cn0)
+                  && typeof NS.spoofDisplayBrandAlignsHost === "function"
+                  && NS.spoofDisplayBrandAlignsHost(cn0, host)) {
                   brand = cn0;
                   break;
                 }
               }
             }
-            // 选举 display 纯拉丁且在主机中
             if ((!brand || forbid(brand)) && pk && pk.display && /^[A-Za-z]/.test(pk.display)
               && !forbid(pk.display)) {
               const dLow = pk.display.toLowerCase().replace(/[^a-z0-9]/g, "");
               const hFlat = host.replace(/[^a-z0-9]/g, "");
-              if (dLow.length >= 2 && hFlat.includes(dLow)) brand = String(pk.display).trim();
+              if (dLow.length >= 2 && hFlat.includes(dLow)
+                && !(typeof NS.isHostShapedCompoundBrandToken === "function"
+                  && NS.isHostShapedCompoundBrandToken(pk.display, host))) {
+                brand = String(pk.display).trim();
+              }
             }
           }
         } catch { /* ignore */ }
       }
       if ((!brand || forbid(brand)) && typeof NS.resolveSpoofDisplayBrandNow === "function") {
         const n = String(NS.resolveSpoofDisplayBrandNow("") || "").trim();
-        if (n && !forbid(n)) brand = n;
+        if (n && !forbid(n)
+          && !(typeof NS.isHostShapedCompoundBrandToken === "function"
+            && NS.isHostShapedCompoundBrandToken(n, host))) brand = n;
       }
       if (forbid(brand)) brand = "";
-      // 最终候选必须反向覆盖 host；不对齐的中文营销词只留在 SW 候选池，不能进状态/UI。
       try {
         if (brand && typeof NS.spoofDisplayBrandAlignsHost === "function"
-          && !NS.spoofDisplayBrandAlignsHost(brand, host)) brand = "";
-      } catch { brand = ""; }
+          && !NS.spoofDisplayBrandAlignsHost(brand, host)) {
+          // 互锁失败：回退页内拉丁，勿留空（曾导致第二次只剩「仿冒品牌官网」）
+          brand = hostAlignedLatin || "";
+        }
+      } catch { brand = hostAlignedLatin || ""; }
       const latinFallback = (() => {
-        // 优先主机对齐页内拉丁，再剥核
         try {
           if (typeof NS.pickHostAlignedLatinBrandFromPage === "function") {
             const h = String(NS.pickHostAlignedLatinBrandFromPage(host) || "").trim();
-            if (h && !forbid(h)) return h;
+            if (h && !forbid(h)
+              && !(typeof NS.isHostShapedCompoundBrandToken === "function"
+                && NS.isHostShapedCompoundBrandToken(h, host))) return h;
           }
         } catch { /* ignore */ }
-        return hostCoreLatin()
+        // 剥核展示：totodesk → ToDesk（formatSpoofDisplayFromHostCore / hostCoreLatin）
+        try {
+          if (typeof NS.formatSpoofDisplayFromHostCore === "function") {
+            const formatted = String(NS.formatSpoofDisplayFromHostCore(host) || "").trim();
+            if (formatted && !forbid(formatted)
+              && !(typeof NS.isHostShapedCompoundBrandToken === "function"
+                && NS.isHostShapedCompoundBrandToken(formatted, host))) {
+              return formatted;
+            }
+          }
+        } catch { /* ignore */ }
+        let coreLat = hostCoreLatin();
+        try {
+          if (coreLat && typeof NS.isHostShapedCompoundBrandToken === "function"
+            && NS.isHostShapedCompoundBrandToken(coreLat, host)) coreLat = "";
+        } catch { /* ignore */ }
+        return coreLat
           || (o.brand && NS.isPureLatinSpoofBrand(o.brand) && !forbid(o.brand) ? String(o.brand).trim() : "")
           || (state.spoofBrand && NS.isPureLatinSpoofBrand(state.spoofBrand) && !forbid(state.spoofBrand)
             ? String(state.spoofBrand).trim() : "");
@@ -927,7 +1364,8 @@
         if (typeof NS.setSpoofDisplayBrand === "function") {
           stored = String(NS.setSpoofDisplayBrand(fb, {
             lockChinese: /[\u4e00-\u9fff]{2,}/.test(fb),
-            forceChinese: /[\u4e00-\u9fff]{2,}/.test(fb)
+            forceChinese: /[\u4e00-\u9fff]{2,}/.test(fb),
+            pinyinValidated: !!(validationOpts && validationOpts.pinyinValidated)
           }) || "").trim();
         } else {
           state.spoofBrand = fb;
@@ -949,6 +1387,20 @@
           if (typeof NS.addSignal === "function") {
             NS.addSignal("仿冒品牌官网下载站", 24, detail);
           }
+          // addSignal de-duplicates by signal name.  A corrected final brand
+          // must therefore replace the old reason instead of leaving the
+          // popup/report text on the first hydrated candidate.
+          (state.details || []).forEach((d) => {
+            if (!d) return;
+            if (d.name === "仿冒品牌官网下载站") {
+              d.reason = detail;
+              return;
+            }
+            if (/仿冒站下载拦截|主动探测仿冒/i.test(String(d.name || ""))
+              && /仿冒|品牌/i.test(String(d.reason || ""))) {
+              d.reason = String(d.reason || "").replace(/「[^」]+」/g, `「${shown}」`);
+            }
+          });
         } catch { /* ignore */ }
         return shown;
       };
@@ -960,11 +1412,19 @@
       const presentOnce = (finalBrand, optsPres) => {
         if (!decisionIsCurrent()) return "";
         const force = !!(optsPres && optsPres.force);
+        const pinyinValidated = !!(optsPres && optsPres.pinyinValidated);
         const curShown = String(state.spoofBrand || "").trim();
-        // 已展示中文则不再改
-        if (state._brandSpoofFinalPresented && /[\u4e00-\u9fff]{2,}/.test(curShown) && !force) {
-          return curShown;
-        }
+        const requestedBrand = String(finalBrand || "").trim();
+        const requestedChineseCorrection = !!(state._brandSpoofFinalPresented
+          && pinyinValidated
+          && /[\u4e00-\u9fff]{2,}/.test(curShown)
+          && /[\u4e00-\u9fff]{2,}/.test(requestedBrand)
+          && requestedBrand !== curShown);
+        // Chinese is normally monotonic, but the latest sequence/fingerprint
+        // checked pinyin result may correct an earlier hydrated Chinese word.
+        // Older SW responses never reach this branch.
+        if (state._brandSpoofFinalPresented && /[\u4e00-\u9fff]{2,}/.test(curShown)
+          && !requestedChineseCorrection) return curShown;
         // 已展示拉丁、新值仍是拉丁 → 忽略（除非 force）
         if (state._brandSpoofFinalPresented && NS.isPureLatinSpoofBrand(curShown)
           && NS.isPureLatinSpoofBrand(String(finalBrand || "")) && !force) {
@@ -1039,10 +1499,21 @@
         const upgradingLatinToCn = state._brandSpoofFinalPresented
           && NS.isPureLatinSpoofBrand(curShown)
           && /[\u4e00-\u9fff]{2,}/.test(toShow);
-        if (upgradingLatinToCn) {
+        const correctingChineseWithPinyin = !!(state._brandSpoofFinalPresented
+          && pinyinValidated
+          && /[\u4e00-\u9fff]{2,}/.test(curShown)
+          && /[\u4e00-\u9fff]{2,}/.test(toShow)
+          && toShow !== curShown);
+        if (upgradingLatinToCn || correctingChineseWithPinyin) {
           state._brandSpoofNoticeSent = false;
           state._brandSpoofNoticeKey = "";
           state._lastGuardNoticeKey = "";
+          state._lastGuardNoticeVersion = "";
+          try {
+            if (correctingChineseWithPinyin && typeof NS.dismissPageToast === "function") {
+              NS.dismissPageToast("brand-spoof");
+            }
+          } catch { /* ignore */ }
         } else if (state._brandSpoofFinalPresented && !force && !upgradingLatinToCn) {
           return curShown;
         }
@@ -1066,6 +1537,23 @@
           state._brandSpoofLatinOnly = false;
         }
 
+        const noticeSequence = Number(state._brandSpoofNoticeSequence || 0) + 1;
+        state._brandSpoofNoticeSequence = noticeSequence;
+        const finalSnapshot = {
+          final: true,
+          brand: shown,
+          url: decisionUrl,
+          analysisTxn: String(state._analysisTxn || ""),
+          analysisTxnStartedAt: Number(state._analysisTxnStartedAt) || Date.now(),
+          decisionGeneration,
+          identityRevision: Number(state._brandElectionIdentityRevision || 0),
+          pinyinRequestSequence: Number(state._brandPinyinRequestSequence || 0),
+          pinyinFingerprint: String(state._brandPinyinRequestFingerprint || ""),
+          noticeSequence,
+          issuedAt: Date.now()
+        };
+        state._brandSpoofFinalSnapshot = finalSnapshot;
+
         const noticeTitle = shown ? `已识别仿冒「${shown}」官网` : "已识别仿冒品牌官网";
         const noticeMsg = o.noticeMsg
           || (shown
@@ -1082,7 +1570,8 @@
               title: noticeTitle,
               guardKind: "brand-spoof",
               forceNotify: true,
-              lockHard
+              lockHard,
+              brandSnapshot: finalSnapshot
             });
           }
           NS.disableAllDownloadIntentControls();
@@ -1092,7 +1581,7 @@
         } catch { /* ignore */ }
         NS.silverfoxLog && NS.silverfoxLog(
           "brand-spoof", "present-final", shown || "(empty)", host,
-          upgradingLatinToCn ? "upgrade-latin→cn" : "",
+          upgradingLatinToCn ? "upgrade-latin→cn" : (correctingChineseWithPinyin ? "correct-cn→cn" : ""),
           "title=", String(document.title || "").slice(0, 60),
           "core=", hostCoreRaw() || "-"
         );
@@ -1140,18 +1629,15 @@
       } else if (provisional) {
         state.spoofBrand = provisional;
       }
-      try {
-        if (typeof NS.installDownloadGuard === "function") {
-          NS.installDownloadGuard(o.reason || "仿冒品牌官网下载站", {
-            notify: false,
-            guardKind: "brand-spoof",
-            lockHard: true
-          });
-        }
-        NS.disableAllDownloadIntentControls();
-      } catch { /* ignore */ }
+      // This is candidate state only.  A provisional identity hold owns the
+      // short pre-verdict click wait; the permanent brand guard and disabled
+      // controls are installed exclusively by presentOnce() after final
+      // election.  Otherwise a stale t0 candidate can block the official page
+      // before its hydrated identity or pinyin result arrives.
 
-      if (state._brandSpoofFinalizeScheduled) return provisional || brand;
+      if (state._brandSpoofFinalizeScheduled) {
+        return state._brandSpoofFinalPresented ? String(state.spoofBrand || "") : "";
+      }
       state._brandSpoofFinalizeScheduled = true;
       let pinyinReady = false;
       let attempts = 0;
@@ -1300,19 +1786,54 @@
       };
 
       // ★ 拼音在 SW：传短候选，不 inject 网页
-      const kickSwPinyin = () => {
+      const collectSwPinyinCandidateSnapshot = () => {
+        const candidates = typeof NS.collectLightChineseBrandCandidates === "function"
+          ? NS.collectLightChineseBrandCandidates() : [];
+        const strongCandidates = typeof NS.collectStrongChineseBrandCandidates === "function"
+          ? NS.collectStrongChineseBrandCandidates() : [];
+        const normalize = (items) => (Array.isArray(items) ? items : [])
+          .map((item) => String(item || "").replace(/\s+/g, " ").trim())
+          .filter(Boolean).slice(0, 24);
+        const cands = normalize(candidates);
+        const strongCands = normalize(strongCandidates);
+        return {
+          cands,
+          strongCands,
+          fingerprint: `${host}|${cands.join("\u001f")}|${strongCands.join("\u001f")}`
+        };
+      };
+
+      const swPinyinRequestIsCurrent = (requestSeq, candidateFingerprint) => {
+        try {
+          if (!decisionIsCurrent()) return false;
+          if (Number(state._brandPinyinRequestSequence || 0) !== requestSeq) return false;
+          if (String(state._brandPinyinRequestFingerprint || "") !== candidateFingerprint) return false;
+          return collectSwPinyinCandidateSnapshot().fingerprint === candidateFingerprint;
+        } catch { return false; }
+      };
+
+      // The t0 call only warms the service worker.  The t400 snapshot may
+      // commit, and sequence + fingerprint checks make every older response
+      // and fallback inert after the page hydrates different candidates.
+      const kickSwPinyin = (allowCommit) => {
         try {
           if (!decisionIsCurrent()) return;
-          const cands = typeof NS.collectLightChineseBrandCandidates === "function"
-            ? NS.collectLightChineseBrandCandidates()
-            : [];
-          const strongCands = typeof NS.collectStrongChineseBrandCandidates === "function"
-            ? NS.collectStrongChineseBrandCandidates()
-            : [];
+          const snapshot = collectSwPinyinCandidateSnapshot();
+          const cands = snapshot.cands;
+          const strongCands = snapshot.strongCands;
+          const candidateFingerprint = snapshot.fingerprint;
+          const requestSeq = Number(state._brandPinyinRequestSequence || 0) + 1;
+          state._brandPinyinRequestSequence = requestSeq;
+          state._brandPinyinRequestFingerprint = candidateFingerprint;
           // 标题壳先同步定稿（钉钉应用中心），不依赖 SW
-          finalize(false);
+          if (allowCommit) finalize(false);
           if (!cands.length || typeof NS.requestBrandPinyinAlign !== "function") {
-            setTimeout(() => finalize(true), 600);
+            if (allowCommit) {
+              setTimeout(() => {
+                if (!swPinyinRequestIsCurrent(requestSeq, candidateFingerprint)) return;
+                finalize(true);
+              }, 600);
+            }
             return;
           }
           NS.requestBrandPinyinAlign({
@@ -1320,7 +1841,7 @@
             candidates: cands,
             strongCandidates: strongCands
           }).then((evidenceSw) => {
-            if (!decisionIsCurrent()) return;
+            if (!allowCommit || !swPinyinRequestIsCurrent(requestSeq, candidateFingerprint)) return;
             pinyinReady = true;
             const brandSw = evidenceSw && String(evidenceSw.brand || "").trim();
             const relationSw = evidenceSw && typeof NS.classifyBrandPinyinHostEvidence === "function"
@@ -1336,6 +1857,7 @@
               invalidateBrandSpoofDecision(state, "pinyin-clean-apex-exact");
               state._brandSpoofFinalizeScheduled = false;
               state._brandSpoofFinalPresented = false;
+              state._brandSpoofFinalSnapshot = null;
               state._spoofPinyinUpgradeDone = true;
               state._brandElectionSettledUrl = String(location.href || "");
               try {
@@ -1362,20 +1884,39 @@
               return;
             }
             finalize(true);
-          }).catch(() => finalize(true));
+          }).catch(() => {
+            if (!allowCommit || !swPinyinRequestIsCurrent(requestSeq, candidateFingerprint)) return;
+            finalize(true);
+          });
         } catch {
-          finalize(false);
-          setTimeout(() => finalize(true), 800);
+          if (allowCommit) {
+            finalize(false);
+            const requestSeq = Number(state._brandPinyinRequestSequence || 0);
+            const candidateFingerprint = String(state._brandPinyinRequestFingerprint || "");
+            setTimeout(() => {
+              if (!swPinyinRequestIsCurrent(requestSeq, candidateFingerprint)) return;
+              finalize(true);
+            }, 800);
+          }
         }
       };
-      kickSwPinyin();
+      kickSwPinyin(false);
       // 少量重试：标题晚挂 / SW 冷启动
-      setTimeout(kickSwPinyin, 400);
+      setTimeout(() => kickSwPinyin(true), 400);
       // 明确截止裁决：两轮 SW 后成功则中文定稿；否则合法拉丁/中性结论收口。
-      setTimeout(() => finalize(true, true), 1600);
-      return brand;
+      setTimeout(() => {
+        const requestSeq = Number(state._brandPinyinRequestSequence || 0);
+        const candidateFingerprint = String(state._brandPinyinRequestFingerprint || "");
+        if (!swPinyinRequestIsCurrent(requestSeq, candidateFingerprint)) return;
+        finalize(true, true);
+      }, 1600);
+      // Callers use a non-empty return as a committed threat and may install a
+      // fallback brand guard themselves.  Keep the provisional transaction
+      // invisible until presentOnce() has actually elected and guarded it.
+      return state._brandSpoofFinalPresented ? String(state.spoofBrand || "") : "";
     } catch {
-      return String((opts && opts.brand) || "");
+      const state = NS.state || {};
+      return state._brandSpoofFinalPresented ? String(state.spoofBrand || "") : "";
     }
   };
 
@@ -1488,12 +2029,16 @@
       const host = (location.hostname || "").toLowerCase().replace(/^www\./, "");
       // 多标签关键词能拼成域名（title/logo/nav 的 ToDesk + AI ≡ todeskai）→ 绝不报盗版
       // 夹带 apex（qq-musics）或营销子域 win. 不得因首标签对齐而跳过
+      // ★ 年轻无备案：禁止强对齐 / related 捷径（todesk-ze 37 天曾放跑）
+      const youngUnverified = typeof NS.isYoungUnverifiedRegistration === "function"
+        && NS.isYoungUnverifiedRegistration();
       try {
         const ap0 = (typeof NS.getRegistrableDomain === "function" ? NS.getRegistrableDomain(host) : host) || host;
         const apLeft0 = (String(ap0).split(".")[0] || "").toLowerCase();
         const pad0 = typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
           && NS.apexLabelLooksLikeMarketingPaddedBrand(apLeft0);
-        if (!needsBrandAuthority && !pad0 && typeof NS.hostLabelStronglyAlignedWithIdentityKeywords === "function"
+        if (!youngUnverified && !needsBrandAuthority && !pad0
+          && typeof NS.hostLabelStronglyAlignedWithIdentityKeywords === "function"
           && NS.hostLabelStronglyAlignedWithIdentityKeywords(apLeft0)) {
           NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "home-fast-skip-identity-aligned", host);
           return false;
@@ -1502,8 +2047,8 @@
       const rel = typeof NS.evaluateDomainKeywordRelevance === "function"
         ? NS.evaluateDomainKeywordRelevance(host)
         : null;
-      // 几乎关联（exact/category）→ 不显示盗版
-      if (!needsBrandAuthority && rel && rel.related && !rel.squat) {
+      // 几乎关联（exact/category）→ 不显示盗版；年轻无备案不得走此捷径
+      if (!youngUnverified && !needsBrandAuthority && rel && rel.related && !rel.squat) {
         NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "home-fast-skip-almost-related", rel.hostMatch, rel.brandToken);
         return false;
       }
@@ -2539,6 +3084,13 @@
   };
 
   NS.collectProactiveDownloadTargets = function () {
+    const cache = NS.caches || {};
+    const urlKey = String(location.href || "");
+    const now = Date.now();
+    if (cache._proactiveTargets && cache._proactiveTargetsUrl === urlKey
+      && now - Number(cache._proactiveTargetsAt || 0) < 800) {
+      return cache._proactiveTargets;
+    }
     const landing = [];
     const probe = [];
     const seenL = new Set();
@@ -2644,7 +3196,11 @@
         }
       }
     } catch { /* ignore */ }
-    return { landing: landing.slice(0, 10), probe: probe.slice(0, 6) };
+    const out = { landing: landing.slice(0, 10), probe: probe.slice(0, 6) };
+    cache._proactiveTargets = out;
+    cache._proactiveTargetsUrl = urlKey;
+    cache._proactiveTargetsAt = now;
+    return out;
   };
 
   /**

@@ -148,7 +148,7 @@
         let hit = false;
         if (html && html.length >= 200) {
           if (/https?:\/\/[^"'\\<>\s]+\/[A-Za-z][A-Za-z0-9._-]{2,60}\.(?:exe|dmg|msi|pkg|apk)(?:\?|"|'|\\)/i.test(html)
-            && /DingTalk_|ToDesk_|_v\d+\.\d+|win_installer|DownloadLink|com\.[a-z0-9_]+\.[a-z0-9_]+/i.test(html)) {
+            && /_v\d+\.\d+|win_installer|DownloadLink|com\.[a-z0-9_]+\.[a-z0-9_]+/i.test(html)) {
             hit = true;
           } else if (/com\.[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*(?:[._-]\d{2,16})?\.apk/i.test(html)
             && document.querySelector("#ice-container, #root, #app, #__next, #__nuxt")) {

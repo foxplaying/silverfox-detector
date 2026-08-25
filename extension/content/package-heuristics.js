@@ -16,8 +16,12 @@
     try { s = decodeURIComponent(s); } catch { /* ignore */ }
     s = s.split("?")[0].split("#")[0].split("&")[0];
     s = s.split(/[/\\]/).filter(Boolean).pop() || s;
-    const pkgTok = s.match(/([A-Za-z0-9][A-Za-z0-9._-]{2,100}\.(?:zip|exe|apk|xapk|apks|aab|dmg|msi|rar|7z|pkg|appx))$/i);
-    if (pkgTok) s = pkgTok[1];
+    // 仅无空格/波浪号/括号时才剥尾段 token；否则会把
+    // 「My Song Title.zip」截成 Title.zip，破坏曲包多词放行。
+    if (!/[\s~～()]/.test(s)) {
+      const pkgTok = s.match(/([A-Za-z0-9][A-Za-z0-9._-]{2,100}\.(?:zip|exe|apk|xapk|apks|aab|dmg|msi|rar|7z|pkg|appx))$/i);
+      if (pkgTok) s = pkgTok[1];
+    }
     return s.trim();
   };
 
@@ -185,6 +189,17 @@
     const base = name.replace(/\.[^.]+$/, "");
     if (base.length < 3 || base.length > 96) return false;
     if (NS.looksLikeAndroidPackageIdName(base)) return true;
+    // 多词空格/波浪号可读名（Phira 谱面、曲包、带 (1) 的浏览器重名）：当产品包放行
+    // 排除「Brand Setup / 官方安装」类伪官网安装包空格名
+    if (/\s|[~～()]/.test(base)) {
+      const words = base.match(/[a-zA-Z一-鿿]{3,}/g) || [];
+      const compact = base.replace(/[\s~～()[\]._-]+/g, "");
+      if (words.length >= 2
+        && !/(?:^|[\s._-])(?:setup|install|installer|client|official|官网|官方|安装包)(?:$|[\s._-])/i.test(base)
+        && !NS.hasGarbleDigitLetterSoup(compact)) {
+        return true;
+      }
+    }
     let stem = base.replace(/[._-](x64|x86|x86_64|amd64|arm64|arm|win32|win64|mac|linux)$/i, "");
     stem = stem.replace(/[._-]?v?\d+(?:\.\d+){1,5}$/i, "");
     if (!stem || stem.length < 2) stem = base.replace(/[._-](x64|x86|x86_64|amd64|arm64|arm|win32|win64|mac|linux)$/i, "");
@@ -502,11 +517,57 @@
     }
   };
 
+  /**
+   * 页内是否出现「伪官网/强营销下载」话术。
+   * 空格文件名 alone 不得拦截（Phira 谱面、音乐包等合法空格名）；
+   * 必须与本门控捆绑：空格文件名 ∧ 强营销。
+   *
+   * ★ 勿调用 pageClaimsBrandDownloadLanding：它含「任意包链接+拉丁标题」弱规则，
+   *   会把 Phira/曲包站也当成营销落地，空格门形同虚设。
+   */
+  NS.pageHasStrongMarketingDownloadPitch = function () {
+    try {
+      // 仅强官方宣称（官网/官方下载/正版…），不用宽落地页启发
+      if (typeof NS.pageClaimsOfficialDownload === "function" && NS.pageClaimsOfficialDownload()) return true;
+      const title = String(document.title || "");
+      const headings = typeof NS.collectHeadingText === "function" ? NS.collectHeadingText(800) : "";
+      const desc = String(document.querySelector('meta[name="description"]')?.getAttribute("content") || "").slice(0, 360);
+      const kw = String(document.querySelector('meta[name="keywords"]')?.getAttribute("content") || "").slice(0, 360);
+      let ctaBits = "";
+      try {
+        ctaBits = Array.from(document.querySelectorAll(
+          "a[href], button, .btn-header, .btn-primary, .btn-lg, .download-btn, [role='button']"
+        )).slice(0, 40).map((el) => (el.textContent || "").replace(/\s+/g, " ").trim())
+          .filter((t) => t.length >= 2 && t.length <= 28)
+          .join(" ");
+      } catch { /* ignore */ }
+      const claim = `${title} ${headings} ${desc} ${kw} ${ctaBits}`;
+      // 与 page-context strongPitchRe 对齐（真正的伪官网话术）
+      return /官网|官方下载|官方正版|官方网站|官方客户端|电脑版官网|全平台官方|下载中心|客户端下载|官方桌面|正版下载|立即免费下载|全平台客户端|官方渠道|安全官网|软件官网/i.test(claim);
+    } catch {
+      return false;
+    }
+  };
+
   NS.looksLikeBrandNearMissPackageName = function (fileName) {
     const name = NS.normalizeFileName(fileName);
     if (!name || !PACKAGE_NAME.test(name)) return false;
+    const rawLeaf = String(fileName || "").split(/[/\\]/).pop() || name;
+    const decodedLeaf = (() => {
+      try { return decodeURIComponent(rawLeaf.replace(/%20/g, " ")); } catch { return rawLeaf.replace(/%20/g, " "); }
+    })();
+    const hasSpaces = /\s/.test(decodedLeaf) || /\s/.test(name);
+    // ★ 空格文件名必须捆绑强营销话术；否则误杀「Retribution ~ Cycle… (Phira ver.).zip」等
+    if (hasSpaces) {
+      if (typeof NS.pageHasStrongMarketingDownloadPitch === "function"
+        && !NS.pageHasStrongMarketingDownloadPitch()) {
+        return false;
+      }
+      // 空格 ∧ 强营销：须像安装包空格名（Setup/官方/客户端）。
+      // 勿用「词数≤1」兜底——会把 Song (1).zip / Pack (remix).zip 误判成安装包。
+      return /(?:setup|install|installer|client|official|官网|官方|安装包|客户端|正版)/i.test(name);
+    }
     const base = name.replace(/\.[^.]+$/, "").replace(/\s+/g, "");
-    if (/\s+\.(zip|exe|apk|msi|dmg|rar|7z)$/i.test(NS.normalizeFileName(fileName).replace(/%20/g, " ")) || /\s/.test(String(fileName || "").split("/").pop() || "")) return true;
     const title = `${document.title || ""} ${(document.body && document.body.innerText) || ""}`.slice(0, 2000);
     const brandTokens = (title.match(/[A-Za-z]{4,}/g) || []).map((t) => t.toLowerCase())
       .filter((t) => t.length >= 4 && !/^(download|windows|linux|android|macos|official|client|software|remote|free|desk|home|page|site|http|https)$/i.test(t));
@@ -529,13 +590,25 @@
   NS.isThreatObjectStoragePackage = function (href, element) {
     if (!NS.looksLikeObjectStoragePackageUrl(href) && !NS.looksLikeHighRiskBlobPackageUrl(href)) return false;
     const fn = NS.getFilenameFromUrl(href);
+    // 可读多词包名（谱面/曲包）即使挂在对象存储也不当威胁
+    if (NS.looksLikeProductPackageName(fn) && !NS.looksLikeOversimplifiedBrandInstallerName(fn)
+      && !NS.isSuspiciousDownloadFilename(fn)) {
+      try {
+        const host = new URL(href, location.href).hostname;
+        // 匿名高熵桶仍拦；普通 OSS/CDN + 可读名放行
+        if (!NS.isAnonymousPublicObjectHost(host)) return false;
+      } catch { return false; }
+    }
     try {
       const host = new URL(href, location.href).hostname;
       if (NS.isAnonymousPublicObjectHost(host)) return true;
       if (NS.hostLooksLikePublicObjectStorageEndpoint(host) && NS.looksLikeObjectStoragePackageUrl(href)) return true;
     } catch { /* ignore */ }
     if (NS.looksLikeHighRiskBlobPackageUrl(href)) return true;
-    if (NS.looksLikeBrandNearMissPackageName(fn)) return true;
+    // 品牌近失须再捆强营销（looksLikeBrandNearMiss 内部已对空格门控；此处避免无营销的 token 近失单独抬威胁）
+    if (NS.looksLikeBrandNearMissPackageName(fn)
+      && typeof NS.pageHasStrongMarketingDownloadPitch === "function"
+      && NS.pageHasStrongMarketingDownloadPitch()) return true;
     if (NS.isClearProductOrAndroidPackage(fn) || NS.isClearProductOrAndroidPackage(href) || NS.looksLikeProductPackageName(fn)) {
       if (NS.looksLikeHighRiskBlobPackageUrl(href)) return true;
       if (NS.looksLikeObjectStoragePackageUrl(href) && NS.looksLikeOversimplifiedBrandInstallerName(fn)) return true;
@@ -578,6 +651,25 @@
     }
   };
 
+  NS.looksLikeMajorSearchEngineHost = function (hostname) {
+    try {
+      const h = String(hostname || "").toLowerCase().replace(/^www\./, "").replace(/\.$/, "");
+      if (!h) return false;
+      // 主站 / 常见搜索子域；产品路径（maps/images）由 looksLikeSearchEngineTrapUrl 再筛
+      if (/^(?:bing|baidu|google|sogou|so|yahoo|duckduckgo|yandex|sm|haosou|shenma)\.(?:com|cn|com\.cn|co\.jp|co\.uk|ru|net)$/i.test(h)) {
+        return true;
+      }
+      if (/^(?:cn|m|www2|search)\.(?:bing|baidu|google|sogou)\.(?:com|cn)$/i.test(h)) return true;
+      if (/^(?:google)\.(?:com?\.)?[a-z]{2,}$/i.test(h) && !/\.(?:apis|usercontent|analytics)\./i.test(h)) {
+        // google.com.hk / google.co.jp 等；排除非搜索产品主机
+        return /^(?:google)\./i.test(h);
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
   NS.looksLikeSearchEngineLandingUrl = function (url) {
     try {
       const u = new URL(url, location.href);
@@ -588,6 +680,33 @@
       if (/(?:^|\/)(?:search|results?)(?:\/|$)/i.test(path) && /[?&](?:q|query|keyword|text|wd|word|p|search)=[^&]+/i.test(q)) return true;
       if (/\/(?:s|web)$/i.test(path) && /[?&](?:q|query|keyword|text|wd|word|p)=[^&]+/i.test(q)) return true;
       if (/\/(?:url|link|redirect|rd|jump)$/i.test(path) && /[?&](?:q|url|u|target|to|redir|redirect)=[^&]+/i.test(q)) return true;
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * 下载陷阱用：含带参搜索落地，以及裸搜索引擎首页（https://www.bing.com/）。
+   * 仿冒 download.html 常把「立即下载」全指到必应/百度首页，旧逻辑因无 query 漏检。
+   */
+  NS.looksLikeSearchEngineTrapUrl = function (url) {
+    try {
+      if (typeof NS.looksLikeSearchEngineLandingUrl === "function" && NS.looksLikeSearchEngineLandingUrl(url)) {
+        return true;
+      }
+      const u = new URL(url, location.href);
+      if (/\.(zip|exe|apk|dmg|msi|rar|7z|pkg|appx)(?:\?|#|$)/i.test(u.pathname || "") || PACKAGE_EXT.test(u.href)) {
+        return false;
+      }
+      if (typeof NS.looksLikeMajorSearchEngineHost !== "function"
+        || !NS.looksLikeMajorSearchEngineHost(u.hostname)) {
+        return false;
+      }
+      const path = (u.pathname || "").toLowerCase().replace(/\/+$/, "") || "/";
+      // 仅首页 / 空路径 / 极浅搜索入口；排除 maps/images/news 等产品页
+      if (path === "/" || path === "") return true;
+      if (/^\/(?:search|s|web|wd|results?)(?:\/|$)/i.test(path)) return true;
       return false;
     } catch {
       return false;
@@ -615,10 +734,13 @@
     }
   };
 
-  NS.looksLikeOfficialProductDownloadEndpoint = function (href) {
+  NS.looksLikeOfficialProductDownloadEndpoint = function (href, pageHostSpoofHint) {
     if (!href || /^(javascript:|#|data:|blob:|mailto:|tel:)/i.test(href)) return false;
     try {
-      if (typeof NS.hostLooksLikeBrandMarketingSpoof === "function" && NS.hostLooksLikeBrandMarketingSpoof()) return false;
+      const pageHostSpoof = typeof pageHostSpoofHint === "boolean"
+        ? pageHostSpoofHint
+        : (typeof NS.hostLooksLikeBrandMarketingSpoof === "function" && NS.hostLooksLikeBrandMarketingSpoof());
+      if (pageHostSpoof) return false;
       const u = new URL(href, location.href);
       if (!NS.isSamePageBrandApex(u.href)) return false;
       const path = (u.pathname || "").toLowerCase().replace(/\/+$/, "") || "/";

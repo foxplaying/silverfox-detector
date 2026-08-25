@@ -130,28 +130,84 @@
       const { claimsOfficial, tokens } = NS.getClaimedBrandContext();
       const officialPitch = claimsOfficial || NS.pageClaimsOfficialDownload();
       if (!officialPitch && tokens.size === 0) return false;
+      const trapUrl = (u) => {
+        try {
+          if (typeof NS.looksLikeSearchEngineTrapUrl === "function") return !!NS.looksLikeSearchEngineTrapUrl(u);
+          return typeof NS.looksLikeSearchEngineLandingUrl === "function" && !!NS.looksLikeSearchEngineLandingUrl(u);
+        } catch { return false; }
+      };
+
+      let absList = [];
+      let platformKeys = 0;
+      let hasStartDownload = false;
+      let fromDomCtas = false;
+
       let blob = "";
       try { for (const s of Array.from(document.scripts || [])) { const t = s.textContent || ""; if (t.length >= 30) blob += `${t}\n`; if (blob.length > 150000) break; } } catch { blob = NS.collectPageScriptScanBlob(120000); }
       try { blob += `\n${NS.getThreatScanHtml(60000)}`; } catch { /* ignore */ }
-      const hasStartDownload = /function\s+startDownload\s*\(\s*platform\s*\)/i.test(blob) && /downloadUrls\s*\[\s*platform\s*\]/i.test(blob);
+      hasStartDownload = /function\s+startDownload\s*\(\s*platform\s*\)/i.test(blob) && /downloadUrls\s*\[\s*platform\s*\]/i.test(blob);
       const mapMatch = blob.match(/(?:const|let|var)\s+downloadUrls\s*=\s*\{([\s\S]{10,1200}?)\}/);
-      if (!mapMatch && !hasStartDownload) return false;
-      const mapBody = mapMatch ? mapMatch[1] : blob;
-      const platformKeys = (mapBody.match(/\b(?:windows|mac|macos|linux|android|ios|win|osx)\b/gi) || []).length;
-      const urls = (mapBody.match(/https?:\/\/[^\s"'\\]+/gi) || []).map((u) => u.replace(/[),;]+$/, ""));
-      if (urls.length < 2 && platformKeys < 2) return false;
-      const absList = [];
-      for (const raw of urls) { try { absList.push(new URL(raw, location.href).href); } catch { absList.push(raw); } }
-      if (absList.length < 2) return false;
+      if (mapMatch || hasStartDownload) {
+        const mapBody = mapMatch ? mapMatch[1] : blob;
+        platformKeys = (mapBody.match(/\b(?:windows|mac|macos|linux|android|ios|win|osx)\b/gi) || []).length;
+        const urls = (mapBody.match(/https?:\/\/[^\s"'\\]+/gi) || []).map((u) => u.replace(/[),;]+$/, ""));
+        for (const raw of urls) { try { absList.push(new URL(raw, location.href).href); } catch { absList.push(raw); } }
+      }
+
+      // ★ DOM 路径：静态页把「下载 Windows/macOS/…」全写成 https://www.bing.com/（无 downloadUrls 字典）
+      if (absList.length < 2) {
+        const domUrls = [];
+        let domPlatform = 0;
+        try {
+          const nodes = document.querySelectorAll(
+            "a.js-download[href], a[data-dl][href], a.btn-download[href], a.download-btn[href], "
+            + "a.btn-blue[href], a.btn[href], a[class*='download'][href]"
+          );
+          const lim = Math.min(nodes.length, 48);
+          for (let i = 0; i < lim; i++) {
+            const el = nodes[i];
+            const href = (el.getAttribute("href") || "").trim();
+            if (!href || href === "#" || /^javascript:/i.test(href)) continue;
+            const text = (el.textContent || "").replace(/\s+/g, " ").trim();
+            const cls = String(el.className || "");
+            const isDl = /js-download|btn-download|download-btn/i.test(cls)
+              || el.hasAttribute("data-dl")
+              || /立即下载|免费下载|官方下载|客户端下载|下载\s*(?:Windows|macOS|Mac|Linux|Android|iOS|Win)|重新下载/i.test(text)
+              || (/下载/.test(text) && text.length <= 28 && /btn|download/i.test(cls));
+            if (!isDl) continue;
+            if (/Windows|macOS|\bMac\b|Linux|Android|iOS|Win(?:dows)?/i.test(text)
+              || /windows|macos|linux|android|ios|mobile|win/i.test(el.getAttribute("data-dl") || "")) {
+              domPlatform++;
+            }
+            try { domUrls.push(new URL(href, location.href).href); } catch { domUrls.push(href); }
+          }
+        } catch { /* ignore */ }
+        if (domUrls.length >= 2) {
+          absList = domUrls;
+          platformKeys = Math.max(platformKeys, domPlatform);
+          fromDomCtas = true;
+        }
+      }
+
+      if (absList.length < 2 && platformKeys < 2) return false;
       const unique = [...new Set(absList)];
-      const serpHits = absList.filter((u) => NS.looksLikeSearchEngineLandingUrl(u)).length;
+      if (unique.length < 1) return false;
+      const serpHits = absList.filter((u) => trapUrl(u)).length;
       const allSame = unique.length === 1;
       const allSerp = serpHits >= 2 && serpHits === absList.length;
-      const sameSerp = allSame && NS.looksLikeSearchEngineLandingUrl(unique[0]);
-      const multiSameExternal = allSame && platformKeys >= 3 && !NS.isPackageFileUrl(unique[0]);
-      if (!(sameSerp || allSerp || (hasStartDownload && multiSameExternal) || (platformKeys >= 3 && multiSameExternal && officialPitch))) return false;
+      const sameSerp = allSame && trapUrl(unique[0]);
+      const multiSameExternal = allSame && platformKeys >= 2 && !NS.isPackageFileUrl(unique[0]);
+      const mostlySerp = serpHits >= 2 && serpHits >= Math.ceil(absList.length * 0.75);
+      if (!(sameSerp || allSerp || mostlySerp
+        || (hasStartDownload && multiSameExternal)
+        || (platformKeys >= 3 && multiSameExternal && officialPitch)
+        || (fromDomCtas && mostlySerp && (officialPitch || platformKeys >= 2)))) {
+        return false;
+      }
       const spoofHost = NS.hostLooksLikeBrandMarketingSpoof();
-      if (!spoofHost && !officialPitch) return false;
+      const rejectShortcut = typeof NS.shouldRejectOfficialDownloadShortcut === "function"
+        && NS.shouldRejectOfficialDownloadShortcut();
+      if (!spoofHost && !officialPitch && !rejectShortcut && !mostlySerp) return false;
       state._multiPlatformSerpTrap = true;
       const sample = unique[0] || absList[0] || "";
       let hostLabel = sample;

@@ -9,25 +9,33 @@
   // 聚合“无备案”只短期复用：避免每次刷新都重打三个来源，同时不给第三方滞后
   // 结果造成长期钉死。任一备案号正缓存仍优先于该负缓存。
   const ICP_MISS_CACHE_TTL_MS = 15 * 60 * 1000;
-  const ICP_CACHE_KEY_PREFIX = "icp_cache_v4_";
-  const ICP_MISS_KEY_PREFIX = "icp_miss_v2_";
+  // v6/v4: ICP records are bound to the exact queried host and the PSL
+  // registrable domain. Older keys collapsed www into the bare domain and
+  // could make a fallback result look like an exact-host hit.
+  // entries may contain a shared suffix owner's record (cn.com/github.io)
+  // attributed to an unrelated tenant, so they must never be reused.
+  const ICP_CACHE_KEY_PREFIX = "icp_cache_v6_";
+  const ICP_MISS_KEY_PREFIX = "icp_miss_v4_";
   // 顺序：爱站 → beiancx → uapis（race 并行，任一命中备案号即返回）
   const ICP_CACHE_SOURCES = ["aizhan", "beiancx", "uapis"];
   const WHOIS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
   // v6：禁止用 ageDays 伪造 registeredAt；拒绝 gov.cn/com.cn 公共后缀结果；缓存失效旧脏数据
-  const WHOIS_CACHE_KEY_PREFIX = "whois_cache_v6_";
+  // v8 records the domain returned by WHOIS/RDAP and keeps www in the cache
+  // key. Older entries cannot prove that a fallback ICP domain was really the
+  // domain described by the response.
+  const WHOIS_CACHE_KEY_PREFIX = "whois_cache_v8_";
 
   /**
    * 所有外部 HTTP(S) 经 background SW。content-script fetch 受 CORS 限制。
    * @param {string} url
    * @param {{ method?: string, body?: string, contentType?: string, timeoutMs?: number,
-   *           redirect?: string, statusOnly404?: boolean }} [opts]
+   *           redirect?: string }} [opts]
    */
   NS.fetchPageTextFromBackground = function (url, opts = {}) {
     return new Promise((resolve) => {
       try {
         if (!chrome?.runtime?.id) { resolve({ success: false, error: "no-extension-runtime" }); return; }
-        const payload = { type: "fetchPageText", url, method: opts.method || "GET", body: opts.body, contentType: opts.contentType, timeoutMs: opts.timeoutMs != null ? opts.timeoutMs : 5000, redirect: opts.redirect || "follow", statusOnly404: opts.statusOnly404 === true };
+        const payload = { type: "fetchPageText", url, method: opts.method || "GET", body: opts.body, contentType: opts.contentType, timeoutMs: opts.timeoutMs != null ? opts.timeoutMs : 5000, redirect: opts.redirect || "follow" };
         chrome.runtime.sendMessage(payload, (response) => {
           if (chrome.runtime.lastError || !response) { resolve({ success: false, error: chrome.runtime.lastError?.message || response?.error || "fetch-failed" }); return; }
           if (response.success !== true) { resolve({ success: false, error: response.error || "fetch-failed", status: response.status, url: response.url }); return; }
@@ -90,8 +98,8 @@
   };
 
   // --- ICP 缓存 ---
-  function icpCacheStorageKey(domain, source) { return `${ICP_CACHE_KEY_PREFIX}${String(source || "unknown")}_${NS.normalizeDomain(domain)}`; }
-  function icpMissingCacheKey(domain) { return `${ICP_MISS_KEY_PREFIX}${NS.normalizeDomain(domain)}`; }
+  function icpCacheStorageKey(domain, source) { return `${ICP_CACHE_KEY_PREFIX}${String(source || "unknown")}_${intelHost(domain)}`; }
+  function icpMissingCacheKey(domain) { return `${ICP_MISS_KEY_PREFIX}${intelHost(domain)}`; }
 
   function readIcpCache(domain, source) {
     const key = icpCacheStorageKey(domain, source);
@@ -110,7 +118,7 @@
   }
 
   function readIcpCacheBatch(hosts) {
-    const list = (hosts || []).map((h) => NS.normalizeDomain(h)).filter(Boolean);
+    const list = (hosts || []).map(intelHost).filter(Boolean);
     const keys = [];
     for (const h of list) { for (const src of ICP_CACHE_SOURCES) keys.push(icpCacheStorageKey(h, src)); keys.push(icpMissingCacheKey(h)); }
     return new Promise((resolve) => {
@@ -127,7 +135,7 @@
             if (!entry || typeof entry !== "object" || !entry.ts) continue;
             const ttl = entry.missing === true ? ICP_MISS_CACHE_TTL_MS : ICP_CACHE_TTL_MS;
             if (now - entry.ts > ttl) { expired.push(key); continue; }
-            if (entry.missing === true) { map.set(key, { success: true, icpRecord: "", icpMissing: true, source: entry.source || "aggregate", fromCache: true, queriedHost: entry.queriedHost || "", hostMiss: true }); continue; }
+            if (entry.missing === true) { map.set(key, { success: true, icpRecord: "", icpMissing: true, source: entry.source || "aggregate", fromCache: true, queriedHost: entry.queriedHost || "", hostMiss: true, attributionRejected: entry.attributionRejected === true, rejectedRecordHosts: Array.isArray(entry.rejectedRecordHosts) ? entry.rejectedRecordHosts : [] }); continue; }
             if (!entry.result) continue;
             map.set(key, { ...entry.result, fromCache: true });
           }
@@ -139,38 +147,88 @@
   }
 
   function writeIcpMissingCache(domain, meta) {
-    const host = NS.normalizeDomain(domain);
+    const host = intelHost(domain);
     if (!host) return Promise.resolve();
     const key = icpMissingCacheKey(host);
-    const toStore = { ts: Date.now(), missing: true, source: (meta && meta.source) || "aggregate", queriedHost: host, triedHosts: (meta && meta.triedHosts) || [] };
+    const toStore = { ts: Date.now(), missing: true, source: (meta && meta.source) || "aggregate", queriedHost: host, triedHosts: (meta && meta.triedHosts) || [], attributionRejected: !!(meta && meta.attributionRejected), rejectedRecordHosts: Array.isArray(meta && meta.rejectedRecordHosts) ? meta.rejectedRecordHosts.map(intelHost).filter(Boolean) : [] };
     try { if (!chrome?.storage?.local) return Promise.resolve(); chrome.storage.local.set({ [key]: toStore }, () => { void chrome.runtime.lastError; }); } catch { /* ignore */ }
     return Promise.resolve();
   }
 
   function clearIcpMissingCache(domain) {
-    const host = NS.normalizeDomain(domain);
+    const host = intelHost(domain);
     if (!host || !chrome?.storage?.local) return;
     try { chrome.storage.local.remove([icpMissingCacheKey(host)], () => { void chrome.runtime.lastError; }); } catch { /* ignore */ }
+  }
+
+  /**
+   * Bind an ICP hit to the registrable site that was actually queried.
+   * A suffix-only owner such as cn.com/github.io must never donate its record
+   * to a tenant below that shared suffix. Sources without a returned domain
+   * are accepted only for ordinary ICANN domains; private/shared suffix
+   * tenants require an explicitly scoped result.
+   */
+  function icpResultIsSafelyAttributed(result, queriedHost) {
+    const host = intelHost(queriedHost);
+    if (!host || !result) return false;
+    let info = null;
+    try {
+      info = typeof NS.parseHostWithTldts === "function"
+        ? NS.parseHostWithTldts(host)
+        : null;
+    } catch { info = null; }
+
+    const claimed = intelHost(result.domain || "");
+    const explicit = result.domainExplicit === true;
+    if (explicit) {
+      if (!claimed) return false;
+      if (claimed === host) return true;
+      // Without a real PSL result, parent-domain inheritance is unsafe.
+      if (!(info && info.pslAvailable === true && info.domain)) return false;
+      let claimedInfo = null;
+      try { claimedInfo = NS.parseHostWithTldts(claimed); } catch { claimedInfo = null; }
+      if (!(claimedInfo && claimedInfo.pslAvailable === true && claimedInfo.domain)) return false;
+      return claimedInfo.domain === info.domain && claimed === info.domain;
+    }
+
+    // Aizhan does not return a domain field. On a shared/private suffix there
+    // is no way to tell whether it returned the suffix owner's record.
+    if (info && info.pslAvailable === true) {
+      if (!info.domain || info.isPrivate === true) return false;
+      return true;
+    }
+    // PSL failed to load: fail closed for multi-label parents, while retaining
+    // exact two-label ICANN queries as a compatibility fallback.
+    return host.split(".").filter(Boolean).length === 2;
   }
 
   function statusFromIcpBatchMap(host, batchMap) {
     if (!host || !batchMap) return null;
     for (const src of ICP_CACHE_SOURCES) {
       const cached = batchMap.get(icpCacheStorageKey(host, src));
-      if (cached && cached.success && cached.icpRecord && NS.looksLikeIcpLicense(cached.icpRecord)) return { kind: "license", data: { ...cached, matchedHost: host, fromCache: true } };
+      if (cached && cached.success && cached.icpRecord && NS.looksLikeIcpLicense(cached.icpRecord)
+        && icpResultIsSafelyAttributed(cached, host)) {
+        return { kind: "license", data: { ...cached, matchedHost: host, fromCache: true } };
+      }
     }
     const hostMiss = batchMap.get(icpMissingCacheKey(host));
-    if (hostMiss && (hostMiss.icpMissing || hostMiss.hostMiss || hostMiss.missing)) return { kind: "missing", data: { success: true, icpRecord: "", icpMissing: true, matchedHost: host, queriedHost: hostMiss.queriedHost || host, source: hostMiss.source || "aggregate", fromCache: true } };
+    if (hostMiss && (hostMiss.icpMissing || hostMiss.hostMiss || hostMiss.missing)) return { kind: "missing", data: { success: true, icpRecord: "", icpMissing: true, matchedHost: host, queriedHost: hostMiss.queriedHost || host, source: hostMiss.source || "aggregate", fromCache: true, attributionRejected: hostMiss.attributionRejected === true, rejectedRecordHosts: Array.isArray(hostMiss.rejectedRecordHosts) ? hostMiss.rejectedRecordHosts : [] } };
     return null;
   }
 
   function writeIcpCache(domain, result) {
     if (!domain || !result || result.success !== true) return Promise.resolve();
     const source = result.source || "unknown";
-    const host = NS.normalizeDomain(domain);
+    const host = intelHost(domain);
     const key = icpCacheStorageKey(domain, source);
     const hasLicense = !!(result.icpRecord && NS.looksLikeIcpLicense(result.icpRecord));
-    const toStore = { ts: Date.now(), result: { success: true, icpRecord: hasLicense ? result.icpRecord : "", icpMissing: hasLicense ? false : true, source, unitName: result.unitName || "", natureName: result.natureName || "", queriedHost: result.queriedHost || host, domain: result.domain || host } };
+    if (hasLicense && !icpResultIsSafelyAttributed(result, host)) return Promise.resolve();
+    const returnedDomain = intelHost(result.domain || "");
+    const queriedHost = intelHost(result.queriedHost || host) || host;
+    const recordHost = result.domainExplicit === true && returnedDomain
+      ? returnedDomain
+      : (intelHost(result.recordHost || queriedHost) || host);
+    const toStore = { ts: Date.now(), result: { success: true, icpRecord: hasLicense ? result.icpRecord : "", icpMissing: hasLicense ? false : true, source, unitName: result.unitName || "", natureName: result.natureName || "", queriedHost, recordHost, domain: returnedDomain || host, domainExplicit: result.domainExplicit === true } };
     try { if (!chrome?.storage?.local) return Promise.resolve(); chrome.storage.local.set({ [key]: toStore }, () => { void chrome.runtime.lastError; }); if (hasLicense) clearIcpMissingCache(host); } catch { /* ignore */ }
     return Promise.resolve();
   }
@@ -182,19 +240,38 @@
     // 只复用「有备案号」的缓存；missing 缓存不短路，避免爱站误 miss 钉死真备案
     if (batchMap) {
       const hit = batchMap.get(icpCacheStorageKey(host, source));
-      if (hit && hit.success && hit.icpRecord && NS.looksLikeIcpLicense(hit.icpRecord)) {
+      if (hit && hit.success && hit.icpRecord && NS.looksLikeIcpLicense(hit.icpRecord)
+        && icpResultIsSafelyAttributed(hit, host)) {
         return { ...hit, queriedHost: hit.queriedHost || host, fromCache: true };
       }
     } else {
       const cached = await readIcpCache(host, source);
-      if (cached && cached.success && cached.icpRecord && NS.looksLikeIcpLicense(cached.icpRecord)) {
+      if (cached && cached.success && cached.icpRecord && NS.looksLikeIcpLicense(cached.icpRecord)
+        && icpResultIsSafelyAttributed(cached, host)) {
         return { ...cached, queriedHost: cached.queriedHost || host };
       }
     }
     const result = await fetcher(host);
     if (result && result.success) {
       const hasLicense = !!(result.icpRecord && NS.looksLikeIcpLicense(result.icpRecord));
-      const normalized = { ...result, source: result.source || source, icpRecord: hasLicense ? result.icpRecord : "", icpMissing: !hasLicense };
+      const returnedDomain = intelHost(result.domain || "");
+      const queriedHost = intelHost(result.queriedHost || host) || host;
+      const recordHost = result.domainExplicit === true && returnedDomain
+        ? returnedDomain
+        : (intelHost(result.recordHost || queriedHost) || host);
+      const normalized = { ...result, source: result.source || source, queriedHost, recordHost, domain: returnedDomain || host, icpRecord: hasLicense ? result.icpRecord : "", icpMissing: !hasLicense };
+      if (hasLicense && !icpResultIsSafelyAttributed(normalized, host)) {
+        return {
+          ...normalized,
+          success: false,
+          icpRecord: "",
+          icpMissing: false,
+          attributionRejected: true,
+          rejectedIcpRecord: normalized.icpRecord,
+          rejectedRecordHost: recordHost,
+          queriedHost: result.queriedHost || host
+        };
+      }
       // 仅缓存命中备案；单源 missing 不写 24h 负缓存（爱站对真备案常假 missing）
       if (hasLicense) writeIcpCache(host, normalized);
       if (batchMap) batchMap.set(icpCacheStorageKey(host, source), { ...normalized, fromCache: false });
@@ -241,11 +318,9 @@
     return { success: false, source: "aizhan" };
   }
 
-  // 爱站/uapis 轻量接口；beiancx 整页 HTML 更慢
+  // 三个来源均走轻量接口；beiancx 直接调用结果页自身使用的 JSON POST。
   const ICP_FAST_TIMEOUT_MS = 2000;
-  // beiancx 对不存在的裸域偶尔连响应头都不返回；3.2 秒即结束该源，
-  // 其它源仍完整执行，避免一个挂起连接拖慢整轮。
-  const ICP_BEIANCX_TIMEOUT_MS = 2200;
+  const ICP_BEIANCX_TIMEOUT_MS = 4000;
 
   /**
    * 解析 uapis.cn ICP JSON，区分三类结局：
@@ -267,13 +342,19 @@
     ).trim();
     const unitRaw = String(data.unitName || "").trim();
     const natureRaw = String(data.natureName || "").trim();
-    const domain = intelHost(data.domain || host);
+    const returnedDomain = intelHost(data.domain || "");
+    const domain = returnedDomain || intelHost(host);
     const unitName = isIcpPlaceholderField(unitRaw) ? "" : unitRaw;
     const natureName = isIcpPlaceholderField(natureRaw) ? "" : natureRaw;
-    const base = { source: "uapis", unitName, natureName, domain };
+    const base = {
+      source: "uapis",
+      unitName,
+      natureName,
+      domain,
+      domainExplicit: !!returnedDomain
+    };
 
     // ① 真实命中优先（含 msg=query success / 查询成功；勿被其它分支误伤）
-    // 实测 ssusu.com: {"code":"200","serviceLicence":"湘ICP备2024068964号","msg":"query success"}
     if (NS.looksLikeIcpLicense(licenseRaw)
       && (code === "200" || code === "0" || code === "OK" || code === "SUCCESS" || code === ""
         || /query\s*success|查询成功|success/i.test(msg))) {
@@ -310,7 +391,7 @@
       const result = await NS.fetchPageTextFromBackground(url, { timeoutMs: ICP_FAST_TIMEOUT_MS });
       if (!result.success || !result.text) return { success: false, queriedHost: h };
       const parsed = extractIcpFromAizhanResponse(result.text);
-      return { ...parsed, source: "aizhan", queriedHost: h };
+      return { ...parsed, source: "aizhan", queriedHost: h, domainExplicit: false };
     }, batchMap);
   }
 
@@ -327,69 +408,68 @@
     }, batchMap);
   }
 
-  /**
-   * beiancx.com/{domain}.html
-   * SSR 把备案号写在 JSON-LD：mainEntity.identifier（京ICP备… / 粤B2-… 等）。
-   * 404 / 未备案 → missing；有 identifier → hit。不必扫整页 CSS/FAQ。
-   */
-  function extractIcpFromBeiancxHtml(html, httpStatus) {
-    if (Number(httpStatus) === 404) {
-      return { success: true, icpRecord: "", icpMissing: true, source: "beiancx" };
-    }
-    const t = String(html || "");
-    if (!t) return { success: false, source: "beiancx" };
-    if (t.length < 1200 && /404\s*Not\s*Found|nginx/i.test(t)) {
-      return { success: true, icpRecord: "", icpMissing: true, source: "beiancx" };
+  function parseBeiancxIcpJson(payload, host) {
+    if (!payload || typeof payload !== "object") return { success: false, source: "beiancx" };
+    const status = Number(payload.status);
+    const data = payload.data && typeof payload.data === "object" ? payload.data : {};
+    const returnedDomain = intelHost(data.icp_domain || "");
+    const domain = returnedDomain || intelHost(host);
+    const licenseRaw = String(
+      data.icp_numer || data.icp_number || data.icp || data.license || ""
+    ).trim();
+    const unitRaw = String(data.icp_subject || data.unitName || "").trim();
+    const natureRaw = String(data.icp_type || data.natureName || "").trim();
+    const base = {
+      source: "beiancx",
+      upstreamSource: String(payload.source || "").trim(),
+      domain,
+      domainExplicit: !!returnedDomain,
+      unitName: isIcpPlaceholderField(unitRaw) ? "" : unitRaw,
+      natureName: isIcpPlaceholderField(natureRaw) ? "" : natureRaw,
+      reviewDate: String(data.review_date || "").trim(),
+      updateTime: String(data.update_time || "").trim()
+    };
+
+    // 备案号优先于状态码，防止上游状态异常时把真实命中降成 missing。
+    if (NS.looksLikeIcpLicense(licenseRaw)) {
+      return { ...base, success: true, icpRecord: licenseRaw, icpMissing: false };
     }
 
-    // ① JSON-LD mainEntity.identifier（站点稳定字段，含非 ICP 形态如 粤B2-20090059-5）
-    let lic = "";
-    const idm = t.match(/"mainEntity"\s*:\s*\{[^}]*?"identifier"\s*:\s*"([^"]*)"/i);
-    if (idm) lic = String(idm[1] || "").trim();
-
-    // ② 兜底：结果卡片 / 页内标准 ICP 号
-    if (!NS.looksLikeIcpLicense(lic)) {
-      const m = t.match(/result-label[^>]*>\s*备案号\s*<[\s\S]{0,120}?result-value[^>]*>([^<]{4,48})</i)
-        || t.match(/([一-鿿]{1,3}ICP[备证]\d{5,12}号(?:-\d+)?)/i);
-      if (m) lic = String(m[1] || "").trim();
+    // 页面 JS 明确定义 status=201 为“当前未备案”。
+    if (status === 201) {
+      return { ...base, success: true, icpRecord: "", icpMissing: true, unitName: "", natureName: "" };
     }
 
-    if (NS.looksLikeIcpLicense(lic)) {
-      const um = t.match(/result-label[^>]*>\s*主办单位名称\s*<[\s\S]{0,120}?result-value[^>]*>([^<]{2,80})</i);
-      return {
-        success: true,
-        icpRecord: lic,
-        icpMissing: false,
-        source: "beiancx",
-        unitName: um ? String(um[1] || "").trim() : ""
-      };
-    }
-
-    // identifier 为空 / 明确未备案
-    if ((idm && !lic) || (/未备案|未查询到备案|暂无备案|没有备案/i.test(t)
-      && !/已查询到备案|已备案|ICP filing record/i.test(t))) {
-      return { success: true, icpRecord: "", icpMissing: true, source: "beiancx" };
-    }
-    return { success: false, source: "beiancx" };
+    // status=200 却没有有效 data/备案号，以及所有错误状态，都属于查询失败；
+    // 不能写入“无备案”缓存。
+    return { ...base, success: false, icpRecord: "", icpMissing: false };
   }
 
   async function queryIcpBeiancx(domain, batchMap) {
     return withIcpCache(domain, "beiancx", async (h) => {
-      const url = `https://beiancx.com/${encodeURIComponent(h)}.html`;
-      // beiancx 的 nginx 404 偶尔不结束响应体；状态码已足够判定 missing，
-      // 不应继续等 response.text() 直到超时。
-      const result = await NS.fetchPageTextFromBackground(url, {
+      const body = new URLSearchParams({
+        url: h,
+        force_refresh: "0",
+        refresh_token: "",
+        refresh_verify_mode: "slider",
+        hv_moves: "0",
+        hv_ms: "0"
+      }).toString();
+      const result = await NS.fetchPageTextFromBackground("https://beiancx.com/icp.php", {
+        method: "POST",
+        body,
+        contentType: "application/x-www-form-urlencoded;charset=UTF-8",
         timeoutMs: ICP_BEIANCX_TIMEOUT_MS,
-        statusOnly404: true
+        redirect: "follow"
       });
-      const st = Number(result && result.status) || 0;
-      if (!result.success) {
-        if (st === 404 || /404|not\s*found/i.test(String(result.error || ""))) {
-          return { success: true, icpRecord: "", icpMissing: true, source: "beiancx", queriedHost: h };
-        }
+      if (!result.success || !result.text) {
         return { success: false, queriedHost: h, source: "beiancx" };
       }
-      return { ...extractIcpFromBeiancxHtml(result.text || "", st), source: "beiancx", queriedHost: h, domain: h };
+      try {
+        return { ...parseBeiancxIcpJson(JSON.parse(result.text), h), queriedHost: h };
+      } catch {
+        return { success: false, queriedHost: h, source: "beiancx" };
+      }
     }, batchMap);
   }
 
@@ -408,16 +488,22 @@
     );
     if (licenseHit) return { ...licenseHit, icpMissing: false };
     const missing = results.filter((r) => r && r.success && r.icpMissing);
-    if (missing.length) {
+    const rejected = results.filter((r) => r && r.attributionRejected === true);
+    if (missing.length || rejected.length) {
       const preferred = missing.find((r) => String(r.source || "").toLowerCase() === "uapis")
         || missing.find((r) => String(r.source || "").toLowerCase() === "beiancx")
-        || missing[0];
+        || missing[0]
+        || rejected.find((r) => String(r.source || "").toLowerCase() === "uapis")
+        || rejected.find((r) => String(r.source || "").toLowerCase() === "beiancx")
+        || rejected[0];
       return {
         ...preferred,
         success: true,
         icpRecord: "",
         icpMissing: true,
-        missingSources: missing.map((r) => String(r.source || "")).filter(Boolean)
+        attributionRejected: rejected.length > 0,
+        rejectedRecordHosts: rejected.map((r) => intelHost(r.rejectedRecordHost || r.recordHost || r.domain || "")).filter(Boolean),
+        missingSources: [...missing, ...rejected].map((r) => String(r.source || "")).filter(Boolean)
       };
     }
     return null; // 全失败，不当 missing
@@ -441,10 +527,17 @@
       out.push(n);
     };
     push(currentHost);
-    if (/^www\./i.test(currentHost)) push(currentHost.replace(/^www\./i, ""));
-    const bare = currentHost.replace(/^www\./i, "");
-    const apex = (typeof NS.getRegistrableDomain === "function" && NS.getRegistrableDomain(bare)) || bare;
-    if (apex) push(apex);
+    // Only a PSL-confirmed registrable domain may be queried as the parent.
+    // The old heuristic reduced todesk.cn.com to cn.com and inherited the
+    // shared suffix owner's ICP record. If PSL is unavailable, query only the
+    // exact host (fail closed) instead of guessing a parent.
+    let parsed = null;
+    try {
+      parsed = typeof NS.parseHostWithTldts === "function"
+        ? NS.parseHostWithTldts(currentHost)
+        : null;
+    } catch { parsed = null; }
+    if (parsed && parsed.pslAvailable === true && parsed.domain) push(parsed.domain);
     return out.length ? out : [currentHost];
   }
 
@@ -466,6 +559,8 @@
     let lastSource = "unknown";
     let sawDefinitiveMissing = false;
     let sawPartialMissing = false;
+    let sawAttributionRejected = false;
+    const rejectedRecordHosts = new Set();
     const partialMissingSources = new Set();
     const toTry = candidates.slice(0, 2);
     const validHosts = toTry.filter((host) =>
@@ -476,7 +571,8 @@
       for (const src of ICP_CACHE_SOURCES) {
         try {
           const hit = batchMap && batchMap.get(icpCacheStorageKey(host, src));
-          if (hit && hit.success && hit.icpRecord && NS.looksLikeIcpLicense(hit.icpRecord)) {
+          if (hit && hit.success && hit.icpRecord && NS.looksLikeIcpLicense(hit.icpRecord)
+            && icpResultIsSafelyAttributed(hit, host)) {
             clearIcpMissingCache(pageHost); clearIcpMissingCache(host);
             NS.silverfoxLog("intel-icp", "host-cache-license", host, src, "ms=", Date.now() - t0);
             return { ...hit, icpMissing: false, matchedHost: host, queriedHost: host, source: src };
@@ -513,8 +609,7 @@
     // 所有查询完成后，备案号优先于任何 missing。
     for (const { host, winner } of hostResults) {
       if (!(winner && winner.icpRecord && NS.looksLikeIcpLicense(winner.icpRecord))) continue;
-      const claimed = NS.normalizeDomain(winner.domain || "");
-      if (claimed && claimed !== host && !NS.intelHostIsValidAttribution(claimed, pageHost)) continue;
+      if (!icpResultIsSafelyAttributed(winner, host)) continue;
       clearIcpMissingCache(pageHost); clearIcpMissingCache(host);
       NS.silverfoxLog("intel-icp", "license", host, winner.source, "ms=", Date.now() - t0);
       return { ...winner, icpMissing: false, matchedHost: host, queriedHost: winner.queriedHost || host };
@@ -528,13 +623,20 @@
       if (sources.some((s) => /^(?:uapis|beiancx|aizhan)$/i.test(String(s || "")))) {
         sawDefinitiveMissing = true;
       }
+      if (winner.attributionRejected === true) {
+        sawAttributionRejected = true;
+        (Array.isArray(winner.rejectedRecordHosts) ? winner.rejectedRecordHosts : []).forEach((h) => {
+          const normalized = intelHost(h);
+          if (normalized) rejectedRecordHosts.add(normalized);
+        });
+      }
       lastSource = winner.source || lastSource;
     }
     if (sawDefinitiveMissing) {
       // 仅严格解析出的明确 missing 才写负缓存；源失败不会进入这里。
-      writeIcpMissingCache(pageHost, { source: lastSource, triedHosts: toTry });
+      writeIcpMissingCache(pageHost, { source: lastSource, triedHosts: toTry, attributionRejected: sawAttributionRejected, rejectedRecordHosts: Array.from(rejectedRecordHosts) });
       NS.silverfoxLog("intel-icp", "missing", pageHost, "ms=", Date.now() - t0);
-      return { success: true, icpRecord: "", icpMissing: true, queriedHost: pageHost, triedHosts: toTry, source: lastSource, fromCache: false };
+      return { success: true, icpRecord: "", icpMissing: true, queriedHost: pageHost, triedHosts: toTry, source: lastSource, fromCache: false, attributionRejected: sawAttributionRejected, rejectedRecordHosts: Array.from(rejectedRecordHosts) };
     }
     if (sawPartialMissing) {
       NS.silverfoxLog("intel-icp", "partial-missing", pageHost,
@@ -555,7 +657,7 @@
   };
 
   // --- WHOIS 缓存 ---
-  function whoisCacheStorageKey(domain) { return WHOIS_CACHE_KEY_PREFIX + NS.normalizeDomain(domain); }
+  function whoisCacheStorageKey(domain) { return WHOIS_CACHE_KEY_PREFIX + intelHost(domain); }
 
   function readWhoisCache(domain) {
     const key = whoisCacheStorageKey(domain);
@@ -579,14 +681,19 @@
     if (!reg) return Promise.resolve(); // 无真实日期不写缓存
     if (NS.isPublicSuffixOnlyHost(result.queriedHost || domain)) return Promise.resolve();
     const key = whoisCacheStorageKey(domain);
+    const queriedHost = intelHost(result.queriedHost || domain);
+    const recordDomain = normalizeWhoisRecordDomain(result.recordDomain);
     const toStore = {
       ts: Date.now(),
       result: {
         success: true,
         registeredAt: reg,
         ageDays: typeof result.ageDays === "number" ? result.ageDays : null,
-        queriedHost: result.queriedHost || NS.normalizeDomain(domain),
-        source: result.source || "rdap.ss"
+        queriedHost,
+        source: result.source || "rdap.ss",
+        recordDomain,
+        recordDomainVerified: result.recordDomainVerified === true
+          && !!recordDomain && recordDomain === queriedHost
       }
     };
     try { if (!chrome?.storage?.local) return Promise.resolve(); chrome.storage.local.set({ [key]: toStore }, () => { void chrome.runtime.lastError; }); } catch { /* ignore */ }
@@ -717,6 +824,14 @@
         ? NS.normalizeHostForIntel(domain)
         : String(domain || "").trim().toLowerCase().replace(/\.+$/g, "");
       if (!h || !h.includes(".")) return true;
+      try {
+        const info = typeof NS.parseHostWithTldts === "function"
+          ? NS.parseHostWithTldts(h)
+          : null;
+        if (info && info.pslAvailable === true) {
+          return !info.domain && info.publicSuffix === h;
+        }
+      } catch { /* use the conservative static fallback below */ }
       const parts = h.split(".").filter(Boolean);
       // ≥3 段：court.gov.cn / www.gov.cn / a.b.com —— 都不是「仅公共后缀」
       if (parts.length >= 3) return false;
@@ -770,7 +885,112 @@
    * 必须有真实 registeredAt；禁止用 ageDays 反推注册日（否则会出现「今天 / 0 天」）。
    * ageDays 仅作交叉校验或由日期推算。
    */
-  function finalizeWhoisResult(host, registeredAt, ageDaysOpt, source) {
+  function normalizeWhoisRecordDomain(raw) {
+    let value = String(raw || "").trim().replace(/^['"]|['"]$/g, "");
+    if (!value || /\s|\//.test(value)) return "";
+    try { value = new URL(`https://${value}`).hostname; } catch { /* use raw */ }
+    const host = intelHost(value);
+    if (!host || !host.includes(".") || !/^[a-z0-9.-]+$/i.test(host)) return "";
+    return host;
+  }
+
+  function extractWhoisDomainsFromText(raw) {
+    const text = String(raw || "");
+    if (!text) return [];
+    const out = [];
+    const re = /(?:^|[\r\n])\s*(?:Domain\s*Name|Domain|域名)\s*[:：]\s*([^\s;]+)/gim;
+    let match;
+    while ((match = re.exec(text))) {
+      const domain = normalizeWhoisRecordDomain(match[1]);
+      if (domain) out.push(domain);
+    }
+    return out;
+  }
+
+  function pickSingleWhoisRecordDomain(values) {
+    const unique = new Set();
+    const push = (value) => {
+      if (Array.isArray(value)) { value.forEach(push); return; }
+      const domain = normalizeWhoisRecordDomain(value);
+      if (domain) unique.add(domain);
+    };
+    (Array.isArray(values) ? values : [values]).forEach(push);
+    return unique.size === 1 ? Array.from(unique)[0] : "";
+  }
+
+  function directWhoisDomainFields(obj, keys) {
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return [];
+    const wanted = new Set((keys || []).map((key) => String(key).toLowerCase()));
+    const out = [];
+    for (const [key, value] of Object.entries(obj)) {
+      if (!wanted.has(String(key).toLowerCase())) continue;
+      if (typeof value === "string" || typeof value === "number") out.push(value);
+    }
+    return out;
+  }
+
+  function standardRdapDomainFields(data) {
+    const containers = [data, data && data.data, data && data.result, data && data.rdap, data && data.rdapData];
+    const out = [];
+    containers.forEach((obj) => out.push(...directWhoisDomainFields(obj, ["ldhName", "unicodeName"])));
+    return out;
+  }
+
+  /**
+   * Source-specific identity extraction. Generic recursive `domain` matching
+   * is intentionally forbidden: several APIs echo the requested domain in an
+   * envelope even when the embedded WHOIS record belongs to another domain.
+   */
+  function extractRdapSsRecordDomain(data) {
+    const whoisData = data && data.whoisData;
+    const rawParts = [
+      data && data.rawData,
+      data && data.raw,
+      data && data.whois,
+      typeof (data && data.result) === "string" ? data.result : "",
+      whoisData && whoisData.raw,
+      whoisData && whoisData.whois
+    ];
+    return pickSingleWhoisRecordDomain([
+      standardRdapDomainFields(data),
+      directWhoisDomainFields(whoisData, ["Domain Name", "Domain_Name", "domainName"]),
+      rawParts.flatMap(extractWhoisDomainsFromText)
+    ]);
+  }
+
+  function extractWhoiscxRecordDomain(data, fields, rawWhois) {
+    return pickSingleWhoisRecordDomain([
+      directWhoisDomainFields(fields, ["Domain Name", "Domain_Name", "domain_name", "domainName"]),
+      extractWhoisDomainsFromText(rawWhois),
+      standardRdapDomainFields(data)
+    ]);
+  }
+
+  function extractWhoDatRecordDomain(data) {
+    return pickSingleWhoisRecordDomain([
+      // Generic domain/domainName fields may only echo the requested URL.
+      // Strict fallback proof accepts RDAP identity or raw WHOIS identity.
+      directWhoisDomainFields(data, ["ldhName", "unicodeName"]),
+      extractWhoisDomainsFromText(data && (data.raw || data.whois || data.rawWhois))
+    ]);
+  }
+
+  function extractTianHuRecordDomain(data, payload, fmtDomain) {
+    return pickSingleWhoisRecordDomain([
+      directWhoisDomainFields(fmtDomain, ["domain", "domainName", "domain_name", "Domain Name", "name", "ldhName", "unicodeName"]),
+      extractWhoisDomainsFromText(payload && payload.result),
+      standardRdapDomainFields(data)
+    ]);
+  }
+
+  function extractOfficialRdapRecordDomain(data) {
+    // Official RDAP identity is the top-level ldhName/unicodeName only.
+    return pickSingleWhoisRecordDomain(
+      directWhoisDomainFields(data, ["ldhName", "unicodeName"])
+    );
+  }
+
+  function finalizeWhoisResult(host, registeredAt, ageDaysOpt, source, recordDomainOpt) {
     if (NS.isPublicSuffixOnlyHost(host)) return null;
     const regIso = parseWhoisDateToIso(registeredAt);
     if (!regIso) return null;
@@ -783,13 +1003,17 @@
       if (ageDays == null) ageDays = apiDays;
       else if (Math.abs(apiDays - ageDays) <= 2) ageDays = apiDays;
     }
+    const queriedHost = intelHost(host);
+    const recordDomain = normalizeWhoisRecordDomain(recordDomainOpt);
     return {
       success: true,
       registeredAt: regIso,
       ageDays: ageDays != null ? ageDays : null,
       // 保留 www（www.gov.cn 不得写成 gov.cn）
-      queriedHost: intelHost(host),
-      source: source || "whois"
+      queriedHost,
+      source: source || "whois",
+      recordDomain,
+      recordDomainVerified: !!(recordDomain && recordDomain === queriedHost)
     };
   }
 
@@ -814,7 +1038,8 @@
         return null;
       }
       NS.silverfoxLog && NS.silverfoxLog("intel-whois", "rdap-hit", host, registeredAt.slice(0, 10));
-      return finalizeWhoisResult(host, registeredAt, null, "rdap.ss");
+      const recordDomain = extractRdapSsRecordDomain(data);
+      return finalizeWhoisResult(host, registeredAt, null, "rdap.ss", recordDomain);
     } catch (e) {
       NS.silverfoxLog && NS.silverfoxLog("intel-whois", "rdap-parse-err", host);
       return null;
@@ -870,7 +1095,8 @@
       let ageDaysOpt = null;
       if (typeof info.creation_days === "number" && info.creation_days >= 0) ageDaysOpt = Math.floor(info.creation_days);
       else if (info.creation_days != null && /^\d+$/.test(String(info.creation_days))) ageDaysOpt = parseInt(String(info.creation_days), 10);
-      return finalizeWhoisResult(host, registeredAt, ageDaysOpt, "whoiscx.com");
+      const recordDomain = extractWhoiscxRecordDomain(data, fields, rawWhois);
+      return finalizeWhoisResult(host, registeredAt, ageDaysOpt, "whoiscx.com", recordDomain);
     } catch { return null; }
   }
 
@@ -911,7 +1137,8 @@
         return null;
       }
       NS.silverfoxLog && NS.silverfoxLog("intel-whois", "whodat-hit", host, registeredAt.slice(0, 10));
-      return finalizeWhoisResult(host, registeredAt, null, "who-dat.as93.net");
+      const recordDomain = extractWhoDatRecordDomain(data);
+      return finalizeWhoisResult(host, registeredAt, null, "who-dat.as93.net", recordDomain);
     } catch (e) {
       NS.silverfoxLog && NS.silverfoxLog("intel-whois", "whodat-parse-err", host);
       return null;
@@ -952,7 +1179,8 @@
         return null;
       }
       NS.silverfoxLog && NS.silverfoxLog("intel-whois", "tianhu-hit", host, registeredAt.slice(0, 10));
-      return finalizeWhoisResult(host, registeredAt, null, "api.tian.hu");
+      const recordDomain = extractTianHuRecordDomain(data, payload, fmtDomain);
+      return finalizeWhoisResult(host, registeredAt, null, "api.tian.hu", recordDomain);
     } catch (e) {
       NS.silverfoxLog && NS.silverfoxLog("intel-whois", "tianhu-parse-err", host);
       return null;
@@ -993,13 +1221,14 @@
         const registeredAt = NS.extractRegistrationDateFromRdap(data);
         if (!registeredAt) continue;
         NS.silverfoxLog && NS.silverfoxLog("intel-whois", "rdap-official-hit", host, registeredAt.slice(0, 10), url.slice(0, 48));
-        return finalizeWhoisResult(host, registeredAt, null, "rdap.org");
+        const recordDomain = extractOfficialRdapRecordDomain(data);
+        return finalizeWhoisResult(host, registeredAt, null, "rdap.org", recordDomain);
       } catch { /* try next */ }
     }
     return null;
   }
 
-  function raceWhoisSources(host) {
+  function raceWhoisSources(host, opts = {}) {
     return new Promise((resolve) => {
       if (NS.isPublicSuffixOnlyHost(host)) { resolve(null); return; }
       // 多源并行竞速：任一拿到真实 registeredAt 即返回
@@ -1016,7 +1245,10 @@
         Promise.resolve(p).then((r) => {
           if (settled) return;
           // 必须有真实 registeredAt
-          if (r && r.success && r.registeredAt && parseWhoisDateToIso(r.registeredAt)) { settled = true; resolve(r); return; }
+          if (r && r.success && r.registeredAt && parseWhoisDateToIso(r.registeredAt)
+            && (opts.requireRecordDomain !== true || r.recordDomainVerified === true)) {
+            settled = true; resolve(r); return;
+          }
           pending -= 1; if (pending <= 0) resolve(null);
         }).catch(() => { if (settled) return; pending -= 1; if (pending <= 0) resolve(null); });
       }
@@ -1070,22 +1302,26 @@
     return out;
   };
 
-  NS.queryWhoisRegistrationExact = async function (domain) {
+  NS.queryWhoisRegistrationExact = async function (domain, opts = {}) {
     const host = intelHost(domain);
     if (!host || !host.includes(".")) return { success: false, queriedHost: host || "" };
     if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return { success: false, queriedHost: host };
     if (NS.isPublicSuffixOnlyHost(host)) return { success: false, queriedHost: host };
+    const requireRecordDomain = opts.requireRecordDomain === true;
     const cached = await readWhoisCache(host);
     // 缓存也必须带真实日期；拒绝仅 ageDays / 空日期的旧脏数据
     if (cached && cached.success && cached.registeredAt && parseWhoisDateToIso(cached.registeredAt)
-      && !NS.isPublicSuffixOnlyHost(cached.queriedHost || host)) {
+      && intelHost(cached.queriedHost || "") === host
+      && !NS.isPublicSuffixOnlyHost(cached.queriedHost || host)
+      && (!requireRecordDomain || (cached.recordDomainVerified === true
+        && normalizeWhoisRecordDomain(cached.recordDomain) === host))) {
       return {
         ...cached,
         registeredAt: parseWhoisDateToIso(cached.registeredAt),
         queriedHost: host
       };
     }
-    const out = await raceWhoisSources(host);
+    const out = await raceWhoisSources(host, { requireRecordDomain });
     if (out && NS.whoisHasResult(out)) {
       const fixed = { ...out, queriedHost: host };
       writeWhoisCache(host, fixed);
@@ -1144,6 +1380,55 @@
     if (!parseWhoisDateToIso(whois.registeredAt)) return false;
     if (whois.queriedHost && NS.isPublicSuffixOnlyHost(whois.queriedHost)) return false;
     return true;
+  };
+
+  /**
+   * ICP exact-host hits do not depend on WHOIS. When ICP falls back to a
+   * registrable parent, however, WHOIS must also have resolved that same site
+   * family; otherwise the parent hit is treated as no备案 for the page.
+   */
+  NS.icpFallbackHasWhoisSupport = async function (icpMatchedHost, pageHost, whois) {
+    const matched = intelHost(icpMatchedHost);
+    const page = intelHost(pageHost);
+    if (!matched || !page) return false;
+    if (matched === page) return true;
+    if (typeof NS.intelHostIsValidAttribution === "function"
+      && !NS.intelHostIsValidAttribution(matched, page)) return false;
+    try {
+      const mi = typeof NS.parseHostWithTldts === "function" ? NS.parseHostWithTldts(matched) : null;
+      const pi = typeof NS.parseHostWithTldts === "function" ? NS.parseHostWithTldts(page) : null;
+      if (mi && mi.pslAvailable === true) {
+        if (!mi.domain || mi.publicSuffix === matched) return false;
+        if (!(pi && pi.domain === mi.domain)) return false;
+      }
+    } catch { return false; }
+
+    const whoisHost = NS.whoisHasResult(whois) ? intelHost(whois.queriedHost || "") : "";
+    const whoisRecordHost = normalizeWhoisRecordDomain(whois && whois.recordDomain);
+    if (whoisHost === matched && whoisRecordHost === matched
+      && whois.recordDomainVerified === true) return true;
+
+    // The normal WHOIS pipeline may already have tried the fallback and found
+    // nothing. Do not repeat that slow request or accept a different parent.
+    const tried = Array.isArray(whois && whois.triedHosts)
+      ? whois.triedHosts.map(intelHost).filter(Boolean)
+      : [];
+    // A failed candidate chain is definitive. If the normal race did return a
+    // date for this host but omitted its response-domain identity, allow one
+    // strict race so another source can supply a verifiable domain field.
+    if (tried.includes(matched) && whoisHost !== matched) return false;
+
+    // Verify the fallback itself. queryWhoisRegistration() is intentionally
+    // not used here because it may fall back yet again to another parent.
+    try {
+      const exact = await NS.queryWhoisRegistrationExact(matched, { requireRecordDomain: true });
+      return !!(NS.whoisHasResult(exact)
+        && intelHost(exact.queriedHost || "") === matched
+        && normalizeWhoisRecordDomain(exact.recordDomain) === matched
+        && exact.recordDomainVerified === true);
+    } catch {
+      return false;
+    }
   };
 
   NS.whoisRecordsMatch = function (a, b) {

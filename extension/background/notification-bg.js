@@ -9,6 +9,7 @@
   NS.shownNoticeKeys = new Set();
   NS.shownNoticeAt = new Map();
   NS.cachedIconDataUrl = null;
+  NS.notificationChannelVersions = new Map();
 
   /** 同 tab 同文案短冷却（防扫描连发） */
   const NOTICE_SHORT_COOLDOWN_MS = 8000;
@@ -32,6 +33,25 @@
     let h = 0;
     for (let i = 0; i < key.length; i++) h = (Math.imul(31, h) + key.charCodeAt(i)) | 0;
     return `silverfox-notice-${h >>> 0}`;
+  };
+
+  NS.clearNotificationChannel = function (channelKey) {
+    const channel = String(channelKey || "").trim();
+    if (!channel) return false;
+    NS.notificationChannelVersions.delete(channel);
+    NS.shownNoticeKeys.delete(channel);
+    NS.shownNoticeAt.delete(channel);
+    for (const key of Array.from(NS.shownNoticeKeys)) {
+      if (String(key).startsWith(`${channel}::`)) NS.shownNoticeKeys.delete(key);
+    }
+    for (const key of Array.from(NS.shownNoticeAt.keys())) {
+      if (String(key).startsWith(`${channel}::`)) NS.shownNoticeAt.delete(key);
+    }
+    try {
+      const id = NS.notificationIdFromKey(channel);
+      chrome.notifications.clear(id, () => { void chrome.runtime.lastError; });
+    } catch { /* ignore */ }
+    return true;
   };
 
   /** 清掉本扩展创建的系统通知（启动时避免托盘残留连环弹出） */
@@ -110,11 +130,17 @@
    * - 普通下载拦截：短冷却 + 40min 跨会话冷却（防启动连环弹）
    * - force / 仿冒身份类：绕过 40min 冷却，仅 2s 防同次扫描连发（保证仿冒官网右下角能弹）
    */
-  NS.showBlockedNotification = async function (title, message, tabId, force = false) {
+  NS.showBlockedNotification = async function (title, message, tabId, force = false, options = null) {
     const t = String(title || "威胁检测");
     const m = String(message || "").slice(0, 250);
-    const key = NS.noticeKey(t, m, tabId);
-    const contentKey = NS.contentNoticeKey(t, m);
+    const channelKey = String(options && options.channelKey || "").trim();
+    const versionToken = String(options && options.versionToken || "").trim();
+    if (channelKey && !versionToken) return false;
+    if (channelKey) NS.notificationChannelVersions.set(channelKey, versionToken);
+    const channelIsCurrent = () => !channelKey
+      || NS.notificationChannelVersions.get(channelKey) === versionToken;
+    const contentKey = channelKey || NS.contentNoticeKey(t, m);
+    const key = channelKey ? `${channelKey}::${versionToken}` : NS.noticeKey(t, m, tabId);
     const now = Date.now();
     // 仿冒官网 / 异常跳转：视为身份类，必须能弹系统通知
     const isIdentity = /仿冒|官网|域名|跳转|搜索引擎|brand-spoof|nav-trap/i.test(`${t} ${m}`);
@@ -122,7 +148,8 @@
 
     // 短冷却：普通 8s；force/仿冒仅 2s（同次 scan 双发去重）
     const shortMs = forceShow ? 2000 : NOTICE_SHORT_COOLDOWN_MS;
-    const lastMem = NS.shownNoticeAt.get(key) || NS.shownNoticeAt.get(contentKey) || 0;
+    const lastMem = NS.shownNoticeAt.get(key)
+      || (!channelKey ? NS.shownNoticeAt.get(contentKey) : 0) || 0;
     if (lastMem && now - lastMem < shortMs) return false;
 
     // 跨会话长冷却：仅约束「非 force 的普通下载拦截」；仿冒/force 不挡
@@ -143,6 +170,7 @@
     }
 
     const iconUrl = await NS.getNotificationIconUrl();
+    if (!channelIsCurrent()) return false;
     // 稳定 ID：同 contentKey 覆盖，避免 Windows 托盘堆一串
     const id = NS.notificationIdFromKey(contentKey);
     const opts = {
@@ -174,27 +202,50 @@
     };
 
     return new Promise((resolve) => {
-      chrome.notifications.create(id, opts, () => {
-        if (chrome.runtime.lastError) {
-          console.warn("notification failed", chrome.runtime.lastError.message);
-          const fallbackIcon = (() => {
-            try { return chrome.runtime.getURL("icons/icon48.png"); } catch { return iconUrl; }
-          })();
-          // fallback 仍用稳定 id，避免再堆
-          chrome.notifications.create(id, { ...opts, iconUrl: fallbackIcon }, () => {
-            if (chrome.runtime.lastError) {
-              console.warn("notification fallback failed", chrome.runtime.lastError.message);
-              resolve(false);
-              return;
-            }
+      const createNotification = (createOpts) => {
+        if (!channelIsCurrent()) { resolve(false); return; }
+        chrome.notifications.create(id, createOpts, () => {
+          if (chrome.runtime.lastError) {
+            console.warn("notification failed", chrome.runtime.lastError.message);
+            const fallbackIcon = (() => {
+              try { return chrome.runtime.getURL("icons/icon48.png"); } catch { return iconUrl; }
+            })();
+            if (!channelIsCurrent()) { resolve(false); return; }
+            chrome.notifications.create(id, { ...createOpts, iconUrl: fallbackIcon }, () => {
+              if (chrome.runtime.lastError) {
+                console.warn("notification fallback failed", chrome.runtime.lastError.message);
+                resolve(false);
+                return;
+              }
+              if (!channelIsCurrent()) { resolve(false); return; }
+              markShown();
+              resolve(true);
+            });
+            return;
+          }
+          if (!channelIsCurrent()) { resolve(false); return; }
+          markShown();
+          resolve(true);
+        });
+      };
+
+      // A brand channel uses one stable notification ID.  Updating it replaces
+      // the old hydrated brand in Windows instead of leaving A and B side by
+      // side in the notification center.
+      if (channelKey && chrome.notifications.update) {
+        chrome.notifications.update(id, opts, (updated) => {
+          if (chrome.runtime.lastError) void chrome.runtime.lastError;
+          if (!channelIsCurrent()) { resolve(false); return; }
+          if (updated) {
             markShown();
             resolve(true);
-          });
-          return;
-        }
-        markShown();
-        resolve(true);
-      });
+            return;
+          }
+          createNotification(opts);
+        });
+        return;
+      }
+      createNotification(opts);
     });
   };
 

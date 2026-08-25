@@ -87,31 +87,60 @@
       try { window.postMessage({ source: "silverfox-detector-hooks", type: "hooks-ready" }, "*"); } catch { /* ignore */ }
     }
 
-    install() {
-      window.__silverfoxNavBootInstalled = true;
-
-      // ---- 立即安装 Location 钩子（先于本文件其余代码）----
+    _activateNavigationHooks() {
+      if (this._navigationHooksActive) return;
+      this._navigationHooksActive = true;
+      // ---- 立即/按需安装 Location 钩子 ----
       try {
         LocationGuard.patchLoc((typeof Location !== "undefined" ? Location : window.Location).prototype, this.blocker);
       } catch { /* ignore */ }
       LocationGuard.patchWindowOpen(this.blocker);
       LocationGuard.patchNavigation(this.gesture, this.blocker);
+      this._installKitScan();
+    }
 
-      // 导出 nav api 供 page-hooks/content 复用
+    _publishFunctionalApi(lazyActivate) {
+      const activate = () => {
+        if (lazyActivate) this._activateNavigationHooks();
+      };
       window.__silverfoxNavApi = {
-        setGuard: (v) => this.blocker.setGuard(v),
+        setGuard: (v) => {
+          this.blocker.setGuard(v);
+          if (v) activate();
+        },
         setOfficialSafe: (v) => this.blocker.setOfficialSafe(v),
-        setCloakingKit: (v) => this.blocker.setCloakingKit(v),
+        setCloakingKit: (v) => {
+          this.blocker.setCloakingKit(v);
+          if (v) activate();
+        },
         rememberHop: (u) => this.blocker.rememberHop(u),
         clearHops: () => this.blocker.clearHops(),
-        setExtraPolicy: (fn) => this.blocker.setExtraPolicy(fn),
-        tryBlock: (u, reason) => this.blocker.tryBlock(u, reason),
+        setExtraPolicy: (fn) => {
+          this.blocker.setExtraPolicy(fn);
+          if (typeof fn === "function") activate();
+        },
+        tryBlock: (u, reason) => {
+          if (this.blocker.guard || this.blocker.kitScanner.cloakingKit || this.blocker.extraPolicy) activate();
+          return this.blocker.tryBlock(u, reason);
+        },
         hasGesture: () => this.gesture.hasGesture(),
         isAuthSsoRedirectUrl: (u) => SsoDetector.isAuthSsoRedirectUrl(u),
         markGesture: (e) => this.gesture.markGesture(e)
       };
+    }
 
-      this._installKitScan();
+    /** URL 形态只控制性能；风险消息到达时可懒激活完整导航保护。 */
+    installPerformanceLight() {
+      window.__silverfoxNavBootInstalled = true;
+      window.__silverfoxPerformanceLight = true;
+      this._publishFunctionalApi(true);
+      try { window.postMessage({ source: "silverfox-detector-hooks", type: "hooks-ready" }, "*"); } catch { /* ignore */ }
+    }
+
+    install() {
+      window.__silverfoxNavBootInstalled = true;
+      this._activateNavigationHooks();
+      this._publishFunctionalApi(false);
       try { window.postMessage({ source: "silverfox-detector-hooks", type: "hooks-ready" }, "*"); } catch { /* ignore */ }
     }
 
@@ -155,13 +184,16 @@
 
   NS.NavBoot = NavBoot;
 
-  // 搜索 / 干净正站下载路径：no-op 轻路径（不装 Location/套件 MO）
-  // 其余全量安装；大站 light 再由 content 侧 official-safe 拆钩
+  // 搜索页为 no-op；干净 /download 仅性能轻量，风险到达后可懒激活钩子。
   const boot = new NavBoot();
-  if (typeof PageShellDetector.shouldUseLightNavBootEarly === "function"
-    ? PageShellDetector.shouldUseLightNavBootEarly()
-    : PageShellDetector.isSearchUrlShapeEarly()) {
+  const searchLightEarly = !!PageShellDetector.isSearchUrlShapeEarly();
+  const performanceLightEarly = !searchLightEarly
+    && typeof PageShellDetector.shouldUseLightNavBootEarly === "function"
+    && PageShellDetector.shouldUseLightNavBootEarly();
+  if (searchLightEarly) {
     boot.installSearchLight();
+  } else if (performanceLightEarly) {
+    boot.installPerformanceLight();
   } else {
     boot.install();
   }
