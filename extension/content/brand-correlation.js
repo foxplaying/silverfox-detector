@@ -1533,6 +1533,39 @@
         || (bestMatch === "partial" && bestScore >= 85 && /^[a-z0-9]+$/i.test(bestTok) && bestTok.length >= 5)
       );
 
+      // ★ 双向校验收口：页内任一拉丁身份核与干净 apex exact 互证时，强制 related。
+      // 避免选举 display 抽到无关中文残片后，把 chatgpt.com+ChatGPT 判成 mismatch。
+      try {
+        if (!related && !squat && apexLabel && !/-/.test((pageApex.split(".")[0] || ""))
+          && !(typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
+            && NS.apexLabelLooksLikeMarketingPaddedBrand((pageApex.split(".")[0] || "")))) {
+          const exactPageLatin = cleanTokens
+            .map((t) => String(t || "").toLowerCase().replace(/[^a-z0-9]/g, ""))
+            .filter((t) => t.length >= 3 && /^[a-z0-9]+$/i.test(t));
+          for (let ei = 0; ei < exactPageLatin.length; ei++) {
+            const t = exactPageLatin[ei];
+            if (t === apexLabel || t === label) {
+              related = true;
+              bestMatch = "exact";
+              bestTok = t;
+              bestScore = Math.max(bestScore, 100);
+              break;
+            }
+            if (typeof NS.resolveMutualLatinBrandIdentity === "function") {
+              const m = NS.resolveMutualLatinBrandIdentity(t, host);
+              if (m && m.matched && m.relation === "exact"
+                && String(m.pageForm || "") === apexLabel) {
+                related = true;
+                bestMatch = "exact";
+                bestTok = t;
+                bestScore = Math.max(bestScore, 100);
+                break;
+              }
+            }
+          }
+        }
+      } catch { /* ignore */ }
+
       // squat 时：若 bestTok 是主机误拆碎片（prto）且不在页内，改用页内真实品牌核（todesk）
       try {
         if (squat && bestTok) {

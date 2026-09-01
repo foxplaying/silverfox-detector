@@ -2026,6 +2026,29 @@
         return false;
       }
 
+      // ★ 硬门：只有确认是「软件下载落地壳」才允许 home-fast arm。
+      // 曾把 chatgpt.com 等正站误报成仿冒「解析差异」——home-fast 曾绕过壳门控。
+      // 仅有导航「Download」链到 /download 不够；须有下载话术或真实包/加密壳。
+      try {
+        const shell = typeof NS.evaluateSoftwareDownloadLandingShell === "function"
+          ? NS.evaluateSoftwareDownloadLandingShell()
+          : null;
+        if (!shell || !shell.ok) {
+          NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "home-fast-skip-not-download-landing", shell || {});
+          return false;
+        }
+        const titleDl = /下载|安装|客户端|安装包/i.test(String(document.title || ""));
+        const realDlShell = shell.pkgCount > 0 || shell.encryptedDl
+          || ((shell.pitch || shell.softPitch) && (shell.hasHub || shell.ctaCount >= 2 || shell.multiPlatform))
+          || (shell.ctaCount >= 2 && shell.pitch && titleDl);
+        if (!realDlShell) {
+          NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "home-fast-skip-no-real-download-shell", shell.reasons || []);
+          return false;
+        }
+      } catch {
+        return false;
+      }
+
       const host = (location.hostname || "").toLowerCase().replace(/^www\./, "");
       // 多标签关键词能拼成域名（title/logo/nav 的 ToDesk + AI ≡ todeskai）→ 绝不报盗版
       // 夹带 apex（qq-musics）或营销子域 win. 不得因首标签对齐而跳过
@@ -2037,6 +2060,15 @@
         const apLeft0 = (String(ap0).split(".")[0] || "").toLowerCase();
         const pad0 = typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
           && NS.apexLabelLooksLikeMarketingPaddedBrand(apLeft0);
+        // ★ 主路径：域名 ↔ 页内关键词双向校验（ChatGPT ⇄ chatgpt.com）
+        // 垃圾词表只是兜底；只要页内身份核与干净 apex 互证，绝不当软仿冒。
+        if (!youngUnverified && !needsBrandAuthority && !pad0
+          && typeof NS.pageKeywordsBidirectionallyMatchHost === "function"
+          && NS.pageKeywordsBidirectionallyMatchHost(host)) {
+          state._pendingSoftBrandSpoof = false;
+          NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "home-fast-skip-bidirectional-keyword-host", host);
+          return false;
+        }
         if (!youngUnverified && !needsBrandAuthority && !pad0
           && typeof NS.hostLabelStronglyAlignedWithIdentityKeywords === "function"
           && NS.hostLabelStronglyAlignedWithIdentityKeywords(apLeft0)) {
@@ -2553,11 +2585,6 @@
         return false;
       }
 
-      // 快速路径：squat 或「无关 + 官方下载」
-      if (typeof NS.tryArmChineseBrandDownloadHomeSpoof === "function" && NS.tryArmChineseBrandDownloadHomeSpoof()) {
-        return true;
-      }
-
       // 发行版 ISO 镜像页（Arch/Ubuntu…）在落地壳判定前跳过，避免 ISO 列表被当 exe 假官网
       if (typeof NS.pageLooksLikeOsDistroIsoDownload === "function" && NS.pageLooksLikeOsDistroIsoDownload()) {
         NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "skip-os-distro-iso");
@@ -2586,7 +2613,7 @@
         return false;
       }
 
-      // 非软件下载落地页壳 → 不 arm
+      // ★ 先确认下载落地壳，再跑 home-fast / 完整仿冒链（禁止非下载站误报）
       const landingShell = typeof NS.evaluateSoftwareDownloadLandingShell === "function"
         ? NS.evaluateSoftwareDownloadLandingShell()
         : null;
@@ -2595,13 +2622,33 @@
         state._pendingSoftBrandSpoof = false;
         return false;
       }
-      // 无安装包/无真实 download hub 时，不 arm「仿冒下载站」（避免空品牌中性 toast）
-      if (!(landingShell.pkgCount > 0 || landingShell.hasHub || landingShell.encryptedDl
-        || (landingShell.ctaCount >= 2 && landingShell.pitch
-          && /下载|安装|客户端|安装包/i.test(String(document.title || ""))))) {
-        NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "skip-no-real-download-shell", landingShell.reasons || []);
-        state._pendingSoftBrandSpoof = false;
-        return false;
+      // 无真实下载壳证据时不 arm（避免仅有导航 Download 链的正站误报）
+      {
+        const titleDl = /下载|安装|客户端|安装包/i.test(String(document.title || ""));
+        const realDlShell = landingShell.pkgCount > 0 || landingShell.encryptedDl
+          || ((landingShell.pitch || landingShell.softPitch)
+            && (landingShell.hasHub || landingShell.ctaCount >= 2 || landingShell.multiPlatform))
+          || (landingShell.ctaCount >= 2 && landingShell.pitch && titleDl);
+        if (!realDlShell) {
+          NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "skip-no-real-download-shell", landingShell.reasons || []);
+          state._pendingSoftBrandSpoof = false;
+          return false;
+        }
+      }
+
+      // ★ 主路径：域名 ↔ 页内关键词双向互证通过 → 正站，不进仿冒链
+      try {
+        if (typeof NS.pageKeywordsBidirectionallyMatchHost === "function"
+          && NS.pageKeywordsBidirectionallyMatchHost()) {
+          state._pendingSoftBrandSpoof = false;
+          NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "skip-bidirectional-keyword-host");
+          return false;
+        }
+      } catch { /* ignore */ }
+
+      // 快速路径：须已过下载壳且双向校验未通过；squat 或「无关 + 官方下载」
+      if (typeof NS.tryArmChineseBrandDownloadHomeSpoof === "function" && NS.tryArmChineseBrandDownloadHomeSpoof()) {
+        return true;
       }
       if (typeof NS.pageLooksLikeHighVolumePackageArchive === "function" && NS.pageLooksLikeHighVolumePackageArchive()) {
         NS.silverfoxLog && NS.silverfoxLog("brand-spoof", "skip-high-volume-archive");

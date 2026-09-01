@@ -603,17 +603,16 @@
       const latin = raw.toLowerCase().replace(/[^a-z0-9]/g, "");
       if (hasCn && !latin) {
         if (opts && opts.pinyinValidated === true) return true;
-        // 严格拼音对齐（含中英双名桥 dingding⇄dingtalk）
+        // ★ 双向校验：中文候选必须自身能对齐当前主机（拼音 / 中英双名桥）。
+        // 禁止「页内另有 ChatGPT 对齐主机 ⇒ 任意中文如「解析差异」也算对齐」——
+        // 那是单向借道，曾导致 chatgpt.com 误报仿冒「解析差异」。
         if (typeof NS.chinesePinyinAlignsHost === "function" && NS.chinesePinyinAlignsHost(raw, hostOpt)) {
           return true;
         }
-        // 页内拉丁已与主机互锁时，标题中文专名可并列保留（钉钉 + DingTalk @ dingtalk-o）
-        try {
-          if (typeof NS.pickHostAlignedLatinBrandFromPage === "function") {
-            const lat = String(NS.pickHostAlignedLatinBrandFromPage(hostOpt) || "").trim();
-            if (lat) return true;
-          }
-        } catch { /* ignore */ }
+        if (typeof NS.chinesePinyinBridgesHostLatinCore === "function"
+          && NS.chinesePinyinBridgesHostLatinCore(raw, hostOpt)) {
+          return true;
+        }
         return false;
       }
 
@@ -625,6 +624,93 @@
       } catch { /* ignore */ }
       return !!(typeof NS.resolveMutualLatinBrandIdentity === "function"
         && NS.resolveMutualLatinBrandIdentity(raw, hostOpt).matched);
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * 域名 ↔ 页内身份关键词双向校验（主路径，非垃圾词表）。
+   * 页内任一拉丁身份核与干净 apex 互证 exact → 正站相关，软仿冒不得 arm。
+   * 例：title「下载 ChatGPT」⇄ chatgpt.com；钉钉页拉丁 DingTalk ⇄ dingtalk.com。
+   */
+  NS.pageKeywordsBidirectionallyMatchHost = function (hostOpt) {
+    try {
+      const host = String(hostOpt || (typeof location !== "undefined" ? location.hostname : "") || "")
+        .toLowerCase().replace(/^www\./, "");
+      if (!host) return false;
+      // 年轻无备案夹带域不得靠双向 exact 洗白
+      if (typeof NS.isYoungUnverifiedRegistration === "function"
+        && NS.isYoungUnverifiedRegistration()) return false;
+      if (typeof NS.hostNeedsAuthoritativeBrandIdentity === "function"
+        && NS.hostNeedsAuthoritativeBrandIdentity(host)) return false;
+
+      // 干净 apex 的 mutual latin exact（最强双向）
+      if (typeof NS.getCleanApexMutualLatinExactEvidence === "function") {
+        const ev = NS.getCleanApexMutualLatinExactEvidence(host);
+        if (ev && ev.relation === "exact") return true;
+      }
+
+      const apex = (typeof NS.getRegistrableDomain === "function"
+        ? NS.getRegistrableDomain(host) : host) || host;
+      const apexLeft = (String(apex).split(".")[0] || "").toLowerCase();
+      const apexFlat = apexLeft.replace(/[^a-z0-9]/g, "");
+      if (!apexFlat || apexFlat.length < 3) return false;
+      if (/-/.test(apexLeft)) return false;
+      if (typeof NS.apexLabelLooksLikeMarketingPaddedBrand === "function"
+        && NS.apexLabelLooksLikeMarketingPaddedBrand(apexLeft)) return false;
+
+      const kw = typeof NS.collectPrimaryBrandKeywords === "function"
+        ? NS.collectPrimaryBrandKeywords()
+        : null;
+      const latinList = [...new Set([
+        ...((kw && kw.latin) || []),
+        ...((kw && kw.structuralLatin) || [])
+      ]
+        .map((t) => String(t || "").toLowerCase().replace(/[^a-z0-9]/g, ""))
+        .filter((t) => t.length >= 3))];
+
+      // 标题/og 再补扫一遍拉丁（选举缓存未含 ChatGPT 时仍能互证）
+      try {
+        const surface = [
+          document.title || "",
+          document.querySelector("h1")?.textContent || "",
+          document.querySelector('meta[property="og:site_name"]')?.getAttribute("content") || "",
+          document.querySelector('meta[property="og:title"]')?.getAttribute("content") || ""
+        ].join(" ");
+        const words = surface.match(/[A-Za-z][A-Za-z0-9]{2,23}/g) || [];
+        for (let i = 0; i < Math.min(words.length, 40); i++) {
+          const flat = words[i].toLowerCase().replace(/[^a-z0-9]/g, "");
+          if (flat.length >= 3 && latinList.indexOf(flat) < 0) latinList.push(flat);
+        }
+      } catch { /* ignore */ }
+
+      for (let i = 0; i < latinList.length; i++) {
+        const t = latinList[i];
+        if (!t || /^(?:download|official|client|windows|macos|android|linux|ai|gpt|ml|bot)$/i.test(t)) {
+          continue;
+        }
+        // 双向：页内词 → 主机，且主机核 → 能被该词覆盖（exact）
+        if (typeof NS.resolveMutualLatinBrandIdentity === "function") {
+          const m = NS.resolveMutualLatinBrandIdentity(t, host);
+          if (m && m.matched && m.relation === "exact"
+            && String(m.pageForm || "") === apexFlat
+            && String(m.hostForm || "") === apexFlat) {
+            return true;
+          }
+        }
+        if (t === apexFlat || t === apexLeft.replace(/[^a-z0-9]/g, "")) return true;
+      }
+
+      // 关系层：evaluateDomainKeywordRelevance 已是关键词→域名综合双向结果
+      if (typeof NS.evaluateDomainKeywordRelevance === "function") {
+        const rel = NS.evaluateDomainKeywordRelevance(host);
+        if (rel && rel.related && !rel.squat
+          && (rel.hostMatch === "exact" || rel.hostMatch === "category")) {
+          return true;
+        }
+      }
+      return false;
     } catch {
       return false;
     }
