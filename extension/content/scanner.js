@@ -504,7 +504,8 @@
           firstHref = firstHref || state.protectedTargets[0] || "仿冒品牌下载";
         }
       }
-      // 仿冒官网：快速路径可先形成候选；最终状态/提示由官网身份核验门控统一定稿。
+      // 仿冒官网 home-fast：内部已强制要求「软件下载落地壳」，非下载站不会 arm。
+      // 最终状态/提示仍由官网身份核验门控统一定稿。
       if (isTop && !state._brandSpoofPortalDetected) {
         try {
           if (typeof NS.tryArmChineseBrandDownloadHomeSpoof === "function" && NS.tryArmChineseBrandDownloadHomeSpoof()) {
