@@ -92,13 +92,10 @@
           }
         }
       }
-      // 扁平短垃圾尾：todeskze（无连字符）——靠 hostLabelIsPaddedBrand，勿盲匹配任意 2 字母尾
-      if (typeof NS.hostLabelIsPaddedBrand === "function" && flat.length >= 7) {
-        const head2 = flat.slice(0, -2);
-        const head1 = flat.slice(0, -1);
-        if (head2.length >= 5 && NS.hostLabelIsPaddedBrand(flat, head2)) return true;
-        if (head1.length >= 5 && NS.hostLabelIsPaddedBrand(flat, head1)) return true;
-      }
+      // 不能把任意整词截去末尾 1～2 字符，再把截出的片段当作品牌：
+      // hypomux → hypom/ hypomu 会使正常整词一律变成 padded。
+      // 无分隔符的短尾由 evaluateDomainKeywordRelevance 使用页面独立品牌
+      // 调用 hostLabelIsPaddedBrand 判定（例如页面 ToDesk + todeskze）。
       // qq-musics / xx-music(s) 连字符仿冒；huorong-lab / brand-soft 营销垫
       if (/^(?:qq|wx|weixin|netease|wy)[-_]?(?:music|musics|yinyue|yinle)/i.test(flat)) return true;
       if (/[-_](?:music|musics|yinyue|yinle|pc|app|soft|safe|vip|pro|cn|win|download|client|lab|labs|tech|site|official)$/i.test(raw)) {
@@ -401,6 +398,19 @@
       const apexLeftRaw = (apex.split(".")[0] || "").toLowerCase();
       const apexFlat = apexLeftRaw.replace(/[^a-z0-9]/g, "");
       const hostFlat = host.replace(/[^a-z0-9]/g, "");
+      // 页面在 headline 与站点身份中独立声明的短品牌，不是域名剥出的噪声。
+      // 例如 todeskze 上的 ToDesk：保留它，后续才能识别真实的短尾夹带。
+      // 不允许同名整段 host 自证，也不调用关键词选举（避免递归）。
+      if (low !== labFlat && low !== apexFlat
+        && typeof NS.hostLabelIsPaddedBrand === "function"
+        && NS.hostLabelIsPaddedBrand(apexFlat, low)) {
+        const escaped = low.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const word = new RegExp(`(?:^|[^A-Za-z0-9])${escaped}(?=$|[^A-Za-z0-9])`, "i");
+        const headline = `${document.title || ""} ${document.querySelector("h1")?.textContent || ""}`;
+        const siteName = String(document.querySelector('meta[property="og:site_name"]')?.getAttribute("content")
+          || document.querySelector('meta[name="application-name"]')?.getAttribute("content") || "").trim();
+        if (word.test(headline) && siteName.toLowerCase() === low) return false;
+      }
       const cores = typeof NS.collectHostBrandCores === "function" ? NS.collectHostBrandCores(host) : null;
       let padCore = (cores && cores.padCore) || "";
       const root = (cores && cores.root) || "";
@@ -431,18 +441,7 @@
       // ★ pc-todeskr 的 Todeskr：段在连字符里但自身仍是污染尾 → 碎片
       if (hyphenSegs.length >= 2 && hyphenSegs.includes(low) && low !== labFlat && low !== apexFlat) {
         if (mktSegOnly.test(low)) return true;
-        try {
-          if (typeof NS.hostLabelIsPaddedBrand === "function") {
-            for (let n = 1; n <= 2; n++) {
-              const head = low.slice(0, -n);
-              const tail = low.slice(-n);
-              if (head.length < 5) break;
-              if (n === 2 && /^(?:ai|go|tv|os|io|me|up|db|js|py|id)$/i.test(tail)) continue;
-              if (NS.hostLabelIsPaddedBrand(low, head)) return true;
-            }
-          }
-        } catch { /* ignore */ }
-        return false;
+        return pageConfirmedSegmentCore(low) !== low;
       }
 
       // 仅夹带/多段主机才做「近形 flat」碎片判定，避免 todesk.com + ToDesk 被误杀
@@ -2378,11 +2377,12 @@
         && cn.length >= 3 && !productSuffix.test(cn)) return true;
 
       // 纯中文功能标题通常由“方式/范围 + 操作或通用品类”构成。
-      // 这是语言结构分类，不是厂商品牌表：批量重命名、远程桌面、云端办公等
+      // 这是语言结构分类，不是厂商品牌表：批量重命名、远程桌面、
+      // 在线修复主机（文件托管页的翻译标题）等
       // 即使被模板复制到 title/H1/OG，也不能因此变成品牌。
       // ★「免费远程」曾误 toast：modeLead=免费 但尾「远程」旧表漏收。
       const modeLead = /^(?:智能|自动|一键|在线|离线|实时|快速|极速|精准|批量|免费|专业|高效|便捷|云端|本地|远程|桌面|移动|跨端|跨平台|多端|多人|团队|个性|每日|热门|精选|官方|正版|最新)/;
-      const capabilityTail = /(?:重?命名|改名|编辑|推荐|生成|识别|分析|检测|搜索|翻译|创作|剪辑|修复|转换|处理|管理|优化|加速|同步|备份|清理|压缩|解压|录制|播放|下载|安装|截图|远程|桌面|控制|协助|协作|连接|访问|办公|会议|教育|助手|运维|操作|服务|音乐|歌曲|歌单|软件|工具|系统)$/;
+      const capabilityTail = /(?:重?命名|改名|编辑|推荐|生成|识别|分析|检测|搜索|翻译|创作|剪辑|修复|转换|处理|管理|优化|加速|同步|备份|清理|压缩|解压|录制|播放|下载|安装|截图|远程|桌面|控制|协助|协作|连接|访问|办公|会议|教育|助手|运维|操作|服务|音乐|歌曲|歌单|软件|工具|系统|主机|服务器|托管)$/;
       if (!mixed && modeLead.test(cn) && capabilityTail.test(cn)) return true;
       // 免费远程 / 极速桌面 / 专业控制：整段即「方式+品类」，无专名
       if (!mixed && /^(?:智能|自动|一键|在线|离线|实时|快速|极速|精准|批量|免费|专业|高效|便捷|云端|本地|官方|正版|最新)(?:远程|桌面|控制|协助|协作|连接|访问|办公)(?:软件|工具|服务|系统|客户端)?$/.test(cn)) {
@@ -2527,35 +2527,36 @@
           return s && s !== "domain" ? s : "";
         };
         const primarySource = (source) => /^(?:title|h1|ogTitle|twitterTitle|ogSite|schema|applicationName)$/i.test(String(source || ""));
-        const exactLatinHit = (text, word) => {
-          const esc = String(word || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-          return !!(esc && new RegExp(`(?:^|[^A-Za-z0-9])${esc}(?=$|[^A-Za-z0-9])`, "i").test(String(text || "")));
-        };
+        // Index only for this election: a later DOM/identity revision must
+        // see its own evidence. Several spellings may normalize to one key.
+        const sourcesByWord = new Map();
+        for (const [name, info] of Object.entries(NS.caches?._primaryKw?.scores || {})) {
+          if (!Array.isArray(info?.sources)) continue;
+          const key = name.toLowerCase().replace(/[^a-z0-9]/g, "");
+          let sources = sourcesByWord.get(key);
+          if (!sources) sourcesByWord.set(key, sources = new Set());
+          for (const source of info.sources) sources.add(source);
+        }
         const pageEvidenceFor = (original, flat) => {
           const families = new Set();
           const primaryFamilies = new Set();
           let occurrences = 0;
           let leadHits = 0;
+          // original comes exclusively from the ASCII alphanumeric tokenizer.
+          const word = new RegExp(`(?:^|[^A-Za-z0-9])${original}(?=$|[^A-Za-z0-9])`, "i");
           identitySlots.forEach((slot) => {
-            if (!exactLatinHit(slot.text, original)) return;
+            if (!word.test(slot.text)) return;
             occurrences += 1;
             families.add(slot.family);
             if (slot.primary) primaryFamilies.add(slot.family);
             const idx = String(slot.text || "").toLowerCase().indexOf(String(original || "").toLowerCase());
             if (idx >= 0 && idx <= 24) leadHits += 1;
           });
-          try {
-            const pk = NS.caches && NS.caches._primaryKw;
-            for (const [name, info] of Object.entries((pk && pk.scores) || {})) {
-              const key = String(name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-              if (!key || key !== flat) continue;
-              (Array.isArray(info && info.sources) ? info.sources : []).forEach((source) => {
-                const family = sourceFamily(source);
-                if (family) families.add(family);
-                if (primarySource(source)) primaryFamilies.add(family);
-              });
-            }
-          } catch { /* ignore */ }
+          for (const source of sourcesByWord.get(flat) || []) {
+            const family = sourceFamily(source);
+            if (family) families.add(family);
+            if (primarySource(source)) primaryFamilies.add(family);
+          }
           return {
             families: families.size,
             primaryFamilies: primaryFamilies.size,
@@ -2573,8 +2574,11 @@
             return String(state.spoofBrand || "").toLowerCase().replace(/[^a-z0-9]/g, "");
           } catch { return ""; }
         })();
+        const triedWords = new Set();
         for (let wi = 0; wi < Math.min(identityWords.length, 80); wi++) {
           const original = identityWords[wi];
+          if (triedWords.has(original)) continue;
+          triedWords.add(original);
           const flat = original.toLowerCase().replace(/[^a-z0-9]/g, "");
           const shortUpperAcronym = /^[A-Z][A-Z0-9]{2}$/.test(original);
           if ((!shortUpperAcronym && flat.length < 5) || flat.length > 20 || BRAND_TOKEN_STOP_RE.test(flat)) continue;
@@ -2710,7 +2714,7 @@
     // 未裁净的「关于…」栏目整段（关于火绒杀毒）——应先 trimChineseBrandLead，残留整段仍弱
     if (/^关于/.test(s) && s.length >= 4) return true;
     // 纯品类词（无专名）——「安全」 alone 会在 火绒安全/终端安全 里到处命中抢票
-    if (/^(?:品牌|产品|功能|特性|特色|方案|浏览器|客户端|软件|应用|平台|工具|系统|服务|网站|主页|中心|频道|首页|博客|新闻|资讯|社区|论坛|帮助|文档|教程|指南|专栏|杀毒|卫士|安全|终端|防护|防御|查杀|病毒|木马|广告|弹窗|音乐|歌曲|视频|办公|网盘|助手|管家)$/.test(s)) return true;
+    if (/^(?:品牌|产品|功能|特性|特色|方案|浏览器|客户端|软件|应用|平台|工具|系统|服务|网站|主页|中心|频道|首页|博客|新闻|资讯|社区|论坛|帮助|文档|教程|指南|专栏|杀毒|卫士|安全|终端|防护|防御|查杀|病毒|木马|广告|弹窗|音乐|歌曲|视频|办公|网盘|助手|管家|主机|服务器|托管)$/.test(s)) return true;
     // 兜底：抽象对比残片不当品牌（主路径仍是域名↔关键词双向校验；此表只挡漏网展示）
     if (/^(?:解析|差异|对比|匹配|校验|核对|核验|比对|偏差|误差|不一致|一致性|兼容性|可用性|稳定性|正确性|完整性|相关性|相似度|相关度)$/.test(s)) return true;
     if (/^(?:解析|对比|匹配|校验|核对|核验|比对).{0,2}(?:差异|结果|偏差|误差|不一致)?$/.test(s)) return true;
@@ -3297,6 +3301,27 @@
    * 用于页面仅有中文品牌名、无拉丁 token 时仍能标 padded。
    * 切勿把 prtodesk 拆成 prto+desk（desk 是 ToDesk 品牌本体后缀，不是营销垫词）。
    */
+  function pageConfirmedSegmentCore(segment) {
+    if (segment.length < 6) return segment;
+    try {
+      // A prefix of our own input is not independent evidence. Compare only
+      // complete page tokens, without calling the brand election recursively.
+      const fields = [document.title, document.querySelector("h1")?.textContent,
+        document.querySelector('meta[property="og:site_name"]')?.getAttribute("content"),
+        document.querySelector('meta[name="application-name"]')?.getAttribute("content")];
+      const tokens = new Set(fields.flatMap(field =>
+        (String(field || "").slice(0, 512).toLowerCase().match(/[a-z0-9]+/g) || [])));
+      if (tokens.has(segment)) return segment;
+      for (let n = 1; n <= 2; n++) {
+        const head = segment.slice(0, -n);
+        if (head.length < 5 || !tokens.has(head)) continue;
+        if (n === 2 && /^(?:ai|go|tv|os|io|me|up|db|js|py|id)$/.test(segment.slice(-n))) continue;
+        if (NS.hostLabelIsPaddedBrand?.(segment, head)) return head;
+      }
+    } catch { /* unavailable identity fields: preserve the complete segment */ }
+    return segment;
+  }
+
   NS.inferMarketingPaddedBrandCore = function (rawLabel) {
     try {
       const raw = String(rawLabel || "").toLowerCase().replace(/^www\./, "");
@@ -3304,7 +3329,7 @@
       // 营销结构剥出的核再收 1～2 字符污染尾：pc-todeskr → todeskr → todesk
       // 仅用于「前缀/后缀夹带剥出的段」，禁止对 google/notion/todesk 等干净整词盲删末字。
       const finishCore = (core0) => {
-        let x = String(core0 || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        const x = String(core0 || "").toLowerCase().replace(/[^a-z0-9]/g, "");
         if (!x || x.length < 6) return x.length >= 4 ? x : "";
         const rawSegs = raw.split(/[-_]/).map((p) => String(p || "").replace(/[^a-z0-9]/g, "")).filter(Boolean);
         // 只收「原始标签里出现过的污染段」：todeskr ∈ pc-todeskr；不收已干净的 todesk
@@ -3312,22 +3337,7 @@
         // 干净整词标签（google）即便 == rawFlat 也不剥：须同时是「多段夹带后的剩余段」或 padded 形
         const fromMktSegment = rawSegs.length >= 2 && rawSegs.includes(x);
         if (!fromMktSegment) return x;
-        try {
-          if (typeof NS.hostLabelIsPaddedBrand === "function") {
-            for (let n = 1; n <= 2; n++) {
-              const head = x.slice(0, -n);
-              const tail = x.slice(-n);
-              if (head.length < 5) break;
-              if (!/^[a-z0-9]+$/i.test(tail)) continue;
-              if (n === 2 && /^(?:ai|go|tv|os|io|me|up|db|js|py|id)$/i.test(tail)) continue;
-              if (NS.hostLabelIsPaddedBrand(x, head)) {
-                x = head;
-                break;
-              }
-            }
-          }
-        } catch { /* ignore */ }
-        return x;
+        return pageConfirmedSegmentCore(x);
       };
       // 营销夹带后缀（huorong-pc / huorong-lab）；勿含 security/antivirus/ai/gpt——产品线正站
       const mktSuf = /^(?:pc|app|soft|safe|vip|pro|cn|win|desk|guard|download|down|client|free|official|online|tool|tools|hub|box|mac|ios|android|mobile|setup|install|site|web|net|home|store|lab|labs|tech)$/i;

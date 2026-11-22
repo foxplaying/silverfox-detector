@@ -607,7 +607,7 @@
     );
     const brandIdentitySettled = typeof NS.isBrandSpoofIdentityVerificationSettled === "function"
       && NS.isBrandSpoofIdentityVerificationSettled();
-    let brandDisplayFinal = brandIdentitySettled
+    const brandDisplayFinal = brandIdentitySettled
       && (!state._brandSpoofFinalizeScheduled || state._brandSpoofFinalPresented);
     const protectionTrusted = identityTrusted && !realHardKit;
 
@@ -732,12 +732,8 @@
     } catch { /* ignore */ }
 
     try { NS.ensureBrandSpoofNotice(identityTrusted); } catch { /* ignore */ }
-    // ensureBrandSpoofNotice/commit 可能刚在本轮把 ToDesk 等展示名定稿。
-    // 报告必须重新读取最终态，不能沿用函数开头的旧布尔值而把 spoofBrand 清空。
-    brandDisplayFinal = brandIdentitySettled
-      && (!state._brandSpoofFinalizeScheduled || state._brandSpoofFinalPresented);
-    // 通知链已经拿到具名品牌时，不能仅因 finalize 的异步标志晚一拍就在完成报告
-    // 中清空 spoofBrand；否则通知显示 ToDesk，popup 会退化成“仿冒品牌官网下载站”。
+    // 通知与报告必须消费同一份有效最终快照。身份查询完成或 portal 标记为真，
+    // 都不能替代品牌结论本身；没有快照时不能退化为笼统的“仿冒品牌官网下载站”。
     const reportBrandSnapshot = NS.getCurrentBrandSpoofFinalSnapshot();
     let reportSpoofBrand = String((reportBrandSnapshot && reportBrandSnapshot.brand)
       || state.spoofBrand || "").trim();
@@ -749,7 +745,7 @@
       if (reportSpoofBrand && typeof NS.isForbiddenSpoofDisplayBrand === "function"
         && NS.isForbiddenSpoofDisplayBrand(reportSpoofBrand)) reportSpoofBrand = "";
     } catch { /* keep the already committed display name */ }
-    const brandPayloadReady = !!(brandIdentitySettled && reportSpoofBrand
+    const brandPayloadReady = !!(brandIdentitySettled && reportBrandSnapshot && reportSpoofBrand
       && (state._brandSpoofPortalDetected || threatDetails.some((d) => /仿冒品牌官网|主动探测仿冒/i.test(d.name || ""))));
     const packageBlockedLive = !protectionTrusted && !!(state.downloadGuardInstalled || state.remoteDownloadDispatchDetected);
     const hasPackageThreat = packageBlockedLive
@@ -801,6 +797,7 @@
       && NS.shouldPreserveForcedMissingIcp();
     const payload = {
       type: "threat-risk", score, riskLevel, analysisComplete,
+      reportSequence: (state._riskReportSequence = (state._riskReportSequence || 0) + 1),
       details: (() => {
         const hasFakeIcp = (state.details || []).some((d) => /^假冒ICP备案信息/i.test(String(d && d.name || "")));
         const hasDeclared = !!(state.pageDeclaredIcp && String(state.pageDeclaredIcp).trim())
@@ -817,7 +814,7 @@
             || (typeof NS.hasOrganizationValidatedSsl === "function" && NS.hasOrganizationValidatedSsl())
           )) return false;
           if (/仿冒品牌官网|仿冒站下载拦截|主动探测仿冒/i.test(d.name || "")
-            && (identityTrusted || (!brandDisplayFinal && !brandPayloadReady))) return false;
+            && (identityTrusted || !brandPayloadReady)) return false;
           if (/已启用安装包|非用户手势|跨域跳转/i.test(d.name || "") && protectionTrusted) return false;
           return true;
         }).slice(0, 12);
@@ -836,8 +833,8 @@
       downloadGuardInstalled: protectionTrusted ? false : !!state.downloadGuardInstalled,
       packageBlocked: packageBlockedLive,
       protectedTargets: pkgTargets,
-      spoofBrand: (identityTrusted || (!brandDisplayFinal && !brandPayloadReady)) ? "" : reportSpoofBrand,
-      brandSpoofPortal: (identityTrusted || (!brandDisplayFinal && !brandPayloadReady)) ? false : (!!(state._brandSpoofPortalDetected || reportSpoofBrand) || threatDetails.some((d) => /仿冒品牌官网/i.test(d.name || ""))),
+      spoofBrand: (identityTrusted || !brandPayloadReady) ? "" : reportSpoofBrand,
+      brandSpoofPortal: !identityTrusted && brandPayloadReady,
       brandFinalSnapshot: (identityTrusted || !brandPayloadReady)
         ? null : reportBrandSnapshot
     };
@@ -882,6 +879,7 @@
     if (!el) return;
     // 允许重复强化禁用（SPA 重绘后 class 还在但 style 被清掉时）
     try {
+      globalThis.SilverfoxControlState?.capture(el);
       el.dataset.threatDetectorDisabled = "1";
       el.style.setProperty("pointer-events", "none", "important");
       el.style.setProperty("opacity", "0.45", "important");
@@ -889,11 +887,16 @@
       el.style.setProperty("cursor", "not-allowed", "important");
       el.setAttribute("aria-disabled", "true");
       el.setAttribute("title", "已拦截可疑安装包下载");
-      if (href && href !== "js-download") el.setAttribute("data-threat-original-href", href);
-      else if (href === "js-download" && !el.getAttribute("data-threat-original-href")) el.setAttribute("data-threat-original-href", "js-download");
+      const isPlaceholder = (value) => !value || /^(?:#|js-download|javascript:.*|about:(?:blank|black)(?:[?#].*)?)$/i.test(String(value).trim());
+      const saved = el.getAttribute("data-threat-original-href");
+      const currentHref = el.tagName === "A" ? el.getAttribute("href") : "";
+      // Repeated sweeps see our own placeholder, not the site's original URL.
+      // Never let it overwrite a usable backup.
+      const original = !isPlaceholder(currentHref) ? currentHref
+        : (!isPlaceholder(saved) ? saved : (!isPlaceholder(href) ? href : ""));
+      if (original && original !== saved) el.setAttribute("data-threat-original-href", original);
+      else if (!saved && href === "js-download") el.setAttribute("data-threat-original-href", "js-download");
       if (el.tagName === "A") {
-        const cur = el.getAttribute("href");
-        if (cur && cur !== "#") el.setAttribute("data-threat-original-href", cur);
         el.removeAttribute("href");
         try { el.href = "javascript:void(0)"; } catch { /* ignore */ }
       }
@@ -919,25 +922,31 @@
   NS.reEnableOneThreatElement = function (el) {
     if (!el) return;
     try {
+      // aria-disabled, javascript:void(0), or download wording belongs to the
+      // site too. Only extension-owned controls may be restored.
+      if (el.dataset.threatDetectorDisabled !== "1" && el.dataset.silverfoxGreyed !== "1"
+        && !el.getAttribute("data-threat-original-href")) return;
       if (el.dataset.threatDetectorDisabled === "1") delete el.dataset.threatDetectorDisabled;
-      el.style.removeProperty("pointer-events");
-      el.style.removeProperty("opacity");
-      el.style.removeProperty("filter");
-      el.style.removeProperty("cursor");
-      if (el.getAttribute("aria-disabled") === "true") el.removeAttribute("aria-disabled");
-      if (el.getAttribute("title") === "已拦截可疑安装包下载") el.removeAttribute("title");
+      const restored = globalThis.SilverfoxControlState?.restore(el);
+      if (!restored) {
+        el.style.removeProperty("pointer-events");
+        el.style.removeProperty("opacity");
+        el.style.removeProperty("filter");
+        el.style.removeProperty("cursor");
+        if (el.getAttribute("aria-disabled") === "true") el.removeAttribute("aria-disabled");
+        if (el.getAttribute("title") === "已拦截可疑安装包下载") el.removeAttribute("title");
+      }
       // disable 时会把 A.href 写成 javascript:void(0) 并另存 data-threat-original-href。
       // 旧逻辑要求 !getAttribute("href") 才还原——void(0) 仍算有 href，导致按钮永久死链。
       const orig = el.getAttribute("data-threat-original-href");
-      if (orig && el.tagName === "A" && orig !== "js-download" && !/^javascript:/i.test(orig)) {
+      if (orig && el.tagName === "A" && orig !== "js-download" && !/^(?:javascript:|about:(?:blank|black)(?:[?#]|$))/i.test(orig)) {
         const cur = (el.getAttribute("href") || "").trim();
-        if (!cur || cur === "#" || /^javascript:/i.test(cur)) {
+        if (!cur || cur === "#" || /^(?:javascript:|about:(?:blank|black)(?:[?#]|$))/i.test(cur)) {
           try { el.setAttribute("href", orig); } catch { /* ignore */ }
-          try { el.href = orig; } catch { /* ignore */ }
         }
       }
       el.removeAttribute("data-threat-original-href");
-      if (el.tagName === "BUTTON" || el.tagName === "INPUT") el.disabled = false;
+      if (!restored && (el.tagName === "BUTTON" || el.tagName === "INPUT")) el.disabled = false;
       try { el.classList && el.classList.remove("silverfox-greyed"); } catch { /* ignore */ }
       try { if (el.dataset) delete el.dataset.silverfoxGreyed; } catch { /* ignore */ }
       try { el.removeAttribute("data-silverfox-greyed"); } catch { /* ignore */ }
@@ -945,25 +954,15 @@
   };
 
   NS.reEnableAllThreatDisabledElements = function () {
+    const restoreIn = (doc, fromParent = false) => doc.querySelectorAll(
+      "[data-threat-detector-disabled='1'], [data-silverfox-greyed='1'], a[data-threat-original-href]"
+    ).forEach((el) => {
+      if (!fromParent || NS.parentLockedFrameControls?.delete(el)) NS.reEnableOneThreatElement(el);
+    });
     try {
-      document.querySelectorAll(
-        "[data-threat-detector-disabled='1'], [data-silverfox-greyed='1'], a[data-threat-original-href], button[aria-disabled='true'], a[href='javascript:void(0)']"
-      ).forEach((el) => NS.reEnableOneThreatElement(el));
-      NS.getAllDownloadIntentElements().forEach((el) => NS.reEnableOneThreatElement(el));
-      // 兜底：仍挂着 original-href 的锚点强制还原
-      document.querySelectorAll("a[data-threat-original-href]").forEach((el) => {
-        try {
-          const orig = el.getAttribute("data-threat-original-href");
-          if (orig && orig !== "js-download" && !/^javascript:/i.test(orig)) {
-            el.setAttribute("href", orig);
-            try { el.href = orig; } catch { /* ignore */ }
-          }
-          el.removeAttribute("data-threat-original-href");
-          el.style.removeProperty("pointer-events");
-          el.style.removeProperty("opacity");
-          el.style.removeProperty("filter");
-          el.style.removeProperty("cursor");
-        } catch { /* ignore */ }
+      restoreIn(document);
+      if (NS.parentLockedFrameControls) document.querySelectorAll("iframe").forEach((frame) => {
+        try { if (frame.contentDocument) restoreIn(frame.contentDocument, true); } catch { /* cross-origin */ }
       });
     } catch { /* ignore */ }
   };
@@ -1434,24 +1433,25 @@
   };
 
   NS.applyConfirmedDownloadBlock = function (href, el, probeInfo) {
-    if (!href) return;
-    if (NS.looksLikeOfficialProductDownloadEndpoint(href) || NS.isTrustedOfficialDownloadContext()) return;
+    if (!href) return false;
+    if (NS.looksLikeOfficialProductDownloadEndpoint(href) || NS.isTrustedOfficialDownloadContext()) return false;
     const probeName = probeInfo?.filename || probeInfo?.fileName || "";
-    if (NS.isClearProductOrAndroidPackage(probeName) || NS.isClearProductOrAndroidPackage(href) || NS.looksLikeStrongProductInstallerName(probeName) || NS.looksLikeStrongProductInstallerName(NS.getFilenameFromUrl(href)) || NS.isAllowlistedProductPackageUrl(href)) return;
+    if (NS.isClearProductOrAndroidPackage(probeName) || NS.isClearProductOrAndroidPackage(href) || NS.looksLikeStrongProductInstallerName(probeName) || NS.looksLikeStrongProductInstallerName(NS.getFilenameFromUrl(href)) || NS.isAllowlistedProductPackageUrl(href)) return false;
     const state = NS.state;
-    if (!state.protectedTargets.includes(href)) state.protectedTargets.push(href);
-    if (el) NS.disableOneSuspiciousElement(el, href);
-    NS.disableSuspiciousDownloadButtons();
-    NS.disableAllDownloadIntentControls();
     let label = NS.formatPackageLabel(href);
     try { const u = new URL(href, location.href); if (!PACKAGE_EXT.test(u.pathname)) label = probeInfo?.filename || `${u.hostname}${u.pathname}`; } catch { /* ignore */ }
     const reason = probeInfo?.reason ? `探测到下载行为(${probeInfo.reason}): ${label}` : `已拦截可疑下载: ${label}`;
+    if (!NS.installDownloadGuard(reason, { notify: true, href, message: label, forceNotify: !state.protectionNoticeSent })) return false;
+    if (!state.protectedTargets.includes(href)) state.protectedTargets.push(href);
+    if (el) NS.disableOneSuspiciousElement(el, href);
     NS.addSignal("探测到跳转/附件下载", 14, reason);
-    NS.installDownloadGuard(reason, { notify: true, href, message: label, forceNotify: !state.protectionNoticeSent });
+    NS.emitRiskReport(true);
+    return true;
   };
 
   NS.disableSuspiciousDownloadButtons = function () {
     const state = NS.state;
+    if (!state.downloadGuardInstalled && !NS.hasRealHardKitThreat?.()) return;
     Array.from(document.querySelectorAll("a[href], a[data-href], a[data-threat-original-href]")).forEach((el) => {
       try {
         const href = (el.getAttribute("href") || el.getAttribute("data-href") || el.getAttribute("data-threat-original-href") || "").trim();
@@ -1774,7 +1774,7 @@
       try { NS.applyDownloadGuardDomLock(true); } catch { /* ignore */ }
       try { NS.scrubHostileLoadingOverlays(); } catch { /* ignore */ }
       NS.postToHooks({ type: "set-guard", enabled: true });
-      return;
+      return true;
     }
     NS.armBackgroundProtect("full");
     NS.armImmediatePackageBlock();
@@ -1829,5 +1829,6 @@
     [0, 50, 200, 500, 1200, 2500, 5000, 9000].forEach((ms) => setTimeout(redisable, ms));
     state._guardRedisableArmed = true;
     NS.emitRiskReport(true);
+    return true;
   };
 })(window.SilverfoxContent ??= {});

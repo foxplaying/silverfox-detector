@@ -90,11 +90,28 @@
     });
   }
 
-  function saveCooldownMap(storageKey, map) {
-    try {
-      if (!chrome?.storage?.local) return;
-      chrome.storage.local.set({ [storageKey]: map }, () => { void chrome.runtime.lastError; });
-    } catch { /* ignore */ }
+  // The two dictionaries are independent. Within one key the next read
+  // must wait until the previous chrome.storage.set callback has completed.
+  const cooldownWrites = new Map();
+  function recordCooldown(storageKey, key, ttl, max, keep, onlyIfNew) {
+    const previous = cooldownWrites.get(storageKey) || Promise.resolve();
+    const task = previous.then(async () => {
+      const now = Date.now();
+      const map = pruneCooldownMap(await loadCooldownMap(storageKey), ttl, now);
+      if (onlyIfNew && Number(map[key]) > now - ttl) return false;
+      map[key] = now;
+      const keys = Object.keys(map);
+      if (keys.length > max) {
+        keys.sort((a, b) => map[a] - map[b]);
+        for (const old of keys.slice(0, keys.length - keep)) delete map[old];
+      }
+      if (chrome?.storage?.local) await new Promise(resolve => {
+        chrome.storage.local.set({ [storageKey]: map }, () => { void chrome.runtime.lastError; resolve(); });
+      });
+      return true;
+    }).catch(() => true);
+    cooldownWrites.set(storageKey, task);
+    return task.finally(() => { if (cooldownWrites.get(storageKey) === task) cooldownWrites.delete(storageKey); });
   }
 
   function pruneCooldownMap(map, ttlMs, now) {
@@ -130,7 +147,22 @@
    * - 普通下载拦截：短冷却 + 40min 跨会话冷却（防启动连环弹）
    * - force / 仿冒身份类：绕过 40min 冷却，仅 2s 防同次扫描连发（保证仿冒官网右下角能弹）
    */
-  NS.showBlockedNotification = async function (title, message, tabId, force = false, options = null) {
+  const pendingNotifications = new Map();
+  NS.showBlockedNotification = function (title, message, tabId, force = false, options = null) {
+    const channel = String(options && options.channelKey || "").trim();
+    const version = String(options && options.versionToken || "").trim();
+    const key = channel ? JSON.stringify(["channel", channel, version])
+      : JSON.stringify(["content", String(title || "威胁检测"), String(message || "").slice(0, 250)]);
+    // 冷却时间在创建完成后落盘；创建期间也必须占位，防并发都通过检查。
+    if (pendingNotifications.has(key)) return Promise.resolve(false);
+    const pending = showBlockedNotificationOnce(title, message, tabId, force, options);
+    pendingNotifications.set(key, pending);
+    return pending.finally(() => {
+      if (pendingNotifications.get(key) === pending) pendingNotifications.delete(key);
+    });
+  };
+
+  async function showBlockedNotificationOnce(title, message, tabId, force = false, options = null) {
     const t = String(title || "威胁检测");
     const m = String(message || "").slice(0, 250);
     const channelKey = String(options && options.channelKey || "").trim();
@@ -140,6 +172,7 @@
     const channelIsCurrent = () => !channelKey
       || NS.notificationChannelVersions.get(channelKey) === versionToken;
     const contentKey = channelKey || NS.contentNoticeKey(t, m);
+    const cooldownKey = options?.cooldownKey || contentKey;
     const key = channelKey ? `${channelKey}::${versionToken}` : NS.noticeKey(t, m, tabId);
     const now = Date.now();
     // 仿冒官网 / 异常跳转：视为身份类，必须能弹系统通知
@@ -157,13 +190,12 @@
       try {
         let map = await loadCooldownMap(COOLDOWN_STORAGE_KEY);
         map = pruneCooldownMap(map, NOTICE_SESSION_COOLDOWN_MS, now);
-        const lastStored = Number(map[contentKey]) || 0;
+        const lastStored = Number(map[cooldownKey]) || 0;
         if (lastStored && now - lastStored < NOTICE_SESSION_COOLDOWN_MS) {
           NS.shownNoticeKeys.add(key);
           NS.shownNoticeKeys.add(contentKey);
           NS.shownNoticeAt.set(key, lastStored);
           NS.shownNoticeAt.set(contentKey, lastStored);
-          saveCooldownMap(COOLDOWN_STORAGE_KEY, map);
           return false;
         }
       } catch { /* ignore storage errors, still try show */ }
@@ -188,17 +220,7 @@
       NS.shownNoticeKeys.add(contentKey);
       NS.shownNoticeAt.set(key, ts);
       NS.shownNoticeAt.set(contentKey, ts);
-      loadCooldownMap(COOLDOWN_STORAGE_KEY).then((map) => {
-        const pruned = pruneCooldownMap(map, NOTICE_SESSION_COOLDOWN_MS, ts);
-        pruned[contentKey] = ts;
-        // 限制条目，防止无限增长
-        const keys = Object.keys(pruned);
-        if (keys.length > 80) {
-          keys.sort((a, b) => (pruned[a] || 0) - (pruned[b] || 0));
-          for (let i = 0; i < keys.length - 60; i++) delete pruned[keys[i]];
-        }
-        saveCooldownMap(COOLDOWN_STORAGE_KEY, pruned);
-      }).catch(() => {});
+      return recordCooldown(COOLDOWN_STORAGE_KEY, cooldownKey, NOTICE_SESSION_COOLDOWN_MS, 80, 60, false);
     };
 
     return new Promise((resolve) => {
@@ -218,14 +240,12 @@
                 return;
               }
               if (!channelIsCurrent()) { resolve(false); return; }
-              markShown();
-              resolve(true);
+              resolve(markShown());
             });
             return;
           }
           if (!channelIsCurrent()) { resolve(false); return; }
-          markShown();
-          resolve(true);
+          resolve(markShown());
         });
       };
 
@@ -237,8 +257,7 @@
           if (chrome.runtime.lastError) void chrome.runtime.lastError;
           if (!channelIsCurrent()) { resolve(false); return; }
           if (updated) {
-            markShown();
-            resolve(true);
+            resolve(markShown());
             return;
           }
           createNotification(opts);
@@ -256,26 +275,7 @@
   NS.shouldNotifyDownloadBlock = async function (urlOrLabel) {
     const raw = String(urlOrLabel || "").trim().slice(0, 300);
     if (!raw) return true;
-    const now = Date.now();
-    try {
-      let map = await loadCooldownMap(DOWNLOAD_COOLDOWN_STORAGE_KEY);
-      map = pruneCooldownMap(map, DOWNLOAD_URL_COOLDOWN_MS, now);
-      const last = Number(map[raw]) || 0;
-      if (last && now - last < DOWNLOAD_URL_COOLDOWN_MS) {
-        saveCooldownMap(DOWNLOAD_COOLDOWN_STORAGE_KEY, map);
-        return false;
-      }
-      map[raw] = now;
-      const keys = Object.keys(map);
-      if (keys.length > 100) {
-        keys.sort((a, b) => (map[a] || 0) - (map[b] || 0));
-        for (let i = 0; i < keys.length - 80; i++) delete map[keys[i]];
-      }
-      saveCooldownMap(DOWNLOAD_COOLDOWN_STORAGE_KEY, map);
-      return true;
-    } catch {
-      return true;
-    }
+    return recordCooldown(DOWNLOAD_COOLDOWN_STORAGE_KEY, raw, DOWNLOAD_URL_COOLDOWN_MS, 100, 80, true);
   };
 
   NS.getNotificationIconUrl().catch(() => {});

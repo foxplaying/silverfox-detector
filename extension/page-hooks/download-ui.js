@@ -3,6 +3,7 @@
  */
 ;(function (NS) {
   "use strict";
+  let parentLockedFrameControls;
 
   class DownloadUi {
     /** 元素是否为下载意图控件（短 CTA 文案 / download 类名）。 */
@@ -25,6 +26,7 @@
 
     static greyOut(el) {
       try {
+        globalThis.SilverfoxControlState?.capture(el);
         el.dataset.silverfoxGreyed = "1";
         el.style.setProperty("pointer-events", "none", "important");
         el.style.setProperty("opacity", "0.45", "important");
@@ -37,8 +39,9 @@
 
     static restoreGreyed(el) {
       try {
-        if (!el) return;
+        if (!el || el.dataset.silverfoxGreyed !== "1") return;
         if (el.dataset.silverfoxGreyed === "1") delete el.dataset.silverfoxGreyed;
+        if (globalThis.SilverfoxControlState?.restore(el)) return;
         el.style.removeProperty("pointer-events");
         el.style.removeProperty("opacity");
         el.style.removeProperty("cursor");
@@ -50,23 +53,33 @@
 
     static restoreAllDownloadButtonsInPage() {
       try {
-        document.querySelectorAll("a, button, [role='button'], [data-silverfox-greyed='1'], a[data-threat-original-href]").forEach((el) => {
+        const restoreIn = (doc, fromParent = false) => doc.querySelectorAll("[data-silverfox-greyed='1'], a[data-threat-original-href]").forEach((el) => {
+          if (fromParent && !parentLockedFrameControls?.delete(el)) return;
+          // Content also owns this lock (including title). Its unlock handles
+          // both markers and the shared snapshot in one pass.
+          if (el.dataset.threatDetectorDisabled === "1") return;
+          // Never reset native player controls or site-owned disabled states.
+          const ownedHref = el.getAttribute && el.getAttribute("data-threat-original-href");
+          if (el.dataset.silverfoxGreyed !== "1" && !ownedHref) return;
           try {
-            const orig = el.getAttribute && el.getAttribute("data-threat-original-href");
-            if (el.tagName === "A" && orig && orig !== "js-download" && !/^javascript:/i.test(orig)) {
-              el.setAttribute("href", orig);
-              try { el.href = orig; } catch { /* ignore */ }
+            const orig = ownedHref;
+            if (el.tagName === "A" && orig && orig !== "js-download" && !/^(?:javascript:|about:(?:blank|black)(?:[?#]|$))/i.test(orig)) {
+              if (el.getAttribute("href") !== orig) el.setAttribute("href", orig);
               el.removeAttribute("data-threat-original-href");
             }
           } catch { /* ignore */ }
-          if (el.dataset.silverfoxGreyed === "1" || DownloadUi.isDownloadIntentText(el)) DownloadUi.restoreGreyed(el);
-          else {
+          if (el.dataset.silverfoxGreyed === "1") DownloadUi.restoreGreyed(el);
+          else if (ownedHref) {
             // href setter 直接写入的半拦截状态没有 greyed dataset，也必须恢复交互样式。
             try {
               el.style.removeProperty("pointer-events");
               el.style.removeProperty("opacity");
             } catch { /* ignore */ }
           }
+        });
+        restoreIn(document);
+        if (parentLockedFrameControls) document.querySelectorAll("iframe").forEach((frame) => {
+          try { if (frame.contentDocument) restoreIn(frame.contentDocument, true); } catch { /* cross-origin */ }
         });
       } catch { /* ignore */ }
     }
@@ -86,7 +99,10 @@
               if (!doc) return;
               doc.querySelectorAll("a, button, [role='button']").forEach((el) => {
                 try {
-                  if (DownloadUi.isDownloadIntentText(el)) DownloadUi.greyOut(el);
+                  if (DownloadUi.isDownloadIntentText(el)) {
+                    (parentLockedFrameControls ??= new WeakSet()).add(el);
+                    DownloadUi.greyOut(el);
+                  }
                 } catch { /* ignore */ }
               });
             } catch { /* cross-origin */ }

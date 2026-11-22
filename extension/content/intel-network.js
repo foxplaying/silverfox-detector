@@ -82,19 +82,37 @@
     return { chain, finalText };
   };
 
+  const downloadProbeInflight = new Map();
   NS.probeDownloadBehavior = function (url) {
     const c = NS.caches;
     const abs = (() => { try { return new URL(url, location.href).href; } catch { return url; } })();
-    if (c.probeCache.has(abs)) return Promise.resolve(c.probeCache.get(abs));
-    return new Promise((resolve) => {
+    const cached = c.probeCache.get(abs);
+    if (cached && cached.success === true && cached.expiresAt > Date.now()) return Promise.resolve(cached);
+    c.probeCache.delete(abs);
+    if (downloadProbeInflight.has(abs)) return downloadProbeInflight.get(abs);
+    const job = new Promise((resolve) => {
+      let done = false;
+      const finish = (response) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        if (response && response.success === true) {
+          response = { ...response, expiresAt: Date.now() + 60000 };
+          c.probeCache.set(abs, response);
+          while (c.probeCache.size > 128) c.probeCache.delete(c.probeCache.keys().next().value);
+        }
+        resolve(response || { success: false, isDownload: null, error: "probe-failed" });
+      };
+      const timer = setTimeout(() => finish({ success: false, isDownload: null, error: "probe-timeout" }), 2000);
       try {
         chrome.runtime.sendMessage({ type: "probeDownloadBehavior", url: abs }, (response) => {
-          if (chrome.runtime.lastError || !response) { const fail = { success: false, isDownload: false, error: chrome.runtime.lastError?.message || "probe-failed" }; c.probeCache.set(abs, fail); resolve(fail); return; }
-          c.probeCache.set(abs, response);
-          resolve(response);
+          const error = chrome.runtime.lastError;
+          finish(error ? { success: false, isDownload: null, error: error.message || "probe-failed" } : response);
         });
-      } catch (e) { const fail = { success: false, isDownload: false, error: e?.message || "probe-failed" }; c.probeCache.set(abs, fail); resolve(fail); }
-    });
+      } catch (error) { finish({ success: false, isDownload: null, error: error.message || "probe-failed" }); }
+    }).finally(() => downloadProbeInflight.delete(abs));
+    downloadProbeInflight.set(abs, job);
+    return job;
   };
 
   // --- ICP 缓存 ---

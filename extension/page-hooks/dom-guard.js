@@ -48,7 +48,9 @@
     }
 
     /** 清除页面中已存在的 dlp 套件 DOM/CSS、ld-wrap 全屏加载层与隐藏的自动下载 a/iframe。 */
-    static scrubDesktopForceDownloadDom() {
+    static scrubDesktopForceDownloadDom(policy) {
+      if (!policy || policy.officialSafe || policy.lightPage
+        || !(policy.guardEnabled || policy.forceDesktopDlKit)) return;
       try {
         document.querySelectorAll(
           ".dlp-overlay, .dlp-topbar, .dlp-modal, [class*='dlp-overlay'], [class*='dlp-topbar'], [class*='dlp-modal']"
@@ -62,25 +64,43 @@
             try { st.remove(); } catch { try { st.textContent = ""; } catch { /* ignore */ } }
           }
         });
-        document.querySelectorAll("a[download], a[href], iframe[src], embed[src]").forEach((el) => {
+        document.querySelectorAll("a[download], a[href], iframe[src], embed[src], object[data]").forEach((el) => {
           try {
-            const href = el.getAttribute("href") || el.getAttribute("src") || "";
+            const href = el.getAttribute("href") || el.getAttribute("src") || el.getAttribute("data") || "";
             if (!href || !PackageHeuristics.isPackageFileUrl(href) || PackageHeuristics.isStrongProductInstallerUrl(href)) return;
             const st = (el.getAttribute("style") || "") + (el.style && el.style.cssText || "");
             if (/display\s*:\s*none/i.test(st) || (el.style && el.style.display === "none") || el.hasAttribute("download")) {
-              el.removeAttribute("href");
-              el.removeAttribute("src");
-              el.removeAttribute("download");
-              try { el.remove(); } catch { /* ignore */ }
+              // A package URL/download attribute is not a kit signature. Keep
+              // ordinary controls in place so a later identity verdict can
+              // restore them without losing listeners or the download name.
+              if (el.tagName === "A") {
+                DomGuard.neutralizeDownloadAnchor(el, href);
+              } else {
+                DomGuard.neutralizeFrameEl(el);
+              }
             }
           } catch { /* ignore */ }
         });
       } catch { /* ignore */ }
     }
 
-    /** MAIN-world：删全屏加载遮罩（与 content scrubHostileLoadingOverlays 同语义） */
-    static scrubHostileLoadingOverlaysMain() {
+    static neutralizeDownloadAnchor(node, href) {
       try {
+        if (!node || node.tagName !== "A") return false;
+        if (href && !node.hasAttribute("data-threat-original-href")) node.setAttribute("data-threat-original-href", href);
+        node.removeAttribute("href");
+        DownloadUi.greyOut(node);
+        return !node.hasAttribute("href");
+      } catch { return false; }
+    }
+
+    /** MAIN-world：删全屏加载遮罩（与 content scrubHostileLoadingOverlays 同语义） */
+    static scrubHostileLoadingOverlaysMain(node = null) {
+      try {
+        const eachMatch = (selector, visit) => {
+          if (!node) document.querySelectorAll(selector).forEach(visit);
+          else if (node.matches(selector)) visit(node);
+        };
         const kill = (el) => {
           if (!el || el.nodeType !== 1) return;
           try {
@@ -91,7 +111,7 @@
             try { el.style.setProperty("display", "none", "important"); } catch { /* ignore */ }
           }
         };
-        document.querySelectorAll(".ld-wrap, .ld-spinner, .ld-text, [class*='ld-wrap'], [class*='ld-spinner']").forEach((el) => {
+        eachMatch(".ld-wrap, .ld-spinner, .ld-text, [class*='ld-wrap'], [class*='ld-spinner']", (el) => {
           try {
             let p = el;
             for (let i = 0; i < 5 && p; i++) {
@@ -106,7 +126,7 @@
             kill(el.parentElement || el);
           } catch { /* ignore */ }
         });
-        document.querySelectorAll("div").forEach((el) => {
+        eachMatch("div", (el) => {
           try {
             const st = el.getAttribute("style") || "";
             if (!/position\s*:\s*fixed/i.test(st)) return;
@@ -128,35 +148,83 @@
      *   Blocked script execution in 'about:blank' because the document's frame is sandboxed…
      * 改用空 srcdoc / 去 src，不写 sandbox、不导航 about:blank。
      */
-    static neutralizeFrameEl(node) {
+    static neutralizeFrameEl(node, pendingSrc) {
       if (!node || node.nodeType !== 1) return;
       const tag = (node.tagName || "").toUpperCase();
+      if (!/^(?:IFRAME|EMBED|OBJECT)$/.test(tag)) return;
       try {
-        if (tag === "IFRAME") {
-          try { node.removeAttribute("src"); } catch { /* ignore */ }
-          try { node.removeAttribute("sandbox"); } catch { /* ignore */ }
-          try { node.setAttribute("srcdoc", "<!--sf-blocked-->"); } catch { /* ignore */ }
-        } else if (tag === "EMBED" || tag === "OBJECT") {
-          try { node.removeAttribute("src"); } catch { /* ignore */ }
-          try { node.removeAttribute("data"); } catch { /* ignore */ }
-          try { node.removeAttribute("type"); } catch { /* ignore */ }
-        } else {
-          try { node.removeAttribute("src"); } catch { /* ignore */ }
+        const records = DomGuard._lockedFrames || (DomGuard._lockedFrames = new Map());
+        // The isolated content guard may have locked this first. It already
+        // owns the original snapshot; don't save its about:blank placeholder.
+        if (!records.has(node) && node.getAttribute("data-silverfox-frame-locked") === "1"
+          && node.getAttribute("data-silverfox-frame-owner") !== "page-hooks") return;
+        if (!records.has(node)) {
+          const attrs = {};
+          for (const name of ["src", "srcdoc", "data", "type", "sandbox"]) attrs[name] = node.getAttribute(name);
+          records.set(node, { attrs, pointer: node.style.getPropertyValue("pointer-events"),
+            priority: node.style.getPropertyPriority("pointer-events") });
         }
-        try { node.setAttribute("data-silverfox-frame-locked", "1"); } catch { /* ignore */ }
-        try { node.style.setProperty("pointer-events", "none", "important"); } catch { /* ignore */ }
+        const saved = records.get(node);
+        if (pendingSrc && !/^(?:about:(?:blank|black)(?:[?#]|$)|javascript:)/i.test(pendingSrc)) {
+          saved.attrs.src = pendingSrc;
+        }
+        const set = (name, value) => { if (node.getAttribute(name) !== value) node.setAttribute(name, value); };
+        const remove = (name) => { if (node.hasAttribute(name)) node.removeAttribute(name); };
+        if (tag === "IFRAME") {
+          remove("src");
+          set("srcdoc", "<!--sf-blocked-->");
+        } else if (tag === "EMBED" || tag === "OBJECT") {
+          remove("src"); remove("data"); remove("type");
+        }
+        set("data-silverfox-frame-locked", "1");
+        set("data-silverfox-frame-owner", "page-hooks");
+        if (node.style.getPropertyValue("pointer-events") !== "none"
+          || node.style.getPropertyPriority("pointer-events") !== "important") node.style.setProperty("pointer-events", "none", "important");
       } catch { /* ignore */ }
+    }
+
+    static restoreNeutralizedFrames(policy) {
+      if (!policy || policy.guardEnabled || policy.forceDesktopDlKit) return;
+      const restoring = DomGuard._restoringFrames || (DomGuard._restoringFrames = new WeakSet());
+      for (const [node, saved] of (DomGuard._lockedFrames || [])) {
+        try {
+          restoring.add(node);
+          // Restore srcdoc last: the blocker continues to mask src until the
+          // original URL, type and sandbox have all been restored.
+          for (const name of ["sandbox", "type", "data", "src", "srcdoc"]) {
+            const value = saved.attrs[name];
+            if (node.getAttribute(name) === value) continue;
+            if (value == null) node.removeAttribute(name);
+            else node.setAttribute(name, value);
+          }
+          if (saved.pointer) node.style.setProperty("pointer-events", saved.pointer, saved.priority);
+          else node.style.removeProperty("pointer-events");
+          node.removeAttribute("data-silverfox-frame-locked");
+          node.removeAttribute("data-silverfox-frame-owner");
+          DomGuard._lockedFrames.delete(node);
+        } catch { /* preserve snapshot for the next unlock attempt */ }
+        finally { restoring.delete(node); }
+      }
+    }
+
+    static holdFrameAttribute(node, name, value) {
+      DomGuard.neutralizeFrameEl(node);
+      const saved = DomGuard._lockedFrames && DomGuard._lockedFrames.get(node);
+      if (saved) saved.attrs[name] = value;
     }
 
     /** 注入节点是否应拒绝（dlp 套件 / 隐藏包 iframe）。 */
     static shouldRejectInjectedNode(node, policy) {
       if (!node || node.nodeType !== 1) return false;
+      if (node.closest && node.closest("template")) return false;
+      if (!/^(?:SCRIPT|STYLE)$/i.test(node.tagName || "")
+        && node.closest && node.closest("pre, code, textarea, [inert]")) return false;
       if (policy.isLightPage() || policy.officialSafe) return false;
       const tag = (node.tagName || "").toUpperCase();
       const cls = typeof node.className === "string" ? node.className : "";
       const id = node.id || "";
       const maybeDlp = tag === "STYLE" || tag === "SCRIPT" || /dlp-/i.test(cls) || /dlp-/i.test(id)
-        || tag === "IFRAME" || tag === "EMBED" || (tag === "A" && (policy.forceDesktopDlKit || policy.guardEnabled));
+        || tag === "IFRAME" || tag === "EMBED" || tag === "OBJECT" || (tag === "A" && (policy.forceDesktopDlKit || policy.guardEnabled));
       if (!maybeDlp) return false;
 
       if (CloakingKit.isDesktopForceDownloadNode(node)) {
@@ -193,17 +261,27 @@
           return true;
         }
       } catch { /* ignore */ }
-      if ((policy.forceDesktopDlKit || policy.guardEnabled) && (tag === "IFRAME" || tag === "EMBED" || tag === "A")) {
+      if ((policy.forceDesktopDlKit || policy.guardEnabled) && (tag === "IFRAME" || tag === "EMBED" || tag === "OBJECT" || tag === "A")) {
         try {
+          // Keep ordinary guarded frames in their intended DOM position, but
+          // with inert sources. Returning true used to swallow append/replace
+          // completely, so restoring the URL later left the frame detached.
+          // Actual kit signatures have already been rejected above.
+          if (policy.guardEnabled && /^(?:IFRAME|EMBED|OBJECT)$/.test(tag)) {
+            DomGuard.neutralizeFrameEl(node);
+            policy.post({ type: "signal", name: "保护模式拦截框架注入", weight: 0, reason: `guard 下暂停 ${tag}` });
+            const owned = DomGuard._lockedFrames && DomGuard._lockedFrames.has(node);
+            const inert = tag === "IFRAME"
+              ? node.getAttribute("srcdoc") === "<!--sf-blocked-->" && !node.hasAttribute("src")
+              : !node.hasAttribute("src") && !node.hasAttribute("data") && !node.hasAttribute("type");
+            return !(owned && inert);
+          }
           const href = node.getAttribute("href") || node.getAttribute("src") || "";
           if (href && PackageHeuristics.isPackageFileUrl(href) && !PackageHeuristics.isStrongProductInstallerUrl(href)) {
             policy._rememberHop(href);
-            return true;
-          }
-          // guard 开启：拒绝再注入 iframe/embed（盗版页常用晚加载 HTML 壳，非 .exe 直链）
-          if (policy.guardEnabled && (tag === "IFRAME" || tag === "EMBED" || tag === "OBJECT")) {
-            DomGuard.neutralizeFrameEl(node);
-            policy.post({ type: "signal", name: "保护模式拦截框架注入", weight: 0, reason: `guard 下拒绝 ${tag}` });
+            // A normal package anchor is not an injected kit. Preserve its
+            // placement/listeners exactly like an ordinary guarded frame.
+            if (tag === "A") return !DomGuard.neutralizeDownloadAnchor(node, href);
             return true;
           }
         } catch { /* ignore */ }
@@ -299,6 +377,7 @@
         const state = DomGuard._fetchInspection;
         if (!state) return;
         state.active = false;
+        for (const cancel of state.pending || []) cancel();
         // 页面若后来自行替换 fetch，不得用旧原生函数把页面的新 wrapper 覆盖掉。
         if (window.fetch === state.installed) {
           window.fetch = state.original;
@@ -309,12 +388,68 @@
       } catch { /* ignore */ }
     }
 
+    /** Inspect a small clone off the page's fetch path; never buffer an entire response. */
+    static async _readFetchInspectionText(response, state, isCurrent) {
+      const maxBytes = 64 * 1024;
+      if (!isCurrent() || state.pending.size >= 4) return null;
+      let reader;
+      try {
+        const length = Number(response.headers && response.headers.get("content-length"));
+        if (Number.isFinite(length) && length > maxBytes) return null;
+        const type = String(response.headers && response.headers.get("content-type") || "");
+        if (type && !/^(?:text\/|application\/(?:[\w.+-]*json|javascript|x-javascript))(?:[;\s]|$)/i.test(type)
+          && !/^text\//i.test(type)) return null;
+        // Native Response streams are available in Edge. If a page supplies
+        // a non-streaming response wrapper, skip it instead of calling text().
+        if (!response.body || typeof response.body.getReader !== "function") return null;
+        const clone = response.clone();
+        if (!clone.body || typeof clone.body.getReader !== "function") return null;
+        reader = clone.body.getReader();
+      } catch { return null; }
+      let stopped = false;
+      let settleCancel;
+      const cancelled = new Promise((resolve) => { settleCancel = resolve; });
+      const cancel = () => {
+        if (stopped) return;
+        stopped = true;
+        settleCancel(null);
+        // A tee cancellation may wait for the original body. Never await it.
+        try { Promise.resolve(reader.cancel()).catch(() => {}); } catch { /* ignore */ }
+      };
+      state.pending.add(cancel);
+      const timer = setTimeout(cancel, 1500);
+      try {
+        const read = async () => {
+          const decoder = new TextDecoder();
+          let size = 0;
+          let text = "";
+          while (!stopped && isCurrent()) {
+            const chunk = await reader.read();
+            if (stopped || !isCurrent()) return null;
+            if (chunk.done) return text + decoder.decode();
+            size += chunk.value.byteLength;
+            if (size > maxBytes) return null;
+            text += decoder.decode(chunk.value, { stream: true });
+          }
+          return null;
+        };
+        return await Promise.race([read(), cancelled]);
+      } catch { return null; }
+      finally {
+        clearTimeout(timer);
+        cancel();
+        state.pending.delete(cancel);
+        try { reader.releaseLock(); } catch { /* a cancelled read may still be settling */ }
+      }
+    }
+
     static _wrapFetch(policy) {
       try {
         if (!policy || policy.lightPage || policy.officialSafe || !policy.guardEnabled) return;
         const existing = DomGuard._fetchInspection;
         if (existing) {
           if (window.fetch === existing.installed) {
+            if (existing.policy !== policy) for (const cancel of existing.pending || []) cancel();
             existing.policy = policy;
             existing.active = true;
             return;
@@ -322,12 +457,13 @@
           // 页面在安装后替换了 fetch。先让旧层变成透明转发，再包装当前函数；
           // 即使页面的新 wrapper 调用了旧层，也只会有一个活跃检查层。
           existing.active = false;
+          for (const cancel of existing.pending || []) cancel();
           DomGuard._fetchInspection = null;
         }
         const origFetch = window.fetch;
         if (typeof origFetch !== "function") return;
         const callOriginal = (thisArg, args) => Reflect.apply(origFetch, thisArg || window, args);
-        const state = { original: origFetch, installed: null, policy, active: true };
+        const state = { original: origFetch, installed: null, policy, active: true, pending: new Set() };
         const wrappedFetch = function (...args) {
           const livePolicy = state.policy;
           if (!state.active || !livePolicy || livePolicy.officialSafe || livePolicy.lightPage
@@ -348,12 +484,16 @@
             const looksLikeAdminApi = /api\.php|page-admin|download[_-]?api|getdown|getlink|download_link/i.test(urlStr)
               && !/\.(?:exe|zip|dmg|msi|apk|rar|7z)(?:\?|#|$)/i.test(urlStr) && !looksLikeVendorClientConfig;
             if (url && (looksLikeAdminApi || looksLikeVendorClientConfig)) {
-              return p.then(async (response) => {
+              const isCurrent = () => state.active && DomGuard._fetchInspection === state
+                && state.policy === livePolicy && livePolicy.guardEnabled
+                && !livePolicy.officialSafe && !livePolicy.lightPage;
+              // Return the original promise below. API inspection must not
+              // withhold response headers while a stream is slow or endless.
+              p.then(async (response) => {
                 try {
-                  if (!state.active || !livePolicy || livePolicy.officialSafe || livePolicy.lightPage
-                    || !livePolicy.guardEnabled) return response;
-                  const clone = response.clone();
-                  const text = await clone.text();
+                  if (!isCurrent()) return;
+                  const text = await DomGuard._readFetchInspectionText(response, state, isCurrent);
+                  if (text == null || !isCurrent()) return;
                   let links = [];
                   try {
                     const data = JSON.parse(text);
@@ -367,8 +507,9 @@
                   }
                   links = [...new Set(links)];
                   const threatLinks = links.filter((l) => PackageHeuristics.isPackageFileUrl(l) && !PackageHeuristics.isClearOrStrongProductPackageUrl(l));
-                  if (!threatLinks.length) return response;
+                  if (!threatLinks.length) return;
                   for (const link of threatLinks) {
+                    if (!isCurrent()) return;
                     livePolicy._rememberHop(link);
                     livePolicy.post({ type: "signal", name: "远程下发下载地址", weight: 16, reason: `API 返回下载地址: ${String(link).slice(0, 200)}` });
                     livePolicy.post({ type: "blocked-download", href: link, reason: `api-download-link -> ${link}` });
@@ -378,18 +519,16 @@
                         const h = a.getAttribute("href") || "";
                         if (h === link || h === "#" || /download/i.test(a.className || "")) {
                           try {
-                            a.setAttribute("data-threat-original-href", link);
+                            if (h && !a.hasAttribute("data-threat-original-href")) a.setAttribute("data-threat-original-href", h);
                             a.removeAttribute("href");
-                            a.style.setProperty("pointer-events", "none", "important");
-                            a.style.setProperty("opacity", "0.45", "important");
+                            DownloadUi.greyOut(a);
                           } catch { /* ignore */ }
                         }
                       });
                     } catch { /* ignore */ }
                   }
                 } catch { /* ignore */ }
-                return response;
-              });
+              }).catch(() => {});
             }
           } catch { /* ignore */ }
           return p;
@@ -467,19 +606,20 @@
                     policy.noteTrustedDownloadIntent(v);
                     if (policy.officialSafe || policy.lightPage) return desc.set.call(this, v);
                     const val = String(v || "");
+                    // a.href 赋值不发起导航。未上锁时保留地址，在 click/导航处判定。
+                    if (!policy.forceDesktopDlKit && !policy.guardEnabled) return desc.set.call(this, v);
                     if (policy._shouldBlockUrl(val) || PackageHeuristics.looksLikeOpaqueDownloadHopUrl(val) || policy.blockedHops.has(val)
                       || PackageHeuristics.looksLikeObjectStoragePackageUrl(val)
                       || ((policy.forceDesktopDlKit || policy.guardEnabled) && PackageHeuristics.isPackageFileUrl(val) && !PackageHeuristics.isStrongProductInstallerUrl(val))) {
                       policy._rememberHop(val);
                       policy._emitBlocked(val, `href-assign -> ${val}`);
                       policy.post({ type: "request-guard", reason: `动态写入下载地址: ${val}` });
-                      if (PackageHeuristics.looksLikeObjectStoragePackageUrl(val) || policy.forceDesktopDlKit) {
+                      if (policy.forceDesktopDlKit) {
                         policy.armDesktopForceDownloadKit(`a.href 写入安装包: ${val.slice(0, 120)}`);
                       }
                       try {
                         this.setAttribute("data-threat-original-href", val);
-                        this.style.setProperty("pointer-events", "none", "important");
-                        this.style.setProperty("opacity", "0.45", "important");
+                        DownloadUi?.greyOut(this);
                       } catch { /* ignore */ }
                       return;
                     }
@@ -503,17 +643,19 @@
                   set(v) {
                     if (policy.officialSafe || policy.lightPage) return desc.set.call(this, v);
                     const val = String(v || "");
-                    if (policy.tryBlockNavigation(val, `${tag}.src-create -> ${val}`)) return;
+                    if (policy.tryBlockNavigation(val, `${tag}.src-create -> ${val}`)) {
+                      DomGuard.neutralizeFrameEl(this, val); return;
+                    }
                     if ((policy.forceDesktopDlKit || policy.guardEnabled) && PackageHeuristics.isPackageFileUrl(val) && !PackageHeuristics.isStrongProductInstallerUrl(val)) {
                       policy._rememberHop(val);
-                      DomGuard.neutralizeFrameEl(this);
+                      DomGuard.neutralizeFrameEl(this, val);
                       return;
                     }
                     // guard：拦截一切非 blank 的框架导航（HTML 下载落地页也拦）
                     if (policy.guardEnabled && val && !/^about:blank$/i.test(val) && !/^javascript:/i.test(val)) {
                       policy._rememberHop(val);
                       policy.post({ type: "signal", name: "保护模式拦截框架加载", weight: 0, reason: `${tag}.src 被拦: ${val.slice(0, 160)}` });
-                      DomGuard.neutralizeFrameEl(this);
+                      DomGuard.neutralizeFrameEl(this, val);
                       return;
                     }
                     return desc.set.call(this, v);
@@ -568,8 +710,7 @@
                 policy.post({ type: "request-guard", reason: `动态写入下载地址: ${val}` });
                 try {
                   this.setAttribute("data-threat-original-href", val);
-                  this.style.setProperty("pointer-events", "none", "important");
-                  this.style.setProperty("opacity", "0.45", "important");
+                  DownloadUi?.greyOut(this);
                   return;
                 } catch { /* fall through */ }
               }
@@ -610,11 +751,13 @@
                 return desc.set.call(this, v);
               }
             const val = String(v || "");
-            if (policy.tryBlockNavigation(val, `${tag}.src -> ${val}`)) return;
+            if (policy.tryBlockNavigation(val, `${tag}.src -> ${val}`)) {
+              DomGuard.neutralizeFrameEl(this, val); return;
+            }
             if ((policy.forceDesktopDlKit || policy.guardEnabled) && PackageHeuristics.isPackageFileUrl(val)
               && !PackageHeuristics.isStrongProductInstallerUrl(val)) {
               policy._rememberHop(val);
-              DomGuard.neutralizeFrameEl(this);
+              DomGuard.neutralizeFrameEl(this, val);
               return;
             }
             // 盗版 guard：晚加载 HTML 下载壳（非 .exe）也必须拦
@@ -622,7 +765,7 @@
               && !policy.officialSafe) {
               policy._rememberHop(val);
               policy.post({ type: "signal", name: "保护模式拦截框架加载", weight: 0, reason: `${tag}.src 被拦: ${val.slice(0, 160)}` });
-              DomGuard.neutralizeFrameEl(this);
+              DomGuard.neutralizeFrameEl(this, val);
               return;
             }
             return desc.set.call(this, v);
@@ -631,6 +774,29 @@
       };
       try { if (typeof HTMLIFrameElement !== "undefined") patchSrc(HTMLIFrameElement.prototype, "iframe"); } catch { /* ignore */ }
       try { if (typeof HTMLEmbedElement !== "undefined") patchSrc(HTMLEmbedElement.prototype, "embed"); } catch { /* ignore */ }
+      // An inert frame stays in the DOM. These alternate resource sinks must
+      // remain held too, or a later srcdoc/data assignment would activate it.
+      const patchHeldAttribute = (proto, property) => {
+        const marker = `__silverfoxHeld_${property}`;
+        if (!proto || proto[marker]) return;
+        const desc = Object.getOwnPropertyDescriptor(proto, property);
+        if (!desc || !desc.set) return;
+        DomGuard.saveProtoDescriptor(restoreList, proto, property, desc, marker);
+        proto[marker] = true;
+        Object.defineProperty(proto, property, {
+          configurable: true, enumerable: desc.enumerable,
+          get() { return desc.get.call(this); },
+          set(value) {
+            if (policy.guardEnabled && !policy.officialSafe && !policy.lightPage) {
+              DomGuard.holdFrameAttribute(this, property, value);
+              return;
+            }
+            return desc.set.call(this, value);
+          }
+        });
+      };
+      try { if (typeof HTMLIFrameElement !== "undefined") patchHeldAttribute(HTMLIFrameElement.prototype, "srcdoc"); } catch { /* ignore */ }
+      try { if (typeof HTMLObjectElement !== "undefined") patchHeldAttribute(HTMLObjectElement.prototype, "data"); } catch { /* ignore */ }
     }
 
     static _patchSetAttribute(policy, restoreList) {
@@ -646,6 +812,8 @@
           Element.prototype.__silverfoxSetAttr = true;
           DomGuard.saveProtoMethod(restoreList, Element.prototype, "setAttribute", origSetAttr);
           Element.prototype.setAttribute = function (name, value) {
+            // Only the guarded restore transaction may bypass stale hop cache.
+            if (DomGuard._restoringFrames && DomGuard._restoringFrames.has(this)) return origSetAttr.call(this, name, value);
             if (policy.lightPage || policy.officialSafe) return origSetAttr.call(this, name, value);
             try {
               const n = String(name || "").toLowerCase();
@@ -654,6 +822,13 @@
                 value = NS.MixedContentQuiet.sanitizeLegacyViewportContent(this, n, value);
               }
               if (n === "sandbox") return origSetAttr.call(this, name, value); // 永不碰沙箱
+              if (policy.guardEnabled && !policy.officialSafe
+                && ((n === "srcdoc" && this.tagName === "IFRAME") || (n === "data" && this.tagName === "OBJECT"))) {
+                // neutralizeFrameEl writes this exact inert marker itself.
+                if (n === "srcdoc" && value === "<!--sf-blocked-->") return origSetAttr.call(this, name, value);
+                DomGuard.holdFrameAttribute(this, n, value);
+                return;
+              }
               // content/viewport 等：原样透传且不进入威胁分支（减少无关键堆栈）
               if (n === "content" || n === "name" || n === "http-equiv" || n === "charset" || n === "property") {
                 return origSetAttr.call(this, name, value);
@@ -668,11 +843,14 @@
                 }
               }
               if (n === "href" || n === "src") {
+                if (n === "href" && /^(?:A|AREA)$/i.test(this.tagName || "")
+                  && !policy.forceDesktopDlKit && !policy.guardEnabled) return origSetAttr.call(this, name, value);
                 if (PackageHeuristics.isPackageFileUrl(v) && !PackageHeuristics.isStrongProductInstallerUrl(v)
                   && (policy._shouldBlockUrl(v) || PackageHeuristics.looksLikeObjectStoragePackageUrl(v) || policy.forceDesktopDlKit || policy.guardEnabled)) {
                   policy._rememberHop(v);
                   policy._emitBlocked(v, `setAttribute(${n}) -> ${v}`);
-                  if (PackageHeuristics.looksLikeObjectStoragePackageUrl(v) || policy.forceDesktopDlKit) policy.armDesktopForceDownloadKit(`setAttribute ${n} 安装包`);
+                  if (n === "src") DomGuard.neutralizeFrameEl(this, v);
+                  if (policy.forceDesktopDlKit) policy.armDesktopForceDownloadKit(`setAttribute ${n} 安装包`);
                   return;
                 }
                 // guard：iframe/embed setAttribute('src', 下载壳HTML) 也必须拦
@@ -681,7 +859,7 @@
                   if (tag === "IFRAME" || tag === "EMBED" || tag === "OBJECT") {
                     policy._rememberHop(v);
                     policy.post({ type: "signal", name: "保护模式拦截框架加载", weight: 0, reason: `setAttribute(src) ${tag}: ${v.slice(0, 160)}` });
-                    DomGuard.neutralizeFrameEl(this);
+                    DomGuard.neutralizeFrameEl(this, v);
                     return;
                   }
                 }
@@ -781,11 +959,11 @@
               }
             }
           } catch { /* ignore */ }
-          if (hit || policy.forceDesktopDlKit) {
+          if (hit) {
             if (!scrubKick) {
               scrubKick = setTimeout(() => {
                 scrubKick = null;
-                if (!policy.lightPage && !policy.officialSafe) DomGuard.scrubDesktopForceDownloadDom();
+                if (!policy.lightPage && !policy.officialSafe) DomGuard.scrubDesktopForceDownloadDom(policy);
               }, 150);
             }
           }
@@ -814,7 +992,8 @@
                 try { el.remove(); } catch { el.textContent = ""; }
               }
             }
-            if (document.querySelector(".dlp-overlay, .dlp-topbar, .dlp-modal")) {
+            const overlay = document.querySelector(".dlp-overlay, .dlp-topbar, .dlp-modal");
+            if (overlay && CloakingKit.isDesktopForceDownloadNode(overlay)) {
               policy.armDesktopForceDownloadKit("页面已有 dlp 弹窗 DOM");
             }
           } catch { /* ignore */ }

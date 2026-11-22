@@ -39,12 +39,59 @@
     try {
       const u = new URL(rawUrl);
       if (u.protocol !== "https:" && u.protocol !== "http:") return false;
-      const host = u.hostname.toLowerCase();
-      if (NS.ICP_FETCH_HOSTS.has(host)) return true;
-      if (/^(localhost|127\.|10\.|192\.168\.|169\.254\.|0\.0\.0\.0)/i.test(host)) return false;
+      if (u.username || u.password) return false;
+      const host = u.hostname.toLowerCase().replace(/\.+$/, "");
+      // URL canonicalizes octal/hex/short IPv4 and IPv4-mapped IPv6 first.
+      // Provider names are not an exemption from the network boundary.
+      if (!host || !host.includes(".") && !host.startsWith("[")) return false;
+      if (/(?:^|\.)(?:localhost|local|internal|lan|home|home\.arpa)$/.test(host)) return false;
+      if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+        const [a, b, c] = host.split(".").map(Number);
+        if (a === 0 || a === 10 || a === 127 || a >= 224
+          || a === 100 && b >= 64 && b <= 127
+          || a === 169 && b === 254 || a === 172 && b >= 16 && b <= 31
+          || a === 192 && (b === 168 || b === 0 && (c === 0 || c === 2))
+          || a === 198 && (b === 18 || b === 19 || b === 51 && c === 100)
+          || a === 203 && b === 0 && c === 113) return false;
+      } else if (host.startsWith("[")) {
+        const words = host.slice(1, -1).split(":");
+        const first = parseInt(words[0] || "0", 16);
+        const second = parseInt(words[1] || "0", 16);
+        // Only native global-unicast IPv6. This also excludes loopback,
+        // link/site local, ULA, multicast and mapped/translated IPv4.
+        if (first < 0x2000 || first > 0x3fff || first === 0x2002
+          || first === 0x2001 && (second < 0x200 || second === 0xdb8)
+          || first === 0x3fff && second < 0x1000) return false;
+      }
       return true;
     } catch { return false; }
   };
+
+  function cancelResponseBody(response) {
+    try { const pending = response?.body?.cancel(); pending?.catch?.(() => {}); } catch { /* ignore */ }
+  }
+
+  async function readCappedPageText(response) {
+    const maxLen = 120000;
+    if (!response.body) return "";
+    if (typeof response.body.getReader !== "function") throw new Error("response-stream-unavailable");
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let text = "", bytes = 0;
+    try {
+      while (text.length < maxLen && bytes < maxLen * 4) {
+        const chunk = await reader.read();
+        if (chunk.done) { text += decoder.decode(); break; }
+        const value = chunk.value.subarray(0, maxLen * 4 - bytes);
+        bytes += value.byteLength;
+        text += decoder.decode(value, { stream: true });
+      }
+      return text.slice(0, maxLen);
+    } finally {
+      try { const pending = reader.cancel(); pending?.catch?.(() => {}); } catch { /* ignore */ }
+      try { reader.releaseLock(); } catch { /* ignore */ }
+    }
+  }
 
   function handleFetchPageText(msg, sendResponse) {
     const url = msg.url;
@@ -61,7 +108,8 @@
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
     const timer = controller ? setTimeout(() => { try { controller.abort(); } catch { /* ignore */ } }, timeoutMs) : null;
     const redirectMode = msg.redirect === "manual" ? "manual" : "follow";
-    const init = { credentials: "omit", redirect: redirectMode, method, cache: "no-store", signal: controller ? controller.signal : undefined, headers: { Accept: "text/html,application/xhtml+xml,application/json,text/plain,*/*;q=0.8" } };
+    // Never let fetch follow a redirect before the next target is checked.
+    const init = { credentials: "omit", redirect: "manual", method, cache: "no-store", signal: controller ? controller.signal : undefined, headers: { Accept: "text/html,application/xhtml+xml,application/json,text/plain,*/*;q=0.8" } };
     if (method === "POST") {
       let body = msg.body;
       if (body != null && typeof body !== "string") { try { body = String(body); } catch { body = ""; } }
@@ -73,29 +121,63 @@
       let responseStatus = 0;
       let responseUrl = url;
       try {
-        const response = await fetch(url, init);
-        responseStatus = Number(response.status) || 0;
-        responseUrl = response.url || url;
-        if (redirectMode === "manual" && response.status >= 300 && response.status < 400) {
-          if (timer) clearTimeout(timer);
-          const loc = response.headers.get("Location") || response.headers.get("location") || "";
-          sendResponse({ success: true, status: response.status, text: "", url: response.url || url, redirectLocation: loc });
+        let current = new URL(url).href;
+        const visited = new Set();
+        for (let hop = 0; hop < 6; hop++) {
+          if (!NS.isAllowedFetchUrl(current)) throw new Error("url-not-allowed");
+          if (visited.has(current)) throw new Error("redirect-loop");
+          visited.add(current);
+          responseUrl = current;
+          if (/\.(zip|exe|apk|dmg|msi|rar|7z|pkg|appx)(?:\?|#|$)/i.test(current)) throw new Error("package-url-blocked");
+          const response = await fetch(current, init);
+          responseStatus = Number(response.status) || 0;
+          responseUrl = response.url || current;
+          if (!NS.isAllowedFetchUrl(responseUrl) || response.redirected) {
+            cancelResponseBody(response);
+            throw new Error("redirect-not-verified");
+          }
+          // Chromium hides cross-origin manual redirects. An opaque response
+          // is inconclusive; never retry it using automatic redirect following.
+          if (response.type === "opaqueredirect" || response.status === 0) {
+            cancelResponseBody(response);
+            throw new Error("redirect-unavailable");
+          }
+          if (response.status >= 300 && response.status < 400) {
+            cancelResponseBody(response);
+            const loc = response.headers.get("Location") || "";
+            if (!loc) throw new Error("redirect-location-missing");
+            const next = new URL(loc, responseUrl).href;
+            if (!NS.isAllowedFetchUrl(next)) throw new Error("url-not-allowed");
+            if (redirectMode === "manual") {
+              sendResponse({ success: true, status: response.status, text: "", url: responseUrl, redirectLocation: next });
+              return;
+            }
+            // Match fetch's POST redirect semantics; never forward POST data
+            // to another origin through a 307/308 response.
+            if (response.status === 303 || (response.status === 301 || response.status === 302) && init.method === "POST") {
+              init.method = "GET";
+              delete init.body;
+              delete init.headers["Content-Type"];
+            } else if (init.method === "POST" && new URL(next).origin !== new URL(current).origin) {
+              throw new Error("cross-origin-post-redirect");
+            }
+            current = next;
+            continue;
+          }
+          if (/\.(zip|exe|apk|dmg|msi|rar|7z|pkg|appx)(?:\?|#|$)/i.test(responseUrl)) {
+            cancelResponseBody(response);
+            throw new Error("package-url-blocked");
+          }
+          const text = await readCappedPageText(response);
+          sendResponse({ success: true, status: response.status, text, url: responseUrl, ok: response.ok });
           return;
         }
-        const finalUrl = response.url || url;
-        if (/\.(zip|exe|apk|dmg|msi|rar|7z|pkg|appx)(?:\?|#|$)/i.test(finalUrl)) {
-          if (timer) clearTimeout(timer);
-          sendResponse({ success: false, error: "package-url-blocked", status: response.status, url: finalUrl }); return;
-        }
-        const text = await response.text();
-        if (timer) clearTimeout(timer);
-        const maxLen = 120000;
-        const capped = text.length > maxLen ? text.slice(0, maxLen) : text;
-        sendResponse({ success: true, status: response.status, text: capped, url: finalUrl, ok: response.ok });
+        throw new Error("redirect-limit");
       } catch (error) {
-        if (timer) clearTimeout(timer);
         const aborted = error && (error.name === "AbortError" || /abort/i.test(error.message || ""));
         sendResponse({ success: false, error: aborted ? "timeout" : (error?.message || "fetch-failed"), status: responseStatus, url: responseUrl });
+      } finally {
+        if (timer) clearTimeout(timer);
       }
     })();
     return true;
@@ -103,7 +185,7 @@
 
   function handleProbeDownloadBehavior(msg, sendResponse) {
     const url = msg.url;
-    if (!url || !NS.isAllowedFetchUrl(url)) { sendResponse({ success: false, isDownload: false, error: "url-not-allowed" }); return true; }
+    if (!url || !NS.isAllowedFetchUrl(url)) { sendResponse({ success: false, isDownload: null, error: "url-not-allowed" }); return true; }
     const PACKAGE_RE = /\.(zip|exe|apk|dmg|msi|rar|7z|pkg|appx)(?:\?|#|$)/i;
     try {
       const u0 = new URL(url);
@@ -126,24 +208,34 @@
     }
     async function abortBody(res) { try { if (res && res.body) { if (typeof res.body.cancel === "function") await res.body.cancel(); else if (typeof res.body.getReader === "function") { const r = res.body.getReader(); await r.cancel(); } } } catch { /* ignore */ } }
     (async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 1500);
       const chain = [];
       let current = url;
       try {
         for (let hop = 0; hop < 5; hop++) {
+          if (controller.signal.aborted) throw new Error("probe-timeout");
+          if (!NS.isAllowedFetchUrl(current)) throw new Error("url-not-allowed");
           if (chain.includes(current)) break;
           chain.push(current);
           try { if (PACKAGE_RE.test(new URL(current).pathname)) { sendResponse({ success: true, isDownload: true, reason: "package-url-no-fetch", finalUrl: current, filename: (current.split("/").pop() || "").split("?")[0], chain }); return; } } catch { /* ignore */ }
           let res = null;
-          try { res = await fetch(current, { method: "HEAD", redirect: "manual", credentials: "omit", cache: "no-store" }); } catch { res = null; }
-          if (!res || res.status === 405 || res.status === 501) { try { res = await fetch(current, { method: "GET", redirect: "manual", credentials: "omit", cache: "no-store", headers: { Range: "bytes=0-0" } }); await abortBody(res); } catch { res = null; } }
-          if (!res) { sendResponse({ success: false, isDownload: false, error: "probe-head-failed", chain }); return; }
+          try { res = await fetch(current, { method: "HEAD", redirect: "manual", credentials: "omit", cache: "no-store", signal: controller.signal }); } catch { res = null; }
+          if (!controller.signal.aborted && (!res || res.status === 405 || res.status === 501)) { try { res = await fetch(current, { method: "GET", redirect: "manual", credentials: "omit", cache: "no-store", signal: controller.signal, headers: { Range: "bytes=0-0" } }); await abortBody(res); } catch { res = null; } }
+          if (!res) { sendResponse({ success: false, isDownload: null, error: "probe-head-failed", chain }); return; }
+          if (res.redirected || res.url && !NS.isAllowedFetchUrl(res.url)) { await abortBody(res); throw new Error("redirect-not-verified"); }
+          if (res.type === "opaqueredirect" || res.status === 0 || res.status >= 400) {
+            await abortBody(res);
+            sendResponse({ success: false, isDownload: null, error: "probe-inconclusive", chain }); return;
+          }
           const verdict = looksDownloadHeaders(res.status, res.headers, current);
           if (verdict) { await abortBody(res); sendResponse({ success: true, chain, ...verdict }); return; }
-          if (res.status >= 300 && res.status < 400) { const loc = res.headers.get("Location") || res.headers.get("location"); if (!loc) break; current = new URL(loc, current).href; if (PACKAGE_RE.test(current)) { sendResponse({ success: true, isDownload: true, reason: "redirect-to-package", finalUrl: current, filename: (current.split("/").pop() || "").split("?")[0], chain: [...chain, current] }); return; } continue; }
+          if (res.status >= 300 && res.status < 400) { const loc = res.headers.get("Location") || res.headers.get("location"); if (!loc) break; current = new URL(loc, current).href; if (!NS.isAllowedFetchUrl(current)) throw new Error("url-not-allowed"); if (PACKAGE_RE.test(current)) { sendResponse({ success: true, isDownload: true, reason: "redirect-to-package", finalUrl: current, filename: (current.split("/").pop() || "").split("?")[0], chain: [...chain, current] }); return; } continue; }
           sendResponse({ success: true, isDownload: false, reason: "not-download", finalUrl: current, contentType: res.headers.get("content-type") || "", chain }); return;
         }
-        sendResponse({ success: true, isDownload: false, reason: "probe-exhausted", finalUrl: current, chain });
-      } catch (e) { sendResponse({ success: false, isDownload: false, error: e?.message || "probe-failed" }); }
+        sendResponse({ success: false, isDownload: null, reason: "probe-exhausted", finalUrl: current, chain });
+      } catch (e) { sendResponse({ success: false, isDownload: null, error: e?.message || "probe-failed" }); }
+      finally { clearTimeout(timer); controller.abort(); }
     })();
     return true;
   }
@@ -222,6 +314,7 @@
     const liveTabUrl = canonicalReportUrl(sender && sender.tab && sender.tab.url);
     NS._activeRiskTxnByTab ??= new Map();
     const active = NS._activeRiskTxnByTab.get(tabId) || null;
+    if (!active && liveTabUrl && !pageUrlMatchesLiveTab(incomingUrl, liveTabUrl)) return false;
     if (active && active.analysisTxn === incomingTxn) {
       // A transaction is page-exact. Reusing a token after a route change is
       // invalid and must not mutate the currently displayed report.
@@ -378,11 +471,6 @@
     return 0;
   }
 
-  function sslInfoHostKey(info) {
-    return String((info && (info.host || info.queriedHost)) || "")
-      .toLowerCase().replace(/\.$/, "").replace(/^www\./, "");
-  }
-
   function isBogusSslOrganization(org) {
     return /internet\s*widgits|some[-\s]?state|default\s+company/i.test(String(org || ""));
   }
@@ -405,51 +493,11 @@
     return rank >= 2 && org && isBogusSslOrganization(org) ? 0 : rank;
   }
 
-  function sslCertificateIdentity(info) {
-    const fingerprint = String((info && (info.fingerprintSha256 || info.fingerprint)) || "")
-      .toLowerCase().replace(/[^a-f0-9]/g, "");
-    if (fingerprint.length >= 32) return `fp:${fingerprint}`;
-    const certId = String((info && (info.certId || info.certificateId)) || "").trim();
-    return certId ? `id:${certId}` : "";
-  }
-
-  /** 同一主机证书只能单调升级；同级保留已验证机构，旧 DV 不得覆盖 OV/EV。 */
+  /** Validation grades belong to a certificate, not permanently to its host. */
   function chooseStrongerSslInfo(previous, incoming) {
-    if (!previous) return incoming || null;
-    if (!incoming) return previous || null;
-    const previousHost = sslInfoHostKey(previous);
-    const incomingHost = sslInfoHostKey(incoming);
-    if (previousHost && incomingHost && previousHost !== incomingHost) return incoming;
-
-    const previousRank = effectiveSslValidationRank(previous);
-    const incomingRank = effectiveSslValidationRank(incoming);
-    if (previousRank !== incomingRank) return incomingRank > previousRank ? incoming : previous;
-
-    const quality = (info) => {
-      let score = 0;
-      if (usableSslOrganization(info)) score += 8;
-      if (info && info.sniChainVerified === true) score += 4;
-      if (info && info.liveTlsLeafVerified === true) score += 4;
-      if (info && info.unexpiredHostVerified === true) score += 2;
-      if (!/^(?:https-reachability|page-https|https-assumed)$/i.test(String((info && info.source) || ""))) score += 1;
-      return score;
-    };
-    const primary = quality(incoming) >= quality(previous) ? incoming : previous;
-    const secondary = primary === incoming ? previous : incoming;
-    const primaryIdentity = sslCertificateIdentity(primary);
-    const secondaryIdentity = sslCertificateIdentity(secondary);
-    // 只有确认为同一张证书时才补字段；不同证书必须整条择优，禁止拼出虚假验证身份。
-    if (primaryIdentity && primaryIdentity === secondaryIdentity) {
-      return {
-        ...secondary,
-        ...primary,
-        organization: usableSslOrganization(primary) || usableSslOrganization(secondary),
-        sniChainVerified: primary.sniChainVerified === true || secondary.sniChainVerified === true,
-        liveTlsLeafVerified: primary.liveTlsLeafVerified === true || secondary.liveTlsLeafVerified === true,
-        unexpiredHostVerified: primary.unexpiredHostVerified === true || secondary.unexpiredHostVerified === true
-      };
-    }
-    return { ...primary };
+    return globalThis.SilverfoxSslEvidence
+      ? globalThis.SilverfoxSslEvidence.choose(previous, incoming)
+      : (incoming || previous || null);
   }
 
   NS.chooseStrongerSslInfo = chooseStrongerSslInfo;
@@ -472,48 +520,7 @@
       || !sameReportPage(previous.url, incoming.url)) {
       return selectWholeRiskTransaction(previous, incoming);
     }
-    const incomingIsHttps = !incoming.url || /^https:/i.test(String(incoming.url));
-    const sslInfo = incomingIsHttps
-      ? chooseStrongerSslInfo(previous.sslInfo, incoming.sslInfo)
-      : (incoming.sslInfo || null);
-
-    // A provider/watchdog failure is a real third state, not a transient
-    // repaint of a previously completed clean report.  Keeping the old
-    // `analysisComplete:true` snapshot here would make a background tab look
-    // safely verified even though the current transaction explicitly says its
-    // identity sources are unavailable.
-    if (incoming.identityVerificationUnavailable === true) return { ...incoming, sslInfo };
-
-    // 已完成报告也可能乱序到达；较旧报告只允许补强 SSL，不回滚其它结论。
-    const previousAt = Number(previous.timestamp) || 0;
-    const incomingAt = Number(incoming.timestamp) || 0;
-    if (previous.analysisComplete === true && incoming.analysisComplete !== false
-      && previousAt && incomingAt && incomingAt < previousAt) {
-      return { ...previous, sslInfo };
-    }
-    if (incoming.analysisComplete !== false || previous.analysisComplete !== true) {
-      const merged = { ...incoming, sslInfo };
-      const incomingHasBrandRisk = !!(merged.brandSpoofPortal
-        || (Array.isArray(merged.details) && merged.details.some((d) => /仿冒品牌官网|主动探测仿冒/i.test(d && d.name || ""))));
-      if (incomingHasBrandRisk && !merged.spoofBrand && previous.spoofBrand) {
-        merged.spoofBrand = previous.spoofBrand;
-      }
-      return merged;
-    }
-    return {
-      ...incoming,
-      ...previous,
-      url: incoming.url || previous.url,
-      tabId: incoming.tabId ?? previous.tabId ?? null,
-      timestamp: incoming.timestamp || previous.timestamp || Date.now(),
-      analysisComplete: true,
-      icpInfo: incoming.icpInfo || previous.icpInfo || "",
-      icpForcedMissing: Object.prototype.hasOwnProperty.call(incoming, "icpForcedMissing")
-        ? incoming.icpForcedMissing === true
-        : previous.icpForcedMissing === true,
-      whoisInfo: incoming.whoisInfo || previous.whoisInfo || "",
-      sslInfo
-    };
+    return globalThis.SilverfoxRiskReport.merge(previous, incoming, chooseStrongerSslInfo);
   };
 
   /** 同一 host 共享一条补查链，避免多个 content 请求叠加 SSL Labs 轮询。 */
@@ -525,12 +532,13 @@
 
     NS._sslUpgradeJobsByHost ??= new Map();
     let job = NS._sslUpgradeJobsByHost.get(upgradeHost);
-    const initialHasOrg = initialRank >= 2 && hasBoundSslOrganization(initialInfo);
     const addTarget = (targetJob) => {
       const previous = targetJob.targets.get(tabId);
+      const selected = chooseStrongerSslInfo(previous?.info, initialInfo);
       targetJob.targets.set(tabId, {
-        rank: Math.max(initialRank, Number(previous && previous.rank) || 0),
-        hasOrg: !!((previous && previous.hasOrg) || initialHasOrg)
+        info: selected,
+        rank: effectiveSslValidationRank(selected),
+        hasOrg: effectiveSslValidationRank(selected) >= 2 && hasBoundSslOrganization(selected)
       });
     };
     if (job && !job.closed) {
@@ -583,21 +591,25 @@
 
       job.inFlight = (async () => {
         try {
-          const up = await NS.probeSslCertForHost(upgradeHost);
+          const probed = await NS.probeSslCertForHost(upgradeHost);
+          // A fast CT response may finish the probe before the live TLS source.
+          // Read the cache too: late verified leaves are recorded there.
+          const cached = typeof NS.getSslCertInfoForHost === "function"
+            ? NS.getSslCertInfoForHost(upgradeHost) : null;
+          const up = chooseStrongerSslInfo(probed, cached);
           if (job.closed || !up || !up.validation) return false;
           const upRank = effectiveSslValidationRank(up);
           if (upRank < 1) return false;
-          const upHasOrg = upRank >= 2 && hasBoundSslOrganization(up);
           let improved = false;
           for (const [targetTabId, target] of job.targets.entries()) {
-            const rankImproved = upRank > target.rank;
-            const orgImproved = upRank >= target.rank && upHasOrg && !target.hasOrg;
-            if (!rankImproved && !orgImproved) continue;
+            const selected = chooseStrongerSslInfo(target.info, up);
+            if (JSON.stringify(selected) === JSON.stringify(target.info)) continue;
             improved = true;
-            target.rank = Math.max(target.rank, upRank);
-            if (upHasOrg && upRank >= target.rank) target.hasOrg = true;
+            target.info = selected;
+            target.rank = effectiveSslValidationRank(selected);
+            target.hasOrg = target.rank >= 2 && hasBoundSslOrganization(selected);
             try {
-              chrome.tabs.sendMessage(targetTabId, { type: "ssl-cert-info", sslInfo: up }, () => {
+              chrome.tabs.sendMessage(targetTabId, { type: "ssl-cert-info", sslInfo: selected }, () => {
                 void chrome.runtime.lastError;
               });
             } catch { /* ignore */ }
@@ -605,7 +617,8 @@
           if (improved && typeof NS.storeSslCertInfo === "function") {
             NS.storeSslCertInfo(upgradeHost, up);
           }
-          if (job.targets.size > 0 && [...job.targets.values()].every((target) => target.hasOrg)) {
+          if (job.targets.size > 0 && [...job.targets.values()].every((target) => target.hasOrg
+            && globalThis.SilverfoxSslEvidence?.isLive(target.info))) {
             finish();
           }
           return improved;
@@ -658,8 +671,17 @@
             details: [],
             timestamp: Date.now()
           };
-          if (resetSnapshot.analysisTxn
-            && acceptActiveRiskTransaction(tabId, resetSnapshot, sender)) {
+          const active = NS._activeRiskTxnByTab?.get(tabId);
+          const staleLegacyReset = !resetSnapshot.analysisTxn && (active
+            || sender.tab?.url && !pageUrlMatchesLiveTab(pageUrl, sender.tab.url));
+          const wrongDocument = active && active.analysisTxn === resetSnapshot.analysisTxn
+            && active.documentId && sender.documentId && active.documentId !== sender.documentId;
+          if (staleLegacyReset || wrongDocument || resetSnapshot.analysisTxn
+            && !acceptActiveRiskTransaction(tabId, resetSnapshot, sender)) {
+            try { sendResponse({ success: true, ignored: "stale-analysis-transaction" }); } catch { /* ignore */ }
+            return;
+          }
+          if (resetSnapshot.analysisTxn) {
             // Persist an explicit new-transaction placeholder. On same-URL
             // reloads this prevents the previous completed report from being
             // rendered during the gap before the first detector snapshot.
@@ -676,7 +698,10 @@
             // script; new content always takes the isolated path above.
             NS.clearTabRiskStorage(tabId, pageUrl);
           }
-          if (pageUrl && NS.isTabProtected(tabId) && !NS.isOnProtectedOrigin(tabId, pageUrl)) { NS.pauseNavBlocking(tabId, "content-url-reset"); NS.clearTabAnalysisState(tabId); }
+          if (pageUrl && NS.isTabProtected(tabId) && !NS.isOnProtectedOrigin(tabId, pageUrl)) {
+            NS.pauseNavBlocking(tabId, "content-url-reset");
+            NS.clearTabAnalysisState(tabId, { preserveReport: !!resetSnapshot.analysisTxn });
+          }
         }
         try { sendResponse({ success: true }); } catch { /* ignore */ }
         return;
@@ -704,16 +729,9 @@
           });
         }
         try {
-          if (typeof NS.clearAllSilverfoxNotifications === "function") NS.clearAllSilverfoxNotifications();
-          else {
-            chrome.notifications.getAll((all) => {
-              void chrome.runtime.lastError;
-              const ids = Object.keys(all || {});
-              for (const id of ids) {
-                try { chrome.notifications.clear(id, () => { void chrome.runtime.lastError; }); } catch { /* ignore */ }
-              }
-            });
-          }
+          // File notifications and other tabs are not owned by this page.
+          NS.clearNotificationChannel?.(`brand-spoof:${tabId}`);
+          NS.clearNotificationChannel?.(`page-threat:${tabId}`);
         } catch { /* ignore */ }
         try { sendResponse({ success: true }); } catch { /* ignore */ }
         return;
@@ -893,24 +911,26 @@
             try { sendResponse({ success: true, ignored: "stale-analysis-transaction" }); } catch { /* ignore */ }
             return;
           }
-          const cleanReport = stamped.analysisComplete !== false
-            && stamped.identityVerificationUnavailable !== true
-            && !stamped.downloadGuardInstalled && !stamped.packageBlocked
-            && !(Array.isArray(stamped.protectedTargets) && stamped.protectedTargets.length > 0)
-            && (riskLevel === "low") && (Number(stamped.score) || 0) < 12;
-          if (tabId != null && cleanReport) {
-            const reportAt = Date.now();
-            chrome.storage.local.get(["latestNotice"], (r) => {
-              if (r.latestNotice
-                && (r.latestNotice.tabId == null || r.latestNotice.tabId === tabId)
-                && riskTransactionOf(r.latestNotice) === stamped.analysisTxn
-                && sameReportPage(r.latestNotice.url, stamped.url)
-                && (Number(r.latestNotice.timestamp) || 0) <= reportAt) {
-                chrome.storage.local.remove(["latestNotice"], () => { void chrome.runtime.lastError; });
-              }
-            });
-          }
           const storeRisk = (stamped) => {
+            const cleanReport = stamped.analysisComplete === true
+              && stamped.identityVerificationUnavailable !== true
+              && !stamped.downloadGuardInstalled && !stamped.packageBlocked
+              && !(Array.isArray(stamped.protectedTargets) && stamped.protectedTargets.length > 0)
+              && (stamped.riskLevel === "low") && (Number(stamped.score) || 0) < 12;
+            if (tabId != null && cleanReport) {
+              const reportAt = stamped.timestamp;
+              const seqAtStore = NS._riskReportSeqByTab.get(tabId);
+              chrome.storage.local.get(["latestNotice"], (r) => {
+                if (NS._riskReportSeqByTab.get(tabId) !== seqAtStore) return;
+                if (r.latestNotice
+                  && (r.latestNotice.tabId == null || r.latestNotice.tabId === tabId)
+                  && riskTransactionOf(r.latestNotice) === stamped.analysisTxn
+                  && sameReportPage(r.latestNotice.url, stamped.url)
+                  && (Number(r.latestNotice.timestamp) || 0) <= reportAt) {
+                  chrome.storage.local.remove(["latestNotice"], () => { void chrome.runtime.lastError; });
+                }
+              });
+            }
             const storedLevel = stamped.riskLevel || "low";
             let badgeText = ""; let badgeColor = "#2e7d32";
             if (storedLevel === "high") { badgeText = "!"; badgeColor = "#d93025"; }
@@ -949,7 +969,7 @@
         return;
       }
       if (msg.type === "get-ssl-cert") {
-        // 保留 www（www.gov.cn / www.12306.cn）；缓存键在 ssl-cert-bg 内再去 www
+        // Query and cache the exact host; www and apex can serve different certificates.
         let host = String(msg.host || "").toLowerCase().replace(/\.$/, "");
         if (!host && sender.tab && sender.tab.url) {
           try { host = new URL(sender.tab.url).hostname.toLowerCase(); } catch { /* ignore */ }
@@ -985,10 +1005,12 @@
             }
             try { sendResponse({ success: true, sslInfo: info || null, host }); } catch { /* ignore */ }
 
-            // 首次 DV / 无已验证 org 的 OV/EV：后台再探（Labs 常稍后 READY 才有 certs PEM）
+            // CT-only OV/EV must also wait for a live leaf; a historical grade
+            // cannot end the update chain before current TLS evidence arrives.
             const v0 = String((info && info.validation) || "").toUpperCase();
             const hasBoundOrg0 = /^(?:OV|EV)$/.test(v0) && hasBoundSslOrganization(info);
-            if (info && (v0 === "DV" || (/^(?:OV|EV)$/.test(v0) && !hasBoundOrg0))
+            if (info && (v0 === "DV" || (/^(?:OV|EV)$/.test(v0) && (!hasBoundOrg0
+              || !globalThis.SilverfoxSslEvidence?.isLive(info))))
               && typeof NS.probeSslCertForHost === "function" && tabId != null) {
               scheduleSslCertUpgrade(host, tabId, info);
             }
@@ -1071,7 +1093,7 @@
       if (msg.type === "set-tab-protect") {
         const tabId = sender.tab?.id ?? msg.tabId ?? null;
         if (tabId != null) {
-          const pageUrl = sender.tab?.url || msg.url || "";
+          const pageUrl = msg.url || sender.tab?.url || "";
           const protectSnapshot = {
             url: pageUrl,
             analysisTxn: String(msg.analysisTxn || ""),
@@ -1099,7 +1121,7 @@
               NS.clearTabProtectionState(tabId);
             } else if (msg.force || !pageUrl || !NS.isOnProtectedOrigin(tabId, pageUrl)) {
               NS.pauseNavBlocking(tabId, "set-protect-off");
-              NS.clearTabAnalysisState(tabId);
+              NS.clearTabAnalysisState(tabId, { preserveReport: true });
             } else {
               NS.pauseNavBlocking(tabId, "same-origin-boot");
             }
@@ -1211,7 +1233,11 @@
         NS.showBlockedNotification(title, message, tabId, forceNotice, brandSnapshot ? {
           channelKey: `brand-spoof:${tabId}`,
           versionToken: brandNoticeVersionToken(brandSnapshot)
-        } : null).then((ok) => { try { sendResponse({ success: !!ok }); } catch { /* ignore */ } }).catch(() => { try { sendResponse({ success: false }); } catch { /* ignore */ } });
+        } : {
+          channelKey: `page-threat:${tabId}`,
+          versionToken: JSON.stringify([noticeSnapshot.analysisTxn, title, message]),
+          cooldownKey: NS.contentNoticeKey(title, message)
+        }).then((ok) => { try { sendResponse({ success: !!ok }); } catch { /* ignore */ } }).catch(() => { try { sendResponse({ success: false }); } catch { /* ignore */ } });
         return true;
       }
       // 已废弃：禁止向网页 inject pinyin-pro（全站卡死根因）。兼容旧消息直接成功。

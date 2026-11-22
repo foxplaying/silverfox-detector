@@ -532,19 +532,45 @@
       if (state._desktopForceDlKit) return true;
       if (NS.pageLooksLikeSearchEngineResultsPage()) return false;
       if ((NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal()) && !state._desktopForceDlKit) return false;
-      const html = NS.getHtmlSlice(100000);
-      const hasDlp = /\.dlp-overlay|\.dlp-modal|\.dlp-topbar|\bdlp-overlay\b|\bdlp-topbar\b/i.test(html);
-      const hasPitch = /电脑版推荐|正在为您下载[\s\S]{0,60}电脑版|大屏浏览|功能更完整/i.test(html);
-      const hasAuto = /triggerDownload|hasTriggered|createElement\s*\(\s*['"]iframe['"]\s*\)/i.test(html) && NS.PACKAGE_EXT.test(html);
-      let domHit = false;
-      try { domHit = !!document.querySelector(".dlp-overlay, .dlp-topbar, .dlp-modal, .dlp-btn"); } catch { /* ignore */ }
-      if (!(hasDlp && (hasPitch || hasAuto)) && !(domHit && hasPitch) && !(hasPitch && hasAuto)) return false;
+      // 仓库/文档可展示完整套件源码，整页 HTML 命中不代表代码正在执行。
+      // 仅用可执行内联脚本和真实弹窗建立证据，JSON hydration 数据不是脚本。
+      const inert = (el) => !!(el.closest && el.closest("pre, code, textarea, template, [inert]"));
+      const executable = (el) => {
+        const type = String(el.getAttribute("type") || "").trim().toLowerCase().split(";")[0].trim();
+        // pre/code 不会阻止真正的 script 执行，不能把可执行节点当作源码文本放行。
+        return !el.getAttribute("src") && !(el.closest && el.closest("template"))
+          && (!type || type === "module" || /^(?:text|application)\/(?:javascript|ecmascript|x-javascript)$/.test(type));
+      };
+      const pitchRe = /电脑版推荐|正在为您下载[\s\S]{0,60}电脑版|大屏浏览|功能更完整/i;
+      const autoRe = /triggerDownload|hasTriggered|createElement\s*\(\s*['"]iframe['"]\s*\)/i;
+      const dlpRe = /\bdlp-(?:overlay|modal|topbar)\b/i;
+      const pkgRe = /\.(?:zip|exe|msi|dmg|apk|rar|7z)(?=[?\s"'`<>\\]|$)/i;
+      let scriptBudget = 100000;
+      const scripts = Array.from(document.querySelectorAll("script:not([src])")).slice(0, 80)
+        .filter(executable).map((el) => {
+          if (scriptBudget <= 0) return "";
+          const code = String(el.textContent || "").slice(0, scriptBudget);
+          scriptBudget -= code.length;
+          return code;
+        });
+      // 同一脚本内的证据组合，不能把互不相关的页面文本、样式和链接拼成套件。
+      const scriptHits = scripts.filter((code) => (dlpRe.test(code) && (pitchRe.test(code) || (autoRe.test(code) && pkgRe.test(code))))
+        || (pitchRe.test(code) && autoRe.test(code) && pkgRe.test(code)));
+      const overlays = Array.from(document.querySelectorAll(".dlp-overlay, .dlp-topbar, .dlp-modal"))
+        .slice(0, 40).filter((el) => !inert(el));
+      const domHits = overlays.filter((el) => pitchRe.test(String(el.textContent || "").slice(0, 4000)));
+      if (!scriptHits.length && !domHits.length) return false;
       state._desktopForceDlKit = true;
       let pkg = "";
       try {
-        const m = html.match(/https?:\/\/[^\s"'<>\\]+?\.(?:zip|exe|msi|dmg|apk)(?:\?[^\s"'<>\\]*)?/i);
+        const m = scriptHits.join("\n").match(/https?:\/\/[^\s"'<>\\]+?\.(?:zip|exe|msi|dmg|apk)(?:\?[^\s"'<>\\]*)?/i);
         if (m) pkg = m[0];
-        if (!pkg) { document.querySelectorAll("a.dlp-btn, a[href*='.zip'], a[href*='.exe']").forEach((a) => { const h = a.getAttribute("href") || ""; if (NS.isPackageFileUrl(h) && !pkg) pkg = h; }); }
+        if (!pkg) {
+          domHits.forEach((el) => el.querySelectorAll("a[href], iframe[src]").forEach((a) => {
+            const h = a.getAttribute("href") || a.getAttribute("src") || "";
+            if (!inert(a) && NS.isPackageFileUrl(h) && !pkg) pkg = h;
+          }));
+        }
       } catch { /* ignore */ }
       if (pkg && !state.protectedTargets.includes(pkg)) state.protectedTargets.push(pkg);
       NS.addSignal("桌面端强制弹窗下载", 24, pkg ? `检测到桌面端强制弹窗+自动下载套件，目标: ${NS.formatPackageLabel(pkg)}` : "检测到桌面端强制弹窗+自动下载套件 (dlp-overlay / 电脑版推荐)");

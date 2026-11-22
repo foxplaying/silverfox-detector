@@ -6,9 +6,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const taskId = String(message.taskId || "");
   const worker = new Worker(chrome.runtime.getURL("offscreen/archive-worker.js"));
   let answered = false;
+  let deadline = null;
   const finish = (response) => {
     if (answered) return;
     answered = true;
+    if (deadline) clearTimeout(deadline);
     try { worker.terminate(); } catch { /* already stopped */ }
     sendResponse(response);
   };
@@ -24,6 +26,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       error: String(event && event.message || "archive-worker-failed")
     });
   }, { once: true });
+  // Stop CPU/WASM work before the background's 60-second wait expires.
+  deadline = setTimeout(() => finish({ ok: false, error: "archive-worker-timeout" }), 55000);
   worker.postMessage({ taskId });
   return true;
 });
