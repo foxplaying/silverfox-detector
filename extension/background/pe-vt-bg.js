@@ -29,8 +29,8 @@
   const VT_DURABLE_KEY_PREFIX = "vtOk_";
   /** v4：独立厂商加权票（Kaspersky=3…）；Avast/AVG 同组；拦截看加权分而非纯家数 */
   const VT_TRUST_POLICY_VERSION = 4;
-  /** v3：文件报告必须与目标完整 SHA-256 绑定；废弃可能串样本的旧统计缓存。 */
-  const VT_STATS_POLICY_VERSION = 3;
+  /** v4：只接受目标文件的结构化根报告；废弃曾混用 DOM 统计的缓存。 */
+  const VT_STATS_POLICY_VERSION = 4;
   const FETCH_TIMEOUT_MS = 120000;
   /** 与网页 https://www.virustotal.com/gui/home/upload 一致：最大 650MB */
   const VT_UPLOAD_MAX = 650 * 1024 * 1024;
@@ -1481,7 +1481,7 @@
       } else if (/timeout/i.test(message)) {
         result.note = `${format.toUpperCase()} 解码超时，已终止本地拆包`;
       } else {
-        result.note = `${format.toUpperCase()} 本地解码失败（压缩包可能损坏或缺少分卷）`;
+        result.note = `${format.toUpperCase()} 本地解码未完成，原因尚未确认（可能需要密码、格式不受支持、文件损坏或缺少分卷）`;
       }
       try { console.warn("[silverfox] archive-wasm task", format, error); } catch { /* ignore */ }
       return result;
@@ -2759,7 +2759,6 @@
         signal: controller ? controller.signal : undefined,
         headers
       });
-      if (timer) clearTimeout(timer);
       const text = await res.text();
       let data = null;
       try { data = JSON.parse(text); } catch {
@@ -2771,7 +2770,6 @@
       }
       return { status: res.status, ok: res.ok, data, text };
     } catch (e) {
-      if (timer) clearTimeout(timer);
       return {
         status: 0,
         ok: false,
@@ -2779,7 +2777,7 @@
         text: "",
         error: e && e.message ? e.message : "fetch-fail"
       };
-    }
+    } finally { if (timer) clearTimeout(timer); }
   }
 
   function isDurableVtResult(result) {
@@ -2940,6 +2938,7 @@
   /** 清除 VT 查询缓存（配置 API Key 后立刻生效） */
   NS.clearVtLookupCache = function () {
     try { NS._vtByHash.clear(); } catch { /* ignore */ }
+    try { vtLookupCooldown.clear(); } catch { /* ignore */ }
   };
 
   // 启动时清掉错误缓存：假无 / 无 Key 占位 / 把失败写成 captcha 的 unknown
@@ -3115,898 +3114,116 @@
   /**
    * 扩展在浏览器内打开 VT 文件页：
    *  content/vt-hook-main.js（document_start MAIN）拦截 SPA 的 /ui/files 响应
-   *  后台轮询 window.__sfVtCaptures[hash] + DOM 兜底
+   *  只读目标根报告；禁止通过 DOM/关联文件补齐统计与签名
    */
   async function fetchVtUiFromPageContext(hash, budgetMs, lookupOptions) {
-    if (!chrome.tabs || !chrome.scripting || !chrome.scripting.executeScript) {
-      return null;
-    }
-    const fileHash = String(hash || "").toLowerCase();
-    if (fileHash.length !== 64) return null;
-    const requireSignature = !!(lookupOptions && lookupOptions.requireSignature);
-    // 页内路径：预算放宽；超时也返回已刮到的 lastPayload，禁止 race 成 null
-    const budget = Math.min(Math.max(12000, budgetMs || 24000), 40000);
-    const targetUrl = "https://www.virustotal.com/gui/file/" + fileHash;
-    const payloadHasTerminalSignature = (payload) => {
-      if (!requireSignature) return true;
-      try {
-        const data = JSON.parse(String((payload && payload.text) || ""));
-        const hit = findTargetVtFileHitInJson(
-          data,
-          fileHash,
-          targetUrl,
-          "vt-page-signature-probe"
-        );
-        return hasTerminalVtSignature(hit);
-      } catch {
-        return false;
-      }
+    const targetHash = normalizeVtFileHash(hash);
+    if (!targetHash || !chrome.scripting || !chrome.tabs) return null;
+    const targetUrl = VT_GUI_BASE + targetHash;
+    const deadline = Date.now() + Math.min(30000, Math.max(1000, Number(budgetMs) || 15000));
+    const remaining = () => Math.max(0, deadline - Date.now());
+    let tabId = null;
+    let created = false;
+    let closed = false;
+    const closeTab = (id) => {
+      if (id == null) return;
+      try { chrome.tabs.remove(id, () => { void chrome.runtime.lastError; }); } catch { /* ignore */ }
     };
-
-    const readCaptureFn = (h) => {
+    const onTarget = (url) => {
       try {
-        const key = String(h || "").toLowerCase();
-        let text = "";
-        let status = 0;
-        try {
-          const bag = window.__sfVtCaptures && window.__sfVtCaptures[key];
-          if (bag && bag.text) {
-            text = String(bag.text);
-            status = bag.status || 0;
-          } else if (window.__sfVtCapture
-            && String(window.__sfVtCaptureUrl || "").toLowerCase().includes(key)) {
-            text = String(window.__sfVtCapture);
-            status = window.__sfVtCaptureStatus || 0;
-          }
-        } catch { /* ignore */ }
-        let pageHint = "";
-        const domRatios = [];
-        const pageEngineResults = [];
-        const engineResultKeys = new Set();
-        const scannedValues = new WeakSet();
-        let pageSignatureInfo = null;
-        const trustedRowCandidates = new Map();
-        const trustedDomRules = [
-          ["BitDefender", /\bBitDefender(?:Falx)?\b/i], ["ESET", /\bESET(?:-NOD32)?\b/i],
-          ["Avast", /\bAvast(?:-Mobile)?\b/i], ["Kaspersky", /\bKaspersky\b/i],
-          ["Huorong", /\bHuorong\b|火绒/i]
-        ];
-        const considerTrustedRow = (rawText) => {
-          const rowText = String(rawText || "").replace(/\s+/g, " ").trim();
-          if (rowText.length < 4 || rowText.length > 360
-            || /Security vendors?' analysis|May differ from commercial/i.test(rowText)) return;
-          for (const [canonical, rule] of trustedDomRules) {
-            const match = rowText.match(rule);
-            if (!match || rowText.length <= match[0].length + 1) continue;
-            const previous = trustedRowCandidates.get(canonical);
-            if (!previous || rowText.length < previous.text.length) {
-              trustedRowCandidates.set(canonical, { text: rowText, label: match[0], index: match.index || 0 });
-            }
-          }
-        };
-        const addEngineResult = (value) => {
-          if (!value || typeof value !== "object") return;
-          const engine = String(value.engine_name || value.engineName || value.engine || "").trim();
-          const category = String(value.category || "").toLowerCase();
-          const result = String(value.result || value.detStr || "").trim();
-          if (!engine || !/^(?:malicious|suspicious|harmless|undetected|timeout|confirmed-timeout|type-unsupported|failure)$/i.test(category)) return;
-          const recordKey = `${engine.toLowerCase()}|${category}|${result}`;
-          if (engineResultKeys.has(recordKey)) return;
-          engineResultKeys.add(recordKey);
-          pageEngineResults.push({ engine_name: engine, category, result: result.slice(0, 160) });
-        };
-        const captureSignatureInfo = (value) => {
-          if (pageSignatureInfo || !value || typeof value !== "object") return;
-          const sig = value.signature_info || value.signatureInfo;
-          if (!sig || typeof sig !== "object") return;
-          try {
-            const json = JSON.stringify(sig);
-            if (json && json.length <= 50000) pageSignatureInfo = JSON.parse(json);
-          } catch { /* ignore non-serializable component state */ }
-        };
-        const scanEngineValue = (value, depth) => {
-          if (!value || depth > 3 || (typeof value !== "object" && !Array.isArray(value))) return;
-          if (typeof value === "object") {
-            if (scannedValues.has(value)) return;
-            scannedValues.add(value);
-          }
-          captureSignatureInfo(value);
-          if (Array.isArray(value)) {
-            for (const item of value.slice(0, 160)) scanEngineValue(item, depth + 1);
-            return;
-          }
-          addEngineResult(value);
-          for (const prop of ["analyses", "analysis", "detections", "results", "items", "rows", "data",
-            "attributes", "last_analysis_results", "lastAnalysisResults", "value", "object"]) {
-            try {
-              if (value[prop] && value[prop] !== value) scanEngineValue(value[prop], depth + 1);
-            } catch { /* ignore getter */ }
-          }
-        };
-        try {
-          const chunks = [];
-          const roots = [document];
-          let rootIndex = 0;
-          let shadowCount = 0;
-          let textChars = 0;
-          while (rootIndex < roots.length && shadowCount < 180) {
-            const root = roots[rootIndex++];
-            if (root === document && document.body) {
-              const bodyText = String(document.body.innerText || "");
-              chunks.push(bodyText);
-              textChars += bodyText.length;
-            } else if (textChars < 180000 && document.createTreeWalker) {
-              // ShadowRoot 没有 innerText；逐个取文本节点并跳过 style/script，避免 CSS
-              // 把真正的主报告文案挤出截断范围。
-              const walker = document.createTreeWalker(root, (window.NodeFilter && NodeFilter.SHOW_TEXT) || 4);
-              const local = [];
-              let node = null;
-              while ((node = walker.nextNode()) && textChars < 180000) {
-                const parentTag = String(node.parentElement && node.parentElement.tagName || "").toUpperCase();
-                if (/^(?:STYLE|SCRIPT|NOSCRIPT|TEMPLATE)$/.test(parentTag)) continue;
-                const value = String(node.nodeValue || "").replace(/\s+/g, " ").trim();
-                if (!value) continue;
-                local.push(value);
-                textChars += value.length + 1;
-              }
-              if (local.length) chunks.push(local.join(" "));
-            }
-            // 比例组件可能位于很深的位置；单独查询，避免被通用 3000 节点上限截掉。
-            for (const el of Array.from(root.querySelectorAll
-              ? root.querySelectorAll("vt-ui-detections-ratio") : [])) {
-              let renderedText = "";
-              try {
-                renderedText = [el.innerText, el.textContent, el.shadowRoot && el.shadowRoot.textContent]
-                  .filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 240);
-              } catch { renderedText = ""; }
-              const renderedMatch = renderedText.match(/(?:^|\D)(\d{1,3})\s*\/\s*(\d{2,3})(?:\D|$)/);
-              const propDetections = Number(el.detections ?? el.getAttribute("detections"));
-              const propTotal = Number(el.total ?? el.getAttribute("total"));
-              const renderedDetections = renderedMatch ? Number(renderedMatch[1]) : NaN;
-              const renderedTotal = renderedMatch ? Number(renderedMatch[2]) : NaN;
-              const renderedValid = Number.isFinite(renderedDetections) && Number.isFinite(renderedTotal)
-                && renderedTotal >= 20 && renderedTotal <= 200
-                && renderedDetections >= 0 && renderedDetections <= renderedTotal;
-              const detections = renderedValid ? renderedDetections : propDetections;
-              const total = renderedValid ? renderedTotal : propTotal;
-              if (Number.isFinite(detections) && Number.isFinite(total) && total >= 20 && total <= 200
-                && detections >= 0 && detections <= total) {
-                const large = !!(el.classList && el.classList.contains("large"))
-                  || !!(el.hasAttribute && el.hasAttribute("large")) || el.large === true;
-                const visible = typeof el.getClientRects === "function" ? el.getClientRects().length > 0 : true;
-                domRatios.push({
-                  detections,
-                  total,
-                  large,
-                  visible,
-                  main: large && visible,
-                  rendered: renderedValid,
-                  renderedText
-                });
-              }
-            }
-            const elements = Array.from(root.querySelectorAll ? root.querySelectorAll("*") : []).slice(0, 3000);
-            for (const el of elements) {
-              const elementTag = String(el && el.tagName || "").toUpperCase();
-              if (!/^(?:STYLE|SCRIPT|NOSCRIPT|TEMPLATE)$/.test(elementTag)) {
-                try { considerTrustedRow(el.innerText || el.textContent || ""); } catch { /* ignore */ }
-              }
-              if (String(el.localName || "").includes("-")) {
-                for (const prop of ["analyses", "analysis", "detections", "results", "items", "rows", "data",
-                  "attributes", "last_analysis_results", "lastAnalysisResults", "value", "object"]) {
-                  try { scanEngineValue(el[prop], 0); } catch { /* ignore getter */ }
-                }
-              }
-              if (!el || !el.shadowRoot || shadowCount++ >= 180) continue;
-              roots.push(el.shadowRoot);
-            }
-          }
-          pageHint = chunks.join("\n").slice(0, 180000);
-          for (const [canonical, candidate] of trustedRowCandidates) {
-            let resultText = candidate.text.slice(candidate.index + candidate.label.length).trim();
-            let nextEngineAt = resultText.length;
-            for (const [, rule] of trustedDomRules) {
-              const next = resultText.match(rule);
-              if (next && next.index != null && next.index > 0) nextEngineAt = Math.min(nextEngineAt, next.index);
-            }
-            resultText = resultText.slice(0, nextEngineAt).trim();
-            if (!resultText || /Security vendors|analysis$/i.test(resultText)) continue;
-            let category = /\bSuspicious\b|可疑/i.test(resultText) ? "suspicious" : "malicious";
-            if (/\bUndetected\b|\bHarmless\b|\bTimeout\b|Confirmed timeout|Unable to process|type unsupported|未检出|无害|超时/i.test(resultText)) {
-              category = /\bHarmless\b|无害/i.test(resultText) ? "harmless"
-                : (/Timeout|超时/i.test(resultText) ? "timeout" : "undetected");
-            }
-            addEngineResult({ engine_name: canonical, category, result: resultText });
-          }
-          domRatios.sort((a, b) => Number(b.main) - Number(a.main)
-            || Number(b.rendered) - Number(a.rendered)
-            || Number(b.visible) - Number(a.visible)
-            || Number(b.large) - Number(a.large));
-        } catch { /* ignore */ }
-        return {
-          status,
-          text: text.slice(0, 800000),
-          pageHint,
-          pageUrl: String(location.href || "").slice(0, 500),
-          captureUrl: String(window.__sfVtCaptureUrl || "").slice(0, 500),
-          domRatios: domRatios.slice(0, 20),
-          pageEngineResults: pageEngineResults.slice(0, 120),
-          pageSignatureInfo,
-          hooked: !!window.__sfVtHookBoot,
-          ok: text.length > 20
-        };
-      } catch (e) {
-        return {
-          status: 0,
-          text: "",
-          pageHint: "",
-          error: e && e.message ? String(e.message) : "read-fail"
-        };
-      }
+        const u = new URL(url);
+        return u.protocol === "https:" && u.hostname === "www.virustotal.com"
+          && new RegExp("^/gui/file/" + targetHash + "(?:/|$)", "i").test(u.pathname);
+      } catch { return false; }
     };
-
-    const activeFetchFn = async (h) => {
-      try {
-        const rand = String(Math.floor(1e10 + Math.random() * 9e10));
-        const ts = (Date.now() / 1000).toFixed(3);
-        const anti = btoa(`${rand}-ZG9udCBiZSBldmls-${ts}`);
-        const res = await fetch("https://www.virustotal.com/ui/files/" + h, {
-          method: "GET",
-          credentials: "include",
-          cache: "no-store",
-          headers: {
-            Accept: "application/json",
-            "Content-Type": "application/json",
-            "Accept-Language": "en,en-GB;q=0.9,en-US;q=0.8",
-            "Accept-ILanguage": "en-US,en;q=0.9,es;q=0.8",
-            "X-Tool": "vt-ui-main",
-            "X-App-Version": "v1x622x0",
-            "X-VT-Anti-Abuse-Header": anti
-          }
-        });
-        const text = await res.text();
-        let pageHint = "";
-        const domRatios = [];
-        const pageEngineResults = [];
-        const engineResultKeys = new Set();
-        const scannedValues = new WeakSet();
-        let pageSignatureInfo = null;
-        const trustedRowCandidates = new Map();
-        const trustedDomRules = [
-          ["BitDefender", /\bBitDefender(?:Falx)?\b/i], ["ESET", /\bESET(?:-NOD32)?\b/i],
-          ["Avast", /\bAvast(?:-Mobile)?\b/i], ["Kaspersky", /\bKaspersky\b/i],
-          ["Huorong", /\bHuorong\b|火绒/i]
-        ];
-        const considerTrustedRow = (rawText) => {
-          const rowText = String(rawText || "").replace(/\s+/g, " ").trim();
-          if (rowText.length < 4 || rowText.length > 360
-            || /Security vendors?' analysis|May differ from commercial/i.test(rowText)) return;
-          for (const [canonical, rule] of trustedDomRules) {
-            const match = rowText.match(rule);
-            if (!match || rowText.length <= match[0].length + 1) continue;
-            const previous = trustedRowCandidates.get(canonical);
-            if (!previous || rowText.length < previous.text.length) {
-              trustedRowCandidates.set(canonical, {
-                text: rowText,
-                label: match[0],
-                index: match.index || 0
-              });
-            }
-          }
-        };
-        const addEngineResult = (value) => {
-          if (!value || typeof value !== "object") return;
-          const engine = String(value.engine_name || value.engineName || value.engine || "").trim();
-          const category = String(value.category || "").toLowerCase();
-          const result = String(value.result || value.detStr || "").trim();
-          if (!engine || !/^(?:malicious|suspicious|harmless|undetected|timeout|confirmed-timeout|type-unsupported|failure)$/i.test(category)) return;
-          const recordKey = `${engine.toLowerCase()}|${category}|${result}`;
-          if (engineResultKeys.has(recordKey)) return;
-          engineResultKeys.add(recordKey);
-          pageEngineResults.push({ engine_name: engine, category, result: result.slice(0, 160) });
-        };
-        const captureSignatureInfo = (value) => {
-          if (pageSignatureInfo || !value || typeof value !== "object") return;
-          const sig = value.signature_info || value.signatureInfo;
-          if (!sig || typeof sig !== "object") return;
-          try {
-            const json = JSON.stringify(sig);
-            if (json && json.length <= 50000) pageSignatureInfo = JSON.parse(json);
-          } catch { /* ignore non-serializable component state */ }
-        };
-        const scanEngineValue = (value, depth) => {
-          if (!value || depth > 3 || (typeof value !== "object" && !Array.isArray(value))) return;
-          if (typeof value === "object") {
-            if (scannedValues.has(value)) return;
-            scannedValues.add(value);
-          }
-          captureSignatureInfo(value);
-          if (Array.isArray(value)) {
-            for (const item of value.slice(0, 160)) scanEngineValue(item, depth + 1);
-            return;
-          }
-          addEngineResult(value);
-          for (const prop of ["analyses", "analysis", "detections", "results", "items", "rows", "data",
-            "attributes", "last_analysis_results", "lastAnalysisResults", "value", "object"]) {
-            try {
-              if (value[prop] && value[prop] !== value) scanEngineValue(value[prop], depth + 1);
-            } catch { /* ignore getter */ }
-          }
-        };
+    const execute = async (func, args, timeout) => {
+      if (!remaining() || closed) return null;
+      return raceMs(new Promise((resolve) => {
         try {
-          const chunks = [];
-          const roots = [document];
-          let rootIndex = 0;
-          let shadowCount = 0;
-          let textChars = 0;
-          while (rootIndex < roots.length && shadowCount < 180) {
-            const root = roots[rootIndex++];
-            if (root === document && document.body) {
-              const bodyText = String(document.body.innerText || "");
-              chunks.push(bodyText);
-              textChars += bodyText.length;
-            } else if (textChars < 180000 && document.createTreeWalker) {
-              const walker = document.createTreeWalker(root, (window.NodeFilter && NodeFilter.SHOW_TEXT) || 4);
-              const local = [];
-              let node = null;
-              while ((node = walker.nextNode()) && textChars < 180000) {
-                const parentTag = String(node.parentElement && node.parentElement.tagName || "").toUpperCase();
-                if (/^(?:STYLE|SCRIPT|NOSCRIPT|TEMPLATE)$/.test(parentTag)) continue;
-                const value = String(node.nodeValue || "").replace(/\s+/g, " ").trim();
-                if (!value) continue;
-                local.push(value);
-                textChars += value.length + 1;
-              }
-              if (local.length) chunks.push(local.join(" "));
-            }
-            for (const el of Array.from(root.querySelectorAll
-              ? root.querySelectorAll("vt-ui-detections-ratio") : [])) {
-              let renderedText = "";
-              try {
-                renderedText = [el.innerText, el.textContent, el.shadowRoot && el.shadowRoot.textContent]
-                  .filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 240);
-              } catch { renderedText = ""; }
-              const renderedMatch = renderedText.match(/(?:^|\D)(\d{1,3})\s*\/\s*(\d{2,3})(?:\D|$)/);
-              const propDetections = Number(el.detections ?? el.getAttribute("detections"));
-              const propTotal = Number(el.total ?? el.getAttribute("total"));
-              const renderedDetections = renderedMatch ? Number(renderedMatch[1]) : NaN;
-              const renderedTotal = renderedMatch ? Number(renderedMatch[2]) : NaN;
-              const renderedValid = Number.isFinite(renderedDetections) && Number.isFinite(renderedTotal)
-                && renderedTotal >= 20 && renderedTotal <= 200
-                && renderedDetections >= 0 && renderedDetections <= renderedTotal;
-              const detections = renderedValid ? renderedDetections : propDetections;
-              const total = renderedValid ? renderedTotal : propTotal;
-              if (Number.isFinite(detections) && Number.isFinite(total) && total >= 20 && total <= 200
-                && detections >= 0 && detections <= total) {
-                const large = !!(el.classList && el.classList.contains("large"))
-                  || !!(el.hasAttribute && el.hasAttribute("large")) || el.large === true;
-                const visible = typeof el.getClientRects === "function" ? el.getClientRects().length > 0 : true;
-                domRatios.push({
-                  detections,
-                  total,
-                  large,
-                  visible,
-                  main: large && visible,
-                  rendered: renderedValid,
-                  renderedText
-                });
-              }
-            }
-            const elements = Array.from(root.querySelectorAll ? root.querySelectorAll("*") : []).slice(0, 3000);
-            for (const el of elements) {
-              const elementTag = String(el && el.tagName || "").toUpperCase();
-              if (!/^(?:STYLE|SCRIPT|NOSCRIPT|TEMPLATE)$/.test(elementTag)) {
-                try { considerTrustedRow(el.innerText || el.textContent || ""); } catch { /* ignore */ }
-              }
-              if (String(el.localName || "").includes("-")) {
-                for (const prop of ["analyses", "analysis", "detections", "results", "items", "rows", "data",
-                  "attributes", "last_analysis_results", "lastAnalysisResults", "value", "object"]) {
-                  try { scanEngineValue(el[prop], 0); } catch { /* ignore getter */ }
-                }
-              }
-              if (!el || !el.shadowRoot || shadowCount++ >= 180) continue;
-              roots.push(el.shadowRoot);
-            }
-          }
-          pageHint = chunks.join("\n").slice(0, 180000);
-          for (const [canonical, candidate] of trustedRowCandidates) {
-            let resultText = candidate.text.slice(candidate.index + candidate.label.length).trim();
-            let nextEngineAt = resultText.length;
-            for (const [, rule] of trustedDomRules) {
-              const next = resultText.match(rule);
-              if (next && next.index != null && next.index > 0) nextEngineAt = Math.min(nextEngineAt, next.index);
-            }
-            resultText = resultText.slice(0, nextEngineAt).trim();
-            if (!resultText || /Security vendors|analysis$/i.test(resultText)) continue;
-            let category = /\bSuspicious\b|可疑/i.test(resultText) ? "suspicious" : "malicious";
-            if (/\bUndetected\b|\bHarmless\b|\bTimeout\b|Confirmed timeout|Unable to process|type unsupported|未检出|无害|超时/i.test(resultText)) {
-              category = /\bHarmless\b|无害/i.test(resultText) ? "harmless"
-                : (/Timeout|超时/i.test(resultText) ? "timeout" : "undetected");
-            }
-            addEngineResult({ engine_name: canonical, category, result: resultText });
-          }
-          domRatios.sort((a, b) => Number(b.main) - Number(a.main)
-            || Number(b.rendered) - Number(a.rendered)
-            || Number(b.visible) - Number(a.visible)
-            || Number(b.large) - Number(a.large));
-        } catch { /* ignore */ }
-        const key = String(h || "").toLowerCase();
-        try {
-          if (text && window.__sfVtCaptures) {
-            const captureQuality = (body) => {
-              const s = String(body || "");
-              const targetIdentity = new RegExp('"(?:sha256|id)"\\s*:\\s*"' + key + '"', "i").test(s);
-              const hasStats = /"last_analysis_stats"\s*:\s*\{|"malicious"\s*:\s*\d+/i.test(s);
-              if (targetIdentity && hasStats) return 5;
-              if (/NotFoundError|Item not found/i.test(s)) return 4;
-              if (targetIdentity) return 3;
-              if (/RecaptchaRequired|captcha|verify (?:that )?you are human/i.test(s)) return 0;
-              return 1;
-            };
-            const previous = window.__sfVtCaptures[key];
-            const quality = captureQuality(text);
-            const previousQuality = previous && Number.isFinite(Number(previous.quality))
-              ? Number(previous.quality)
-              : captureQuality(previous && previous.text);
-            if (!previous || !previous.text || quality > previousQuality
-              || (quality === previousQuality && text.length >= String(previous.text || "").length)) {
-              window.__sfVtCaptures[key] = {
-                text: text.slice(0, 800000),
-                status: res.status,
-                at: Date.now(),
-                url: "https://www.virustotal.com/ui/files/" + key,
-                quality
-              };
-              window.__sfVtCapture = text;
-              window.__sfVtCaptureStatus = res.status;
-              window.__sfVtCaptureUrl = "https://www.virustotal.com/ui/files/" + key;
-              window.__sfVtCaptureQuality = quality;
-            }
-          }
-        } catch { /* ignore */ }
-        return {
-          status: res.status,
-          text: String(text || "").slice(0, 800000),
-          pageHint,
-          pageUrl: String(location.href || "").slice(0, 500),
-          captureUrl: "https://www.virustotal.com/ui/files/" + key,
-          domRatios: domRatios.slice(0, 20),
-          pageEngineResults: pageEngineResults.slice(0, 120),
-          pageSignatureInfo,
-          ok: res.ok
-        };
-      } catch (e) {
-        // executeScript 会单独序列化此函数，不能引用外层 readCaptureFn。
-        return {
-          status: 0,
-          text: "",
-          pageHint: "",
-          pageUrl: String(location.href || "").slice(0, 500),
-          captureUrl: "",
-          domRatios: [],
-          pageEngineResults: [],
-          ok: false,
-          error: e && e.message ? String(e.message) : "page-fetch-fail"
-        };
-      }
-    };
-
-    const exec = async (tabId, func, args, timeoutMs, world) => {
-      try {
-        const injected = await raceMs(
           chrome.scripting.executeScript({
-            target: { tabId },
-            world: world || "MAIN",
-            func,
-            args: args || []
-          }),
-          timeoutMs || 8000,
-          null
-        );
-        if (!injected || !injected[0]) return null;
-        return injected[0].result;
-      } catch {
-        return null;
-      }
+            target: { tabId, frameIds: [0] }, world: "MAIN", func, args
+          }, (results) => {
+            if (chrome.runtime.lastError) return resolve(null);
+            resolve(results && results[0] && results[0].result || null);
+          });
+        } catch { resolve(null); }
+      }), Math.min(timeout, remaining()), null);
     };
-
-    // MAIN 世界补装钩子（content_scripts 偶发未注入到后台新建标签时）
-    const ensureHookFn = () => {
-      try {
-        if (window.__sfVtHookBoot) return true;
-        window.__sfVtHookBoot = true;
-        window.__sfVtCapture = null;
-        window.__sfVtCaptureStatus = 0;
-        window.__sfVtCaptureUrl = "";
-        window.__sfVtCaptureQuality = -1;
-        window.__sfVtCaptures = window.__sfVtCaptures || {};
-        const fileReportHashFromUrl = (value) => {
-          try {
-            const parsed = new URL(String(value || ""), location.origin);
-            const match = parsed.pathname.match(/^\/ui\/files\/([a-f0-9]{64})\/?$/i);
-            return match ? match[1].toLowerCase() : "";
-          } catch {
-            return "";
-          }
-        };
-        const captureQuality = (text, key) => {
-          const s = String(text || "");
-          const targetIdentity = new RegExp('"(?:sha256|id)"\\s*:\\s*"' + key + '"', "i").test(s);
-          const hasStats = /"last_analysis_stats"\s*:\s*\{|"malicious"\s*:\s*\d+/i.test(s);
-          if (targetIdentity && hasStats) return 5;
-          if (/NotFoundError|Item not found/i.test(s)) return 4;
-          if (targetIdentity) return 3;
-          if (/RecaptchaRequired|captcha|verify (?:that )?you are human/i.test(s)) return 0;
-          return 1;
-        };
-        const capture = (url, status, body) => {
-          try {
-            const u = String(url || "");
-            const reportHash = fileReportHashFromUrl(u);
-            if (!reportHash) return;
-            const text = String(body || "");
-            if (text.length < 2) return;
-            if (reportHash) {
-              const previous = window.__sfVtCaptures[reportHash];
-              const quality = captureQuality(text, reportHash);
-              const previousQuality = previous && Number.isFinite(Number(previous.quality))
-                ? Number(previous.quality)
-                : captureQuality(previous && previous.text, reportHash);
-              if (!previous || !previous.text || quality > previousQuality
-                || (quality === previousQuality && text.length >= String(previous.text || "").length)) {
-                window.__sfVtCapture = text.slice(0, 800000);
-                window.__sfVtCaptureStatus = status || 0;
-                window.__sfVtCaptureUrl = u;
-                window.__sfVtCaptureQuality = quality;
-                window.__sfVtCaptures[reportHash] = {
-                  text: text.slice(0, 800000),
-                  status: status || 0,
-                  at: Date.now(),
-                  url: u.slice(0, 500),
-                  quality
-                };
-              }
-            }
-          } catch { /* ignore */ }
-        };
-        const ofetch = window.fetch;
-        if (typeof ofetch === "function" && !ofetch.__sfVtWrapped) {
-          const wrapped = function () {
-            const args = arguments;
-            let url = "";
-            try {
-              const a0 = args[0];
-              url = typeof a0 === "string" ? a0 : (a0 && a0.url) ? a0.url : String(a0 || "");
-            } catch { url = ""; }
-            return ofetch.apply(this, args).then((res) => {
-              try {
-                const responseUrl = res && res.url;
-                if (fileReportHashFromUrl(url) || fileReportHashFromUrl(responseUrl)) {
-                  const c = res.clone();
-                  const captureUrl = fileReportHashFromUrl(url) ? url : responseUrl;
-                  c.text().then((t) => capture(captureUrl, res.status, t)).catch(() => {});
-                }
-              } catch { /* ignore */ }
-              return res;
-            });
-          };
-          wrapped.__sfVtWrapped = true;
-          window.fetch = wrapped;
-        }
-        return true;
-      } catch {
-        return false;
-      }
+    // Only read the target response, never ratios, signatures or engines from the DOM.
+    const readCapture = (expected) => {
+      const path = location.pathname.match(/^\/gui\/file\/([a-f0-9]{64})(?:\/|$)/i);
+      if (!path || path[1].toLowerCase() !== expected) return null;
+      const entry = window.__sfVtCaptures && window.__sfVtCaptures[expected];
+      return entry ? {
+        text: entry.text, status: entry.status, captureUrl: entry.url,
+        pageUrl: location.href, targetHash: expected
+      } : null;
     };
-
-    // 与 work 共享：超时后仍可读到已刮内容
-    const live = { payload: null };
-    const work = (async () => {
-      let tabId = null;
-      let created = false;
-      let createdWindowId = null; // 屏外隐藏窗：不占当前窗口标签栏
+    const fetchTarget = async (expected, timeout, headers) => {
+      const path = location.pathname.match(/^\/gui\/file\/([a-f0-9]{64})(?:\/|$)/i);
+      if (!path || path[1].toLowerCase() !== expected) return null;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeout);
       try {
-        // 优先复用用户已打开的同一文件页（用户自己开的，可显性）
-        try {
-          const existing = await raceMs(new Promise((resolve) => {
-            try {
-              chrome.tabs.query({ url: ["https://www.virustotal.com/*", "https://virustotal.com/*"] }, (tabs) => {
-                if (chrome.runtime.lastError) resolve(null);
-                else resolve(tabs || []);
-              });
-            } catch { resolve(null); }
-          }), 2500, null);
-          if (Array.isArray(existing)) {
-            const hit = existing.find((t) => {
-              const u = String((t && t.url) || "").toLowerCase();
-              return u.includes("/gui/file/" + fileHash) || u.includes("/gui/file/" + fileHash + "/");
-            });
-            if (hit && hit.id != null) {
-              tabId = hit.id;
-              created = false;
-            }
-          }
-        } catch { /* ignore */ }
-
-        if (tabId == null) {
-          // ★ 屏外 popup 窗口：不抢焦点、不出现在当前窗口标签条
-          // （chrome.tabs.create active:false 仍会在标签栏多出一个可见页签）
-          const win = await raceMs(new Promise((resolve) => {
-            try {
-              if (!chrome.windows || typeof chrome.windows.create !== "function") {
-                resolve(null);
-                return;
-              }
-              chrome.windows.create({
-                url: targetUrl,
-                type: "popup",
-                focused: false,
-                width: 420,
-                height: 320,
-                // 尽量移出可视区域（多屏/负坐标在 Windows 上有效）
-                left: -12000,
-                top: -12000
-              }, (w) => {
-                if (chrome.runtime.lastError) resolve(null);
-                else resolve(w || null);
-              });
-            } catch {
-              resolve(null);
-            }
-          }), 5000, null);
-
-          if (win && win.id != null) {
-            createdWindowId = win.id;
-            created = true;
-            try {
-              // 再压到最小化，进一步避免闪一下
-              chrome.windows.update(win.id, { state: "minimized", focused: false }, () => {
-                void chrome.runtime.lastError;
-              });
-            } catch { /* ignore */ }
-            const tabsInWin = win.tabs || [];
-            if (tabsInWin[0] && tabsInWin[0].id != null) {
-              tabId = tabsInWin[0].id;
-            } else {
-              // 部分 Chrome 版本 create 回调 tabs 为空，再查一次
-              const found = await raceMs(new Promise((resolve) => {
-                try {
-                  chrome.tabs.query({ windowId: win.id }, (tabs) => {
-                    if (chrome.runtime.lastError) resolve(null);
-                    else resolve((tabs && tabs[0]) || null);
-                  });
-                } catch { resolve(null); }
-              }), 2000, null);
-              if (found && found.id != null) tabId = found.id;
-            }
-          }
-
-          // 无 windows API 时退回隐藏标签（active:false）
-          if (tabId == null) {
-            const tab = await raceMs(new Promise((resolve) => {
-              try {
-                chrome.tabs.create(
-                  { url: targetUrl, active: false },
-                  (t) => {
-                    if (chrome.runtime.lastError) resolve(null);
-                    else resolve(t || null);
-                  }
-                );
-              } catch {
-                resolve(null);
-              }
-            }), 5000, null);
-            created = !!(tab && tab.id != null);
-            if (!tab || tab.id == null) return null;
-            tabId = tab.id;
-          }
-
-          try {
-            chrome.tabs.update(tabId, { autoDiscardable: false, muted: true, active: false }, () => {
-              void chrome.runtime.lastError;
-            });
-          } catch { /* ignore */ }
-        }
-
-        await waitTabComplete(tabId, 14000);
-        // 补装 MAIN 钩子 + 立刻页内 fetch（不依赖 SPA 是否再请求一次）
-        try { await exec(tabId, ensureHookFn, [], 2000, "MAIN"); } catch { /* ignore */ }
-
-        let payload = null;
-        let stableItemNotFoundHits = 0;
-        // 控制轮询次数，避免超时后 raceMs 丢掉已刮到的内容
-        const pollN = Math.max(10, Math.min(28, Math.floor(budget / 700)));
-        for (let i = 0; i < pollN; i++) {
-          await new Promise((r) => setTimeout(r, i < 3 ? 280 : 420));
-          payload = await exec(tabId, readCaptureFn, [fileHash], 2500);
-          if (payload) live.payload = payload;
-          // MAIN world 可能被页面策略挡住；DOM 读取由隔离世界兜底
-          if (!payload || (!(payload.pageHint || "").trim()
-            && !(Array.isArray(payload.domRatios) && payload.domRatios.length)
-            && !(payload.text || "").trim())) {
-            const isolated = await exec(tabId, readCaptureFn, [fileHash], 3000, "ISOLATED");
-            if (isolated) {
-              if (!payload) payload = isolated;
-              else {
-                if (isolated.pageHint) payload.pageHint = isolated.pageHint;
-                if (Array.isArray(isolated.domRatios) && isolated.domRatios.length) {
-                  payload.domRatios = isolated.domRatios;
-                }
-                if (Array.isArray(isolated.pageEngineResults) && isolated.pageEngineResults.length) {
-                  payload.pageEngineResults = isolated.pageEngineResults;
-                }
-                if (!payload.pageSignatureInfo && isolated.pageSignatureInfo) {
-                  payload.pageSignatureInfo = isolated.pageSignatureInfo;
-                }
-                if (!payload.pageUrl && isolated.pageUrl) payload.pageUrl = isolated.pageUrl;
-                if ((!payload.text || payload.text.length < 40) && isolated.text) {
-                  payload.text = isolated.text;
-                  payload.status = isolated.status || payload.status;
-                }
-              }
-            }
-          }
-          if (payload) {
-            payload.targetHash = fileHash;
-            live.payload = payload;
-          }
-
-          const currentPageHint = String((payload && payload.pageHint) || "");
-          const pageUrlLc = String((payload && payload.pageUrl) || "").toLowerCase();
-          const onFilePage = pageUrlLc.includes(fileHash) || currentPageHint.toLowerCase().includes(fileHash);
-          const hasDomRatio = !!(payload && Array.isArray(payload.domRatios) && payload.domRatios.length
-            && Number(payload.domRatios[0].total) >= 20);
-          const mainFlagRe = /(\d{1,3})\s*\/\s*(\d{2,3})\s+security vendors?\s+flagged this file as malicious/i;
-          const hasMainFlag = mainFlagRe.test(currentPageHint)
-            || /(\d{1,3})\s*\/\s*(\d{2,3})\s*(?:家|个)安全(?:厂商|引擎)/i.test(currentPageHint)
-            || /No security vendors flagged this file as malicious/i.test(currentPageHint);
-
-          // 比例组件已就绪：足够产出自动统计，无需再等完整引擎表
-          if (onFilePage && hasDomRatio && i >= 2) {
-            const mainDetected = hasMainFlag
-              ? (parseInt((currentPageHint.match(mainFlagRe) || [])[1], 10) || 0)
-              : Number(payload.domRatios[0].detections) || 0;
-            const hasPageEngines = !!(payload && Array.isArray(payload.pageEngineResults)
-              && payload.pageEngineResults.length >= 8);
-            if (payloadHasTerminalSignature(payload)
-              && (mainDetected === 0 || hasPageEngines || i >= 10)) break;
-          }
-          if (onFilePage && hasMainFlag) {
-            const mainMatch = currentPageHint.match(mainFlagRe);
-            const mainDetected = mainMatch ? (parseInt(mainMatch[1], 10) || 0) : 0;
-            const hasPageEngines = !!(payload && Array.isArray(payload.pageEngineResults)
-              && payload.pageEngineResults.length);
-            if (payloadHasTerminalSignature(payload)
-              && (mainDetected === 0 || hasPageEngines || i >= 16)) break;
-          }
-          const capturedText = String((payload && payload.text) || "");
-          // 任意长响应可能只是 Recaptcha/鉴权/占位对象，不能因此提前结束页面轮询。
-          // 只有真正包含报告统计时才收下，继续等待页面组件完成渲染。
-          if (capturedText && !/RecaptchaRequired/i.test(capturedText)
-            && (/last_analysis_stats/i.test(capturedText)
-              || /"malicious"\s*:\s*\d+/i.test(capturedText))) {
-            if (payloadHasTerminalSignature(payload) || (!requireSignature && i >= 6)) break;
-          }
-          if (capturedText && /NotFoundError|Item not found/i.test(capturedText)) {
-            break;
-          }
-          if (payload && onFilePage
-            && looksLikeVtExplicitItemNotFoundText(payload.pageHint)
-            && !/\d{1,3}\s*\/\s*\d{2,3}|last_analysis_stats|security vendors? flagged|domRatios/i.test(payload.pageHint || "")
-            && !hasDomRatio) {
-            stableItemNotFoundHits++;
-            // SPA 加载中可能短暂出现空态；连续四次稳定后才认定。
-            if (stableItemNotFoundHits >= 4) {
-              payload.notFoundStable = true;
-              break;
-            }
-          } else {
-            stableItemNotFoundHits = 0;
-          }
-
-          // 中段仍无 JSON：主动页内同源 fetch 一次（带浏览器 Cookie）
-          if (i === 5 || i === 12) {
-            const active = await exec(tabId, activeFetchFn, [fileHash], 6000);
-            if (active) {
-              if (!payload) payload = active;
-              else {
-                if (active.text && active.text.length >= String(payload.text || "").length
-                  && !/RecaptchaRequired/i.test(active.text)) {
-                  payload.text = active.text;
-                  payload.status = active.status;
-                }
-                if (active.pageHint && active.pageHint.length > String(payload.pageHint || "").length) {
-                  payload.pageHint = active.pageHint;
-                }
-                if (Array.isArray(active.domRatios) && active.domRatios.length) {
-                  payload.domRatios = active.domRatios;
-                }
-                if (Array.isArray(active.pageEngineResults) && active.pageEngineResults.length) {
-                  payload.pageEngineResults = active.pageEngineResults;
-                }
-                if (!payload.pageSignatureInfo && active.pageSignatureInfo) {
-                  payload.pageSignatureInfo = active.pageSignatureInfo;
-                }
-              }
-              if (payload) payload.targetHash = fileHash;
-              // 主动 fetch 已带回 stats，可提前结束
-              if (payload.text && /last_analysis_stats|"malicious"\s*:\s*\d+/i.test(payload.text)
-                && !/RecaptchaRequired/i.test(payload.text)
-                && payloadHasTerminalSignature(payload)) {
-                break;
-              }
-              if (Array.isArray(payload.domRatios) && payload.domRatios.length
-                && Number(payload.domRatios[0].total) >= 20
-                && payloadHasTerminalSignature(payload)) {
-                break;
-              }
-            }
-          }
-        }
-
-        // 钩子未截到：页内同源再补一枪
-        const finalCapturedText = String((payload && payload.text) || "");
-        const hasResolvedCapture = /last_analysis_stats|"malicious"\s*:\s*\d+|NotFoundError|Item not found/i.test(finalCapturedText)
-          || /\d{1,3}\s*\/\s*\d{2,3}\s+security vendors?\s+flagged this file as malicious/i.test(String((payload && payload.pageHint) || ""))
-          || !!(payload && Array.isArray(payload.domRatios) && payload.domRatios.length
-            && Number(payload.domRatios[0].total) >= 20);
-        if (!payload || !hasResolvedCapture || /RecaptchaRequired/i.test(finalCapturedText)
-          || !payloadHasTerminalSignature(payload)) {
-          const active = await exec(tabId, activeFetchFn, [fileHash], 7000);
-          if (active) {
-            if (!payload) payload = active;
-            else {
-              if (active.text && active.text.length >= (payload.text || "").length
-                && !/RecaptchaRequired/i.test(active.text)) {
-                payload.text = active.text;
-                payload.status = active.status;
-              }
-              if (active.pageHint && active.pageHint.length > (payload.pageHint || "").length) {
-                payload.pageHint = active.pageHint;
-              }
-              if (Array.isArray(active.domRatios) && active.domRatios.length) {
-                payload.domRatios = active.domRatios;
-              }
-              if (Array.isArray(active.pageEngineResults) && active.pageEngineResults.length) {
-                payload.pageEngineResults = active.pageEngineResults;
-              }
-              if (!payload.pageSignatureInfo && active.pageSignatureInfo) {
-                payload.pageSignatureInfo = active.pageSignatureInfo;
-              }
-            }
-          }
-        }
-
-        if (payload) {
-          payload.targetHash = fileHash;
-          live.payload = payload;
-        }
-        return live.payload || payload;
-      } catch {
-        return live.payload;
-      } finally {
-        // 只关我们创建的隐藏窗/标签；用户原有 VT 页不关
-        if (created) {
-          if (createdWindowId != null && chrome.windows && typeof chrome.windows.remove === "function") {
-            try {
-              chrome.windows.remove(createdWindowId, () => { void chrome.runtime.lastError; });
-            } catch { /* ignore */ }
-          } else if (tabId != null) {
-            try {
-              chrome.tabs.remove(tabId, () => { void chrome.runtime.lastError; });
-            } catch { /* ignore */ }
-          }
-        }
-      }
-    })();
-
+        const response = await fetch("/ui/files/" + expected, {
+          credentials: "include", cache: "no-store", signal: controller.signal,
+          headers
+        });
+        const text = await response.text();
+        // Navigation while fetching invalidates the page context, not the file identity.
+        const current = location.pathname.match(/^\/gui\/file\/([a-f0-9]{64})(?:\/|$)/i);
+        if (!current || current[1].toLowerCase() !== expected) return null;
+        return {
+          text, status: response.status, captureUrl: response.url,
+          pageUrl: location.href, targetHash: expected
+        };
+      } catch { return null; }
+      finally { clearTimeout(timer); }
+    };
     try {
-      const raced = await raceMs(work, budget, "__timeout__");
-      if (raced && raced !== "__timeout__") return raced;
-      // 超时：仍返回已刮到的内容（禁止 null 导致整段「取数未完成」）
-      return live.payload || null;
-    } catch {
-      return live.payload || null;
+      const tabs = await raceMs(new Promise((resolve) => {
+        chrome.tabs.query({ url: "https://www.virustotal.com/*" }, (items) => {
+          resolve(chrome.runtime.lastError ? [] : (items || []));
+        });
+      }), Math.min(2000, remaining()), []);
+      const existing = tabs.find((tab) => onTarget(tab.url));
+      if (existing) tabId = existing.id;
+      else {
+        const tab = await raceMs(new Promise((resolve) => {
+          chrome.tabs.create({ url: targetUrl, active: false }, (item) => {
+            const failed = chrome.runtime.lastError;
+            // A late browser callback must not leave an orphan background tab.
+            if (closed || !remaining()) {
+              if (item) closeTab(item.id);
+              return resolve(null);
+            }
+            resolve(failed ? null : item);
+          });
+        }), Math.min(5000, remaining()), null);
+        if (!tab || tab.id == null) return null;
+        tabId = tab.id;
+        created = true;
+      }
+      if (!remaining()) return null;
+      await waitTabComplete(tabId, Math.min(5000, remaining()));
+      // Give the SPA capture a short opportunity; do not wait for the engine table.
+      for (let i = 0; i < 4 && remaining() > 300; i++) {
+        const payload = await execute(readCapture, [targetHash], 1500);
+        if (parseVtPageFetchPayload(payload, targetHash, targetUrl)) return payload;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(250, remaining())));
+      }
+      // At most one supplemental request. Its AbortController ends network work too.
+      const timeout = Math.min(6500, remaining() - 100);
+      if (timeout > 0) {
+        const payload = await execute(fetchTarget, [targetHash, timeout, vtUiHeaders()], timeout + 100);
+        if (parseVtPageFetchPayload(payload, targetHash, targetUrl)) return payload;
+      }
+      // The SPA may have completed while the supplemental request was running.
+      return await execute(readCapture, [targetHash], 1000);
+    } catch { return null; }
+    finally {
+      closed = true;
+      if (created) closeTab(tabId);
     }
   }
 
@@ -4029,199 +3246,32 @@
   }
 
   function parseVtPageFetchPayload(payload, hash, guiUrl) {
-    if (!payload) return null;
-    const status = Number(payload.status) || 0;
-    const text = String(payload.text || "");
-    const pageHint = String(payload.pageHint || "");
-    const pageUrl = String(payload.pageUrl || "").toLowerCase();
-    const captureUrl = String(payload.captureUrl || "").toLowerCase();
-    const hashLc = String(hash || "").toLowerCase();
-    let data = null;
-    try { data = JSON.parse(text); } catch { data = null; }
-    // captcha JSON 不能当文件报告，但绝不能因此跳过 DOM/pageHint 刮取
-    const dataIsCaptcha = !!(data && isVtCaptchaError(data, status));
-    let pageEngineConsensus = {};
-    try { pageEngineConsensus = vtEngineConsensusFromPageResults(payload.pageEngineResults) || {}; } catch { pageEngineConsensus = {}; }
-    const structuredNode = !dataIsCaptcha && data && typeof data === "object"
-      ? (data.data || data)
-      : null;
-    const structuredAttrsCandidate = structuredNode && !Array.isArray(structuredNode)
-      ? (structuredNode.attributes || structuredNode)
-      : null;
-    const structuredAttrs = structuredAttrsCandidate
-      && vtFileIdentityMatchesTarget(hashLc, structuredNode && structuredNode.id, structuredAttrsCandidate)
-      ? structuredAttrsCandidate
-      : null;
-    const structuredSignatureInfo = (structuredAttrs
-      && (structuredAttrs.signature_info || structuredAttrs.signatureInfo)) || null;
-    // DOM/component 状态没有文件身份，绝不能给当前 hash 提供验签结论。
-    const pageSignatureInfo = structuredSignatureInfo;
-    const finalizePageResult = (result) => {
-      try {
-        const out = result;
-        if (!out) return out;
-        if (!pageSignatureInfo) return out;
-        let meta = { trust: "", signer: "" };
-        try { meta = vtSignatureMetaFromAttrs({ signature_info: pageSignatureInfo }) || meta; } catch { /* ignore */ }
-        if (meta.signer && !out.signerFromVt) out.signerFromVt = meta.signer;
-        if (meta.trust === "invalid" || meta.trust === "valid"
-          || (!out.sigTrustFromVt && meta.trust)) out.sigTrustFromVt = meta.trust;
-        // 成功结果绝不能带 captcha/unknown 假标志
-        out.unknown = false;
-        out.captcha = false;
-        out.swCaptcha = false;
-        out.needApiKey = false;
-        return out;
-      } catch {
-        return result || null;
-      }
-    };
-
-    // 当前文件页必须由真实 page/capture URL（或页面正文）绑定完整 hash；targetHash 是调用方输入，不能自证。
-    const pageOnCurrentFile = !!(
-      hashLc.length === 64 && (
-        pageUrl.includes(hashLc)
-        || captureUrl.includes(hashLc)
-        || pageHint.toLowerCase().includes(hashLc)
-      )
-    );
-
-    // 主报告顶部文案（例如 23/70 ... flagged this file）比全页任意比例组件可靠。
-    if (pageOnCurrentFile
-      && /security vendors?\s+flagged this file as malicious|安全(?:厂商|引擎).{0,30}(?:标记|检出).{0,20}(?:恶意|有害)|未发现安全厂商将此文件标记为恶意/i.test(pageHint)) {
-      const mainDom = parseVtDomStats(pageHint, hash, guiUrl);
-      if (mainDom) {
-        mainDom.source = "vt-page-main-report";
-        if (pageEngineConsensus.engineDetailsAvailable) Object.assign(mainDom, pageEngineConsensus);
-        return finalizePageResult(mainDom);
-      }
+    const expected = normalizeVtFileHash(hash);
+    if (!payload || !expected || payload.targetHash !== expected) return null;
+    // Both page route and actual response endpoint must describe this exact file.
+    try {
+      const page = new URL(payload.pageUrl);
+      const response = new URL(payload.captureUrl);
+      if (page.protocol !== "https:" || response.protocol !== "https:"
+        || page.hostname !== "www.virustotal.com" || response.hostname !== page.hostname
+        || !new RegExp("^/gui/file/" + expected + "(?:/|$)", "i").test(page.pathname)
+        || !new RegExp("^/ui/files/" + expected + "/?$", "i").test(response.pathname)) return null;
+    } catch { return null; }
+    let body;
+    try { body = JSON.parse(String(payload.text || "")); } catch { return null; }
+    if (!body || typeof body !== "object") return null;
+    const node = body.data;
+    if (node && typeof node === "object" && !Array.isArray(node)) {
+      if (node.type && node.type !== "file") return null;
+      return fileHitFromAttrs(node.attributes, expected, guiUrl, "vt-page-json", node.id);
     }
-
-    // ① 页面/JSON 明确无样本（Item not found，常非 HTTP 404）
-    if (!dataIsCaptcha && isVtNotFoundError(data, status)) {
-      return vtNotFoundResult(hash, { source: "vt-page", status: status || 200, verifiedNotFound: true });
+    if (body.error && isVtNotFoundError(body, Number(payload.status) || 0)) {
+      return vtNotFoundResult(expected, {
+        source: "vt-page-json", verifiedNotFound: true, status: Number(payload.status) || 0
+      });
     }
-    if (payload.notFoundStable === true && pageOnCurrentFile
-      && looksLikeVtExplicitItemNotFoundText(pageHint)) {
-      return vtNotFoundResult(hash, { source: "vt-page-dom", status: status || 200, verifiedNotFound: true });
-    }
-
-    // ② UI JSON 完整报告（非 captcha 时）
-    if (data && !dataIsCaptcha) {
-      try {
-        const parsed = parseVtUiJson(data, hash, guiUrl);
-        if (parsed && (parsed.found === true || parsed.notFound === true)) {
-          parsed.source = "vt-page";
-          return finalizePageResult(parsed);
-        }
-        if (data.data && data.data.attributes) {
-          const hit = fileHitFromAttrs(
-            data.data.attributes,
-            hash,
-            guiUrl,
-            "vt-page",
-            data.data.id
-          );
-          if (hit) return finalizePageResult(hit);
-        }
-      } catch { /* continue DOM */ }
-    }
-    // 正文抠 stats：即使 data 是 captcha 包，text 里也可能混有 last_analysis_stats
-    if (text && text.length > 40) {
-      try {
-        const fromText = parseVtStatsFromAnyText(text, hash, guiUrl, "vt-page-text");
-        if (fromText && fromText.found === true) {
-          return finalizePageResult(fromText);
-        }
-      } catch { /* continue */ }
-    }
-
-    // ③ 明确主报告标题最可靠；不再用 Community Score 附近的任意 x/y。
-    const fromDom = pageOnCurrentFile ? parseVtDomStats(pageHint, hash, guiUrl) : null;
-    if (fromDom) {
-      fromDom.source = "vt-page-main-report";
-      if (pageEngineConsensus.engineDetailsAvailable) Object.assign(fromDom, pageEngineConsensus);
-      return finalizePageResult(fromDom);
-    }
-
-    const ratios = Array.isArray(payload.domRatios) ? payload.domRatios : [];
-    const credibleRatios = ratios.filter((item) => item && (
-      item.main === true
-      || (item.large === true && item.visible !== false)
-      || (item.rendered === true && item.visible !== false)
-    ));
-    const bestRatio = credibleRatios[0] || null;
-    const ratioDetections = bestRatio ? (Number(bestRatio.detections) || 0) : 0;
-    const ratioTotal = bestRatio ? (Number(bestRatio.total) || 0) : 0;
-    const noVendorBanner = /No security vendors flagged this file as malicious|未发现安全厂商将此文件标记为恶意|没有安全厂商将此文件标记为恶意/i.test(pageHint);
-    const trustedDistributorBanner = ratioDetections === 0
-      && /File distributed by\s+[^\n]{2,160}|文件由\s*[^\n]{2,160}\s*分发/i.test(pageHint);
-    const ratioContextConfirmed = ratioDetections === 0 && (noVendorBanner || trustedDistributorBanner);
-
-    // ④ 逐引擎明细仅在它与已确认的主比例一致时计算；全 DOM 可能同时存在 Relations 的其它引擎表。
-    const pageStats = vtStatsFromPageResults(payload.pageEngineResults);
-    const rowsMatchMainRatio = !!(bestRatio && pageStats.total === ratioTotal
-      && (pageStats.malicious + pageStats.suspicious) === ratioDetections);
-    if (pageOnCurrentFile && ratioContextConfirmed && rowsMatchMainRatio && pageStats.total >= 20) {
-      const fromRows = {
-        success: true,
-        found: true,
-        notFound: false,
-        hash,
-        guiUrl,
-        source: "vt-page-engine-results",
-        statsPolicyVersion: VT_STATS_POLICY_VERSION,
-        ...pageStats,
-        ratio: `${pageStats.malicious + pageStats.suspicious}/${pageStats.total}`,
-        signerFromVt: "",
-        summary: formatVtSummary(pageStats.malicious, pageStats.suspicious, pageStats.total, ""),
-        ...pageEngineConsensus
-      };
-      return finalizePageResult(fromRows);
-    }
-
-    // ⑤ ★ 自定义元素 vt-ui-detections-ratio（captcha 时仍可用 DOM）。
-    // 必须同时有 clean/distributor 主横幅；不再任取全页组件列表第一个。
-    if (pageOnCurrentFile && ratioContextConfirmed && bestRatio) {
-      const malicious = ratioDetections;
-      const total = ratioTotal;
-      if (total >= 20 && total <= 200 && malicious >= 0 && malicious <= total) {
-        const fromRatio = {
-          success: true,
-          found: true,
-          notFound: false,
-          hash,
-          guiUrl,
-          source: "vt-page-dom-ratio",
-          statsPolicyVersion: VT_STATS_POLICY_VERSION,
-          malicious,
-          suspicious: 0,
-          undetected: Math.max(0, total - malicious),
-          harmless: 0,
-          total,
-          ratio: `${malicious}/${total}`,
-          signerFromVt: "",
-          summary: formatVtSummary(malicious, 0, total, ""),
-          ...pageEngineConsensus
-        };
-        return finalizePageResult(fromRatio);
-      }
-    }
-
-    // captcha 仅表示 JSON 接口被拦，不是最终结论（DOM 可能已成功；此处才失败）
     return null;
   }
-
-  /**
-   * 查 VT（整段 ≤28s）：
-   *  1) 可选 API Key v3
-   *  2) ★ 扩展打开 VT 页：DOM 刮取 + 页内同源 fetch（浏览器会话，非外部爬）
-   *  3) SW 直连短试
-   */
-  /**
-   * 策略版本升级时本地重算加权票，禁止为了换算法去删掉已成功的 VT 统计缓存
-   * （删缓存后 SW 再查极易 captcha →「自动取数受限」假故障）。
-   */
   function reweightCachedVtResult(cr) {
     try {
       if (!cr || cr.found !== true) return null;
@@ -4265,9 +3315,41 @@
     }
   }
 
-  NS.lookupVirusTotalHash = async function (sha256, lookupOptions) {
-    const hash = String(sha256 || "").toLowerCase().replace(/[^0-9a-f]/g, "");
-    if (hash.length !== 64) {
+  const vtLookupInflight = new Map();
+  const vtLookupCooldown = new Map();
+  NS.lookupVirusTotalHash = function (sha256, lookupOptions) {
+    const hash = String(sha256 || "").trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(hash)) return lookupVirusTotalHashUnshared(sha256, lookupOptions);
+    if (vtLookupInflight.has(hash)) return vtLookupInflight.get(hash);
+    const recent = vtLookupCooldown.get(hash);
+    if (recent && recent.until > Date.now() && !(lookupOptions && lookupOptions.force)) {
+      return Promise.resolve({ ...recent.result, cached: true, retryAfterMs: recent.until - Date.now() });
+    }
+    // Request signature metadata for every consumer so PE/archive jobs can share a query.
+    const job = (async () => {
+      // Refresh invalidation belongs inside the shared job and after cooldown checks.
+      if (lookupOptions && lookupOptions.refresh) {
+        NS._vtByHash.delete(hash);
+        await removeDurableVtCache(hash);
+      }
+      return lookupVirusTotalHashUnshared(hash, { ...lookupOptions, requireSignature: true });
+    })()
+      .then((result) => {
+        const missingEngines = result && result.found === true
+          && Number(result.malicious) + Number(result.suspicious) > 0 && result.engineDetailsAvailable !== true;
+        if (result && (result.unknown || result.signatureIncomplete || missingEngines || result.rateLimited || result.badApiKey)) {
+          vtLookupCooldown.set(hash, { result, until: Date.now() + 60000 });
+          while (vtLookupCooldown.size > 128) vtLookupCooldown.delete(vtLookupCooldown.keys().next().value);
+        } else vtLookupCooldown.delete(hash);
+        return result;
+      }).finally(() => { vtLookupInflight.delete(hash); });
+    vtLookupInflight.set(hash, job);
+    return job;
+  };
+
+  async function lookupVirusTotalHashUnshared(sha256, lookupOptions) {
+    const hash = String(sha256 || "").trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(hash)) {
       return { success: false, error: "bad-hash", guiUrl: "", uploadUrl: VT_UPLOAD_PAGE, summary: "VT: 哈希无效" };
     }
     const guiUrl = VT_GUI_BASE + hash;
@@ -4361,12 +3443,6 @@
         try {
           const parsed = parseVtUiJson(r1.data, hash, guiUrl);
           if (parsed && (parsed.found === true || parsed.notFound === true)) return parsed;
-        } catch { /* ignore */ }
-      }
-      if (r1.text && r1.text.length > 40) {
-        try {
-          const fromText = parseVtStatsFromAnyText(r1.text, hash, guiUrl, "vt-ui-text");
-          if (fromText && fromText.found === true) return fromText;
         } catch { /* ignore */ }
       }
       if (isVtCaptchaError(r1.data, r1.status)) return { __swCaptcha: true };
@@ -5088,14 +4164,8 @@
   function vtFileIdentityMatchesTarget(hash, nodeId, attrs) {
     const expected = normalizeVtFileHash(hash);
     if (!expected) return false;
-    const identities = [];
-    const idHash = normalizeVtFileHash(nodeId);
-    const attrHash = normalizeVtFileHash(attrs && attrs.sha256);
-    if (idHash) identities.push(idHash);
-    if (attrHash) identities.push(attrHash);
-    return identities.length > 0
-      && identities.includes(expected)
-      && identities.every((candidate) => candidate === expected);
+    const identities = [nodeId, attrs && attrs.sha256].filter((value) => value != null && value !== "");
+    return identities.length > 0 && identities.every((value) => normalizeVtFileHash(value) === expected);
   }
 
   function statsFromAttrs(attrs) {
@@ -5339,6 +4409,7 @@
     }
     // 常见：{ data: { id, type, attributes } }
     const node = data.data || data;
+    if (Array.isArray(node) || (node && node.type && node.type !== "file")) return null;
     const attrs = (node && node.attributes) || (data.attributes) || null;
     if (attrs && typeof attrs === "object") {
       const hit = fileHitFromAttrs(attrs, hash, guiUrl, "vt-ui", node && node.id);
@@ -5523,6 +4594,12 @@
 
         // 超大文件：全量下载失败时，对压缩包走 Range 分段扫包内 PE
         if ((!fetched.ok || !fetched.buf) && fetched.tooLarge) {
+          report.partialScan = true;
+          report.vt = {
+            success: false, found: null, notFound: false, unknown: true,
+            queryState: "not-requested", skipped: true, reason: "file-not-fully-read",
+            hash: "", guiUrl: "", summary: "文件未完整读取，未生成 SHA256，未查询 VT"
+          };
           const sizeMb = fetched.contentLength
             ? Math.round(fetched.contentLength / 1048576)
             : "?";
@@ -5535,14 +4612,6 @@
               report.nested = (rangeScan && rangeScan.items) || [];
               report.archiveFormat = (rangeScan && rangeScan.format) || "zip";
               report.sha256 = ""; // 未全量下载，无法可靠哈希
-              report.vt = {
-                success: true,
-                found: null,
-                notFound: false,
-                unknown: true,
-                summary: "",
-                guiUrl: ""
-              };
               report.success = true;
               report.partialScan = true;
               report.error = "";
@@ -5588,14 +4657,6 @@
             report.archiveFormat = fmt;
             report.archiveNote = note;
             report.partialScan = true;
-            report.vt = {
-              success: true,
-              found: null,
-              notFound: false,
-              unknown: true,
-              summary: "",
-              guiUrl: ""
-            };
             report.signature = resolveDigitalSignature(report.pe, null, []);
             report.success = true;
             report.error = "";
@@ -6231,7 +5292,7 @@
     const s = String(status || "");
     const st = String(stage || "");
     if (s === "blocked" || s === "flagged") return 100;
-    if (s === "allowed" || s === "done" || s === "error") return 90;
+    if (s === "allowed" || s === "done" || s === "error" || s === "unscanned") return 90;
     if (s === "uploading") return 40;
     if (s === "checking") {
       // 外壳 VT 已回、包内还在查
@@ -6246,6 +5307,9 @@
   /** 换站时清内存中的过期 VT，供 clearTabRiskStorage 调用 */
   NS.clearLatestExeVtIfStaleForTab = function (tabId, newUrl) {
     try {
+      if (Number.isInteger(tabId) && tabId >= 0) {
+        NS._vtProbeGenByTab.set(tabId, (NS._vtProbeGenByTab.get(tabId) || 0) + 1);
+      }
       const hostOf = (u) => {
         try { return new URL(u || "").hostname.toLowerCase().replace(/^www\./, ""); } catch { return ""; }
       };
@@ -6256,17 +5320,20 @@
       const mh = String(m.pageHost || "").toLowerCase().replace(/^www\./, "") || hostOf(m.pageUrl);
       if (!newHost || !mh || newHost !== mh) {
         NS._latestExeVtMem = null;
-        // 作废该 tab 进行中的旧探测代数
-        if (Number.isInteger(tabId) && tabId >= 0) {
-          const g = (NS._vtProbeGenByTab.get(tabId) || 0) + 1;
-          NS._vtProbeGenByTab.set(tabId, g);
-        }
       }
     } catch { /* ignore */ }
   };
 
   function writeLatestExeVt(payload) {
     try {
+      // This pipeline fetches a URL again; it never reads Edge's on-disk bytes.
+      // Apply the scope to refreshes and legacy records as well as new probes.
+      const sampleOnly = payload.sampleOnly === true || /^https?:\/\//i.test(payload.url || "");
+      if (sampleOnly) payload = {
+        ...payload,
+        title: sampleTitle(payload.title || "安装包/压缩包检测"),
+        message: sampleMessage(payload.message)
+      };
       const nextStatus = payload.status || "done";
       const nextUrl = String(payload.url || "").slice(0, 400);
       const stage = String(payload.stage || "");
@@ -6298,7 +5365,7 @@
       if (sameTab && sameUrl && !newerProbe) {
         const prevRank = Number(prev._rank) || 0;
         if (nextRank < prevRank && !allowRankDowngrade) return null;
-        if (/^(done|allowed|blocked|flagged|error)$/i.test(String(prev.status || ""))
+        if (/^(done|allowed|blocked|flagged|error|unscanned)$/i.test(String(prev.status || ""))
           && /^(checking|uploading)$/i.test(nextStatus)) {
           return null;
         }
@@ -6330,7 +5397,14 @@
         url: nextUrl,
         pageUrl: (payload.pageUrl || "").slice(0, 500),
         pageHost: payload.pageHost || "",
+        // Capture at download start, not at a later popup refresh. A same-URL
+        // reload is a different document and must never inherit old verdicts.
+        sourceAnalysisTxn: String(payload.sourceAnalysisTxn || ""),
+        sourcePageUrl: String(payload.sourcePageUrl || ""),
+        sourceNavigationSeq: Number.isInteger(payload.sourceNavigationSeq) ? payload.sourceNavigationSeq : null,
         sha256: payload.sha256 || "",
+        sampleOnly,
+        downloadIdentityVerified: false,
         peSigned: !!payload.peSigned,
         peSigner: payload.peSigner || "",
         peSigTrust: payload.peSigTrust || "",
@@ -6339,6 +5413,7 @@
         nested: Array.isArray(payload.nested) ? payload.nested : [],
         archiveNote: payload.archiveNote || "",
         archiveFormat: payload.archiveFormat || "",
+        partialScan: payload.partialScan === true,
         nestedVtPrimary: payload.nestedVtPrimary || null,
         signature: payload.signature || null,
         risks: Array.isArray(payload.risks) ? payload.risks : [],
@@ -6403,51 +5478,54 @@
     } catch { /* ignore */ }
   }
 
-  async function deleteDownloadFileById(downloadId) {
-    if (!Number.isInteger(downloadId) || downloadId < 0
-      || !chrome.downloads || typeof chrome.downloads.removeFile !== "function") {
-      return false;
-    }
+  function sampleTitle(title) {
+    const value = String(title || "文件检测");
+    return value.startsWith("来源样本：") ? value : `来源样本：${value}`;
+  }
 
-    if (typeof chrome.downloads.cancel === "function") {
-      await new Promise((resolve) => {
-        try {
-          chrome.downloads.cancel(downloadId, () => {
-            void chrome.runtime.lastError;
-            resolve();
-          });
-        } catch { resolve(); }
-      });
-    }
+  function sampleMessage(message) {
+    const note = "仅检测重新请求的来源样本，尚未核验实际下载文件；未据此删除本地文件。";
+    const value = String(message || "");
+    return value.includes(note) ? value : `${note}${value ? " " + value : ""}`;
+  }
 
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      const removed = await new Promise((resolve) => {
-        try {
-          chrome.downloads.removeFile(downloadId, () => {
-            const failed = !!chrome.runtime.lastError;
-            resolve(!failed);
-          });
-        } catch { resolve(false); }
-      });
-      if (removed) return true;
+  function currentVtReportPageScope(report, tabId) {
+    if (!report || !Number.isInteger(tabId) || tabId < 0 || report.tabId !== tabId) return null;
+    const sourceAnalysisTxn = String(report.sourceAnalysisTxn || "");
+    const sourcePageUrl = String(report.sourcePageUrl || "");
+    const active = NS._activeRiskTxnByTab instanceof Map ? NS._activeRiskTxnByTab.get(tabId) : null;
+    if (!sourceAnalysisTxn || !sourcePageUrl || !active
+      || active.analysisTxn !== sourceAnalysisTxn || active.url !== sourcePageUrl
+      || report.pageUrl !== sourcePageUrl.slice(0, 500)) return null;
+    if (Number.isInteger(report.sourceNavigationSeq)
+      && (!(NS._riskNavigationSeqByTab instanceof Map)
+        || NS._riskNavigationSeqByTab.get(tabId) !== report.sourceNavigationSeq)) return null;
+    return { sourceAnalysisTxn, sourcePageUrl };
+  }
 
-      const alreadyGone = await new Promise((resolve) => {
-        if (typeof chrome.downloads.search !== "function") {
-          resolve(false);
-          return;
-        }
-        try {
-          chrome.downloads.search({ id: downloadId }, (items) => {
-            void chrome.runtime.lastError;
-            const found = Array.isArray(items) ? items[0] : null;
-            resolve(!!found && found.exists === false);
-          });
-        } catch { resolve(false); }
-      });
-      if (alreadyGone) return true;
-      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+  // Both refresh paths recalculate the sample verdict from all bound hashes.
+  // A refresh never cancels or restarts an actual browser download.
+  function refreshedVtFields(current, changes) {
+    const report = { ...current, ...changes, nestedVtPrimary: null };
+    if (report.vt) report.vt = { ...report.vt };
+    annotateArchiveVtFromNested(report);
+    const consensus = vtShouldHardBlock(report, {});
+    const fields = { vt: report.vt, nestedVtPrimary: report.nestedVtPrimary,
+      guiUrl: report.nestedVtPrimary?.guiUrl || report.vt?.guiUrl || current.guiUrl || (VT_GUI_BASE + current.sha256),
+      risks: buildFileRiskLines(report, { requireSignedPe: !!current.gated }) };
+    if (consensus.block) {
+      const title = consensus.nestedName ? `包内文件 VT 检出：${consensus.nestedName}` : "VT 权威引擎共识检出可疑文件";
+      Object.assign(fields, { status: current.status === "blocked" ? "blocked" : "flagged",
+        title, message: formatInspectNotice(report, {}) || title, allowed: false });
+    } else if (changes.vt && Number(current.vt?.trustedPolicyVersion) !== VT_TRUST_POLICY_VERSION
+      && /^(?:blocked|flagged)$/i.test(current.status) && /\bVT\b|VirusTotal/i.test(current.title || "")
+      && !vtShouldHardBlock(report, { requireSignedPe: !!current.gated }).block) {
+      const released = Number.isInteger(current.releasedDownloadId) && current.releasedDownloadId >= 0;
+      const title = current.gated && !released ? "VT 复核完成，原下载未恢复，请手动重试" : "检测完成";
+      Object.assign(fields, { status: current.gated && released ? "allowed" : "done",
+        title, message: title, allowed: !current.gated || released, allowRankDowngrade: true });
     }
-    return false;
+    return { consensus, fields };
   }
 
   /**
@@ -6467,6 +5545,11 @@
     if (!current || String(current.sha256 || "").toLowerCase() !== hash) {
       return { success: false, error: "stale-report" };
     }
+    // A global latest record is only a fallback for its own tab, not authority
+    // to relabel another tab's report (even when both downloaded the same SHA).
+    if (Number.isInteger(tabId) && tabId >= 0 && current.tabId !== tabId) {
+      return { success: false, error: "stale-report" };
+    }
 
     const requireSignature = !!(
       current.peSigned
@@ -6474,11 +5557,26 @@
       || String(current.peSigTrust || "").toLowerCase() === "present"
       || String(current.signature && current.signature.trust || "").toLowerCase() === "present"
     );
-    try { NS._vtByHash.delete(hash); } catch { /* ignore */ }
-    // 手动刷新必须绕过持久化定论，否则刚删内存缓存又会立刻读回旧错结果。
-    await removeDurableVtCache(hash);
-    const vt = await NS.lookupVirusTotalHash(hash, { requireSignature });
+    // Popup supplementation shares the same hash job/cooldown; it must not erase
+    // a good cache on every popup opening before the scheduler can coalesce it.
+    const revision = JSON.stringify(current);
+    const originalKey = tabKey && stored[tabKey] ? tabKey : stored.latestExeVt ? "latestExeVt" : "";
+    const memoryBefore = NS._latestExeVtMem;
+    const vt = await NS.lookupVirusTotalHash(hash, { requireSignature, refresh: true });
     if (!vt || vt.found !== true) return { success: false, vt: vt || null };
+    // Nested signature refresh and outer refresh can finish in either order.
+    // Revalidate the original record, not just its hash (or even downloadId).
+    const seq = NS._latestExeVtSeq;
+    const latestStore = await new Promise(resolve => {
+      try { chrome.storage.local.get(tabKey ? [tabKey, "latestExeVt"] : ["latestExeVt"],
+        value => resolve(chrome.runtime.lastError ? null : value)); } catch { resolve(null); }
+    });
+    const latest = latestStore && ((tabKey && latestStore[tabKey]) || latestStore.latestExeVt || NS._latestExeVtMem);
+    if (!latest || (originalKey && !latestStore[originalKey]) || JSON.stringify(latest) !== revision
+      || NS._latestExeVtSeq !== seq
+      || (NS._latestExeVtMem !== memoryBefore && NS._latestExeVtMem?.tabId === current.tabId)) {
+      return { success: false, error: "stale-report" };
+    }
 
     const pe = current.pe ? { ...current.pe } : null;
     if (pe && pe.signed && !pe.signerHint && vt.signerFromVt) {
@@ -6492,79 +5590,67 @@
       || ""
     );
 
-    const consensus = vtShouldHardBlock({ vt }, {});
-    const oldPolicyVtFlag = Number(current.vt && current.vt.trustedPolicyVersion) !== VT_TRUST_POLICY_VERSION
-      && /^(?:blocked|flagged)$/i.test(String(current.status || ""))
-      && /\bVT\b|VirusTotal/i.test(String(current.title || ""));
-    const removableDownloadId = Number.isInteger(current.releasedDownloadId)
-      ? current.releasedDownloadId
-      : (!current.gated && Number.isInteger(current.downloadId) ? current.downloadId : null);
-    let fileDeleted = false;
-    if (consensus.block && Number.isInteger(removableDownloadId)) {
-      fileDeleted = await deleteDownloadFileById(removableDownloadId);
-    }
-    const status = consensus.block ? "flagged"
-      : (oldPolicyVtFlag ? (current.gated ? "allowed" : "done") : String(current.status || "done"));
-    const title = consensus.block
-      ? (fileDeleted ? "VT 权威引擎共识，文件已删除"
-        : (current.gated ? "VT 权威引擎共识，已拦截下载" : "VT 权威引擎共识检出可疑文件"))
-      : (oldPolicyVtFlag ? "检测完成" : current.title);
+    const { fields, consensus } = refreshedVtFields(current, { vt, pe, signature });
     const updated = writeLatestExeVt({
       ...current,
       stage: "vt",
-      status,
-      title,
-      vt,
+      ...fields,
       pe,
       signature,
       peSigned: !!(pe && pe.signed),
       peSigner,
       peSigTrust: (signature && signature.trust) || "",
-      guiUrl: vt.guiUrl || current.guiUrl || (VT_GUI_BASE + hash),
       tabId: Number.isInteger(tabId) && tabId >= 0 ? tabId : current.tabId,
-      allowed: consensus.block ? false : (oldPolicyVtFlag ? true : current.allowed),
-      allowRankDowngrade: oldPolicyVtFlag && !consensus.block,
       success: true
     });
-    const previouslyBlockedByVt = vtShouldHardBlock({ vt: current.vt || null }, {}).reason === "vt-trusted-consensus";
-    if (consensus.block && !previouslyBlockedByVt && Number.isInteger(tabId) && tabId >= 0) {
+    if (!updated) return { success: false, error: "stale-report" };
+    notifyRefreshedVt(current, updated, tabId, consensus);
+    return { success: true, vt, updated: true };
+  };
+
+  function notifyRefreshedVt(current, updated, tabId, consensus) {
+    const previouslyBlockedByVt = vtShouldHardBlock(current, {}).block;
+    // Recheck after the awaited lookup. Legacy records without a captured
+    // source may update file details, but cannot target whatever page is open.
+    const sourceScope = currentVtReportPageScope(updated, tabId);
+    if (consensus.block && !previouslyBlockedByVt && sourceScope) {
       try {
         chrome.tabs.sendMessage(tabId, {
           type: "show-page-threat-toast",
-          title: "VT 检出可疑安装包",
-          message: String(current.filename || "权威安全引擎检出该文件").slice(0, 240),
+          ...sourceScope,
+          title: "来源样本：VT 检出可疑安装包",
+          message: sampleMessage(current.filename).slice(0, 240),
           force: true
         }, { frameId: 0 }, () => { void chrome.runtime.lastError; });
       } catch { /* ignore */ }
       try {
         chrome.tabs.sendMessage(tabId, {
           type: "arm-page-download-guard",
+          ...sourceScope,
           reason: String(consensus.reason || "vt-trusted-consensus").slice(0, 80),
-          title: "VT 权威引擎共识检出，已禁用下载",
-          message: "下载文件被权威引擎共识检出恶意。请勿继续下载本站安装包。",
+          title: "来源样本：VT 检出，已禁用下载",
+          message: sampleMessage("来源样本检出恶意，请勿继续下载本站安装包。"),
           detail: String(current.filename || "").slice(0, 200),
           href: String(current.url || "").slice(0, 500),
           notify: true
         }, { frameId: 0 }, () => { void chrome.runtime.lastError; });
+      } catch { /* ignore */ }
+      try {
+        if (currentVtReportPageScope(updated, tabId) && typeof NS.markTabProtected === "function") {
+          NS.markTabProtected(tabId, sourceScope.sourcePageUrl, {
+            mode: "full", analysisTxn: sourceScope.sourceAnalysisTxn
+          });
+        }
       } catch { /* ignore */ }
     }
     try {
       chrome.runtime.sendMessage({
         type: "exe-vt-result",
         tabId: updated && updated.tabId,
-        vtInfo: updated || {
-          ...current,
-          vt,
-          pe,
-          signature,
-          peSigned: !!(pe && pe.signed),
-          peSigner,
-          peSigTrust: (signature && signature.trust) || ""
-        }
+        vtInfo: updated
       }, () => { void chrome.runtime.lastError; });
     } catch { /* ignore */ }
-    return { success: true, vt, updated: !!updated };
-  };
+  }
 
   NS.refreshStoredNestedSignatures = async function (sha256, tabId) {
     const parentHash = String(sha256 || "").toLowerCase().replace(/[^0-9a-f]/g, "");
@@ -6578,6 +5664,15 @@
     if (!current || (parentHash && String(current.sha256 || "").toLowerCase() !== parentHash)) {
       return { success: false, error: "stale-report" };
     }
+    if (tabKey && current.tabId !== tabId) {
+      return { success: false, error: "stale-report" };
+    }
+    // A hash alone does not identify a download transaction. A second
+    // download can have the same bytes, and a newer refresh can update this
+    // report while nested VT lookups are still pending.
+    const originalSnapshot = JSON.stringify(current);
+    const originalMemory = NS._latestExeVtMem;
+    const originalStorageKey = tabKey && stored[tabKey] ? tabKey : (stored.latestExeVt ? "latestExeVt" : "");
     const nested = Array.isArray(current.nested)
       ? current.nested.map((item) => ({ ...item, vt: item && item.vt ? { ...item.vt } : null }))
       : [];
@@ -6597,22 +5692,32 @@
     if (!pending.length) return { success: true, updated: false };
 
     await attachVtToNestedItems(nested, 30000);
+    const refreshedStore = await new Promise((resolve) => {
+      const keys = tabKey ? [tabKey, "latestExeVt"] : ["latestExeVt"];
+      try { chrome.storage.local.get(keys, (value) => resolve(value || {})); }
+      catch { resolve({}); }
+    });
+    const latest = (tabKey && refreshedStore[tabKey]) || refreshedStore.latestExeVt || NS._latestExeVtMem || null;
+    if (!latest || (originalStorageKey && !refreshedStore[originalStorageKey])
+      || (tabKey && latest.tabId !== tabId)
+      || JSON.stringify(latest) !== originalSnapshot
+      || (NS._latestExeVtMem !== originalMemory && NS._latestExeVtMem
+        && NS._latestExeVtMem.tabId === current.tabId)) {
+      return { success: false, error: "stale-report" };
+    }
     const signature = resolveDigitalSignature(current.pe || null, current.vt || null, nested);
+    const { fields, consensus } = refreshedVtFields(current, { nested, signature });
     const updated = writeLatestExeVt({
       ...current,
+      ...fields,
       nested,
       signature,
       peSigTrust: signature && signature.trust ? signature.trust : current.peSigTrust,
       tabId: Number.isInteger(tabId) && tabId >= 0 ? tabId : current.tabId,
       success: true
     });
-    try {
-      chrome.runtime.sendMessage({
-        type: "exe-vt-result",
-        tabId: updated && updated.tabId,
-        vtInfo: updated || { ...current, nested, signature }
-      }, () => { void chrome.runtime.lastError; });
-    } catch { /* ignore */ }
+    if (!updated) return { success: false, error: "stale-report" };
+    notifyRefreshedVt(current, updated, tabId, consensus);
     return { success: true, updated: !!updated };
   };
 
@@ -6626,7 +5731,7 @@
    * VT 查不到 / 失败：不拦死。
    */
   function vtShouldHardBlock(report, opts) {
-    const vt = report && report.vt;
+    const vt = report && nestedVtMatchesItem(report) ? report.vt : null;
     const trustedMalicious = vt ? (Number(vt.trustedMaliciousCount) || 0) : 0;
     const trustedSuspicious = vt ? (Number(vt.trustedSuspiciousCount) || 0) : 0;
     const trustedCount = (trustedMalicious + trustedSuspicious)
@@ -6727,12 +5832,25 @@
         return `${Date.now()}-${Number.isInteger(downloadId) ? downloadId : "download"}-${Math.random().toString(36).slice(2, 10)}`;
       })();
       let released = false;
+      let releasePromise = null;
       let pageUrl = "";
       let pageHost = "";
       let verifiedResponseUrl = "";
       let pageVtToastShown = false;
-      let downloadDeletePromise = null;
       let releasedDownloadId = null;
+      let previousPartial = null;
+      let partialClosed = false;
+      const sourceTxn = NS._activeRiskTxnByTab instanceof Map ? NS._activeRiskTxnByTab.get(tabId) : null;
+      const sourceTxnId = String(sourceTxn && sourceTxn.analysisTxn || "");
+      const sourceTxnUrl = String(sourceTxn && sourceTxn.url || "");
+      const sourceNavSeq = NS._riskNavigationSeqByTab instanceof Map ? NS._riskNavigationSeqByTab.get(tabId) : null;
+      const pageEffectsAllowed = () => {
+        const current = NS._activeRiskTxnByTab instanceof Map ? NS._activeRiskTxnByTab.get(tabId) : null;
+        return !!(sourceTxnId && sourceTxnUrl && current
+          && current.analysisTxn === sourceTxnId && current.url === sourceTxnUrl
+          && pageUrl === sourceTxnUrl
+          && (!(NS._riskNavigationSeqByTab instanceof Map) || NS._riskNavigationSeqByTab.get(tabId) === sourceNavSeq));
+      };
       // 本地下载探测代数：新下载递增，迟到的旧探测不得覆盖新结果
       const bumpProbeGen = (tid) => {
         if (!Number.isInteger(tid) || tid < 0) return 0;
@@ -6748,7 +5866,11 @@
       };
       const writeVt = (payload) => writeLatestExeVt({
         ...payload,
+        sampleOnly: true,
         tabId: payload.tabId != null ? payload.tabId : tabId,
+        sourceAnalysisTxn: sourceTxnId,
+        sourcePageUrl: sourceTxnUrl,
+        sourceNavigationSeq: sourceNavSeq,
         probeGen,
         probeId
       });
@@ -6790,44 +5912,42 @@
         } catch { /* ignore */ }
       };
 
-      const deleteVtDetectedDownload = () => {
-        if (gate || !Number.isInteger(downloadId)) return Promise.resolve(false);
-        if (!downloadDeletePromise) {
-          downloadDeletePromise = deleteDownloadFileById(downloadId);
-        }
-        return downloadDeletePromise;
-      };
-
       const showPageVtToast = (title, message) => {
+        if (!pageEffectsAllowed()) return;
         if (pageVtToastShown || tabId == null || !chrome.tabs || !chrome.tabs.sendMessage) return;
         pageVtToastShown = true;
         try {
           chrome.tabs.sendMessage(tabId, {
             type: "show-page-threat-toast",
-            title: String(title || "VT 检出可疑安装包").slice(0, 120),
-            message: String(message || filename || "权威安全引擎检出该文件").slice(0, 240),
+            sourceAnalysisTxn: sourceTxnId,
+            sourcePageUrl: sourceTxnUrl,
+            title: sampleTitle(title || "VT 检出可疑安装包").slice(0, 120),
+            message: sampleMessage(message || filename).slice(0, 240),
             force: true
           }, { frameId: 0 }, () => { void chrome.runtime.lastError; });
         } catch { /* ignore */ }
       };
 
-      /** VT 共识删盘后：通知来源页禁用下载按钮（仅 toast 不会 lock 页面） */
+      /** 来源样本命中 VT 共识：预防性禁用来源页下载，不宣称已核验/删除原文件。 */
       const armPageDownloadGuardFromVt = (hard, reportOpt) => {
+        if (!pageEffectsAllowed()) return;
         if (tabId == null || !chrome.tabs || !chrome.tabs.sendMessage) return;
         if (!hard || !hard.block) return;
         if (hard.reason !== "vt-trusted-consensus" && hard.reason !== "vt-nested-high-detection") return;
         try {
           const nestName = String((hard && hard.nestedName) || "").slice(0, 80);
           const detail = nestName
-            ? `包内 ${nestName} 被权威引擎共识检出恶意`
-            : "下载文件被权威引擎共识检出恶意";
+            ? `来源样本包内 ${nestName} 被权威引擎共识检出恶意`
+            : "来源样本被权威引擎共识检出恶意";
           chrome.tabs.sendMessage(tabId, {
             type: "arm-page-download-guard",
+            sourceAnalysisTxn: sourceTxnId,
+            sourcePageUrl: sourceTxnUrl,
             reason: String(hard.reason || "vt-trusted-consensus").slice(0, 80),
             title: hard.reason === "vt-trusted-consensus"
-              ? "VT 权威引擎共识检出，已禁用下载"
-              : "包内 VT 高检出，已禁用下载",
-            message: `${detail}。请勿继续下载本站安装包。`.slice(0, 240),
+              ? "来源样本：VT 共识检出，已禁用下载"
+              : "来源样本：包内 VT 高检出，已禁用下载",
+            message: sampleMessage(`${detail}。请勿继续下载本站安装包。`).slice(0, 240),
             detail,
             href: String(url || "").slice(0, 500),
             notify: true
@@ -6854,40 +5974,51 @@
       };
 
       const releaseDownload = () => {
-        if (!gate || released) return;
-        released = true;
-        try {
-          NS.grantVtPassUrl(url, 120000, probeId);
-          if (verifiedResponseUrl && verifiedResponseUrl !== url) {
-            NS.grantVtPassUrl(verifiedResponseUrl, 120000, probeId);
-          }
-          if (chrome.downloads && chrome.downloads.download) {
+        if (!gate) return Promise.resolve({ success: true });
+        // Share the exact request, including failures. A failed browser API
+        // call must not leave a false "allowed" state or trigger an automatic
+        // second replay from another completion path.
+        if (releasePromise) return releasePromise;
+        releasePromise = new Promise((resolve) => {
+          const fail = (error) => {
+            try { NS.revokeVtPassUrl(url, probeId); } catch { /* ignore */ }
+            try { if (verifiedResponseUrl && verifiedResponseUrl !== url) NS.revokeVtPassUrl(verifiedResponseUrl, probeId); } catch { /* ignore */ }
+            resolve({ success: false, error: String(error || "download-start-failed") });
+          };
+          try {
+            NS.grantVtPassUrl(url, 120000, probeId);
+            if (verifiedResponseUrl && verifiedResponseUrl !== url) {
+              NS.grantVtPassUrl(verifiedResponseUrl, 120000, probeId);
+            }
+            if (!chrome.downloads || typeof chrome.downloads.download !== "function") {
+              fail("downloads-api-unavailable");
+              return;
+            }
             chrome.downloads.download({
               url,
               filename: filename || undefined,
               conflictAction: "uniquify",
               saveAs: false
             }, (newDownloadId) => {
-              if (chrome.runtime.lastError) {
-                try { NS.revokeVtPassUrl(url, probeId); } catch { /* ignore */ }
-                try { if (verifiedResponseUrl && verifiedResponseUrl !== url) NS.revokeVtPassUrl(verifiedResponseUrl, probeId); } catch { /* ignore */ }
+              const error = chrome.runtime.lastError;
+              if (error || !Number.isInteger(newDownloadId) || newDownloadId < 0) {
+                fail(error && error.message || "download-id-missing");
                 return;
               }
+              released = true;
               rememberReleasedDownloadId(newDownloadId);
+              resolve({ success: true, downloadId: newDownloadId });
             });
-          } else {
-            try { NS.revokeVtPassUrl(url, probeId); } catch { /* ignore */ }
-            try { if (verifiedResponseUrl && verifiedResponseUrl !== url) NS.revokeVtPassUrl(verifiedResponseUrl, probeId); } catch { /* ignore */ }
+          } catch (error) {
+            fail(error && error.message);
           }
-        } catch {
-          try { NS.revokeVtPassUrl(url, probeId); } catch { /* ignore */ }
-          try { if (verifiedResponseUrl && verifiedResponseUrl !== url) NS.revokeVtPassUrl(verifiedResponseUrl, probeId); } catch { /* ignore */ }
-        }
+        });
+        return releasePromise;
       };
 
       const writePartial = (stage, pr) => {
         try {
-          if (!probeIsCurrent()) return;
+          if (partialClosed) return;
           pr = pr || {};
           if (pr.responseUrl) verifiedResponseUrl = String(pr.responseUrl || "");
           const pe = pr.pe || null;
@@ -6897,11 +6028,13 @@
             (sig && sig.signer) || (pe && pe.signerHint) || (vt && vt.signerFromVt) || ""
           );
           // 合并包内列表：外壳 VT 阶段绝不可用 [] 冲掉已展示的包内文件
-          const prevMem = NS._latestExeVtMem;
+          // Partial data belongs to this download, never to another task at the same URL.
+          const prevMem = previousPartial;
           const nestedFromPr = Array.isArray(pr.nested) ? pr.nested : null;
           const nestedMerged = nestedFromPr != null
             ? nestedFromPr
-            : (prevMem && prevMem.url === url && Array.isArray(prevMem.nested) ? prevMem.nested : []);
+            : (prevMem && Array.isArray(prevMem.nested) ? prevMem.nested : []);
+          previousPartial = { ...prevMem, ...pr, nested: nestedMerged };
           const looksArchive = reportLooksLikeArchiveShell({
             kind: pr.kind,
             filename: filename || pr.filename,
@@ -6909,7 +6042,7 @@
             pe
           }) || /\.(?:zip|rar|7z|cab|iso)(?:\?|#|$)/i.test(filename || "");
 
-          // VT 阶段：裸 PE 可写成完成态；压缩包还要等包内 VT，禁止用外壳「无」提前放行
+          // VT 中间阶段不能放行：仍须等待最终报告（包括签名、包内检测）。
           if (stage === "vt") {
             const hardEarly = vtShouldHardBlock({ ...pr, nested: nestedMerged }, {
               requireSignedPe: !!(opts && opts.requireSignedPe)
@@ -6957,9 +6090,9 @@
                   ? "已拦截未签名安装包"
                   : "VT 检出，已拦截下载";
               } else {
-                st = "allowed";
-                title = "未达拦截阈值，已放行下载";
-                releaseDownload();
+                st = "checking";
+                allowed = false;
+                title = "样本检测尚未完成（下载待处理）";
               }
             } else if (hardEarly.block) {
               st = "flagged";
@@ -6969,12 +6102,7 @@
                 : (hardEarly.reason === "vt-trusted-consensus"
                   ? "VT 权威引擎共识检出"
                   : "VT 检出可疑安装包");
-              // 仅权威引擎 ≥3 共识才 removeFile；总检出高 / 2 家引擎：不删盘、不 cancel 已完成项
-              if (hardEarly.deleteFile === true && hardEarly.reason === "vt-trusted-consensus") {
-                void deleteVtDetectedDownload();
-                title = "VT 权威引擎共识检出，文件已删除";
-              }
-              // nested-high：只标记，保留用户已下载文件
+              // 来源样本不等于原文件：所有命中都保留本地文件。
             }
             if (hardEarly.block && (hardEarly.reason === "vt-trusted-consensus"
               || hardEarly.reason === "vt-nested-high-detection")) {
@@ -7062,7 +6190,6 @@
           }
           pageUrl = ctx.pageUrl || "";
           pageHost = ctx.pageHost || "";
-          if (!probeIsCurrent()) return;
 
           writeVt({
             status: "checking",
@@ -7099,12 +6226,15 @@
             90000,
             null
           );
-          if (!probeIsCurrent()) return;
+          partialClosed = true;
           if (!report) {
+            const restart = gate ? await releaseDownload() : null;
             writeVt({
               status: "error",
-              title: "检测超时",
-              message: "检测超时，请配置 API Key 后重试",
+              title: restart && !restart.success ? "下载重新发起失败" : "检测超时",
+              message: restart && !restart.success
+                ? `检测超时，且未能重新发起下载：${restart.error}。请手动重试下载。`
+                : "检测超时，请配置 API Key 后重试",
               filename,
               url,
               pageUrl,
@@ -7113,10 +6243,9 @@
               downloadId,
               releasedDownloadId,
               gated: gate,
-              allowed: !gate,
+              allowed: !gate || !!(restart && restart.success),
               success: false
             });
-            if (gate) releaseDownload();
             return;
           }
           if (report.responseUrl && !report.responseMismatch) verifiedResponseUrl = String(report.responseUrl || "");
@@ -7148,6 +6277,7 @@
           let status = "done";
           let title = "安装包/压缩包检测";
           let finalMsg = message;
+          let restart = null;
           if (bestNestFinal && bestNestFinal.mal >= 1) {
             title = `包内检出恶意（${bestNestFinal.name}）`;
           } else if (nestedVtUseful) {
@@ -7167,7 +6297,7 @@
             status = "error";
             title = "下载响应无法验证";
             finalMsg = report.error || "重新获取的响应与下载文件不一致";
-            if (gate && !released) releaseDownload();
+            if (gate && !released) restart = await releaseDownload();
           } else if (gate) {
             if (hard.block) {
               allowed = false;
@@ -7189,15 +6319,15 @@
                 : (vtObj && vtObj.found === true
                   && (Number(vtObj.malicious) || 0) < 3
                   && (Number(vtObj.suspicious) || 0) < 5);
-              title = vtClean ? "未发现高危，已放行下载" : "未达拦截阈值，已放行下载";
+              title = vtClean ? "未发现高危，重新发起下载" : "未达拦截阈值，重新发起下载";
               finalMsg = message || "未发现高危检出";
               if (!released) {
-                finalMsg += " · 正在开始下载…";
-                releaseDownload();
+                restart = await releaseDownload();
+                if (restart.success) finalMsg += " · 已重新发起下载";
               }
             }
           } else if (hard.block) {
-            // 非门禁：仅「权威引擎 ≥3 共识」删盘；包内总检出高只标红，不碰磁盘
+            // 非门禁只警告来源样本，不碰未经字节绑定的磁盘文件。
             allowed = false;
             status = "flagged";
             title = hard.reason === "vt-nested-high-detection"
@@ -7205,11 +6335,19 @@
               : (hard.reason === "vt-trusted-consensus"
                 ? "VT 权威引擎共识检出"
                 : "VT 检出可疑安装包");
-            // 删盘：仅权威引擎 ≥3 共识；禁止用 cancel 清进行中下载（用户会当成「文件被删」）
-            if (hard.deleteFile === true && hard.reason === "vt-trusted-consensus") {
-              void deleteVtDetectedDownload();
-              title = "VT 权威引擎共识检出，文件已删除";
-            }
+          }
+
+          if (!hard.block && report.partialScan && !report.sha256 && !(report.nested || []).length) {
+            status = "unscanned";
+            title = "文件未完整读取，检测未完成";
+            finalMsg = report.archiveNote || report.error || "文件未完整读取，未生成 SHA256，未查询 VT";
+          }
+
+          if (restart && !restart.success) {
+            allowed = false;
+            status = "error";
+            title = "下载重新发起失败";
+            finalMsg = `浏览器未能重新发起下载：${restart.error}。请手动重试下载。`;
           }
 
           if (hard.block && (hard.reason === "vt-trusted-consensus"
@@ -7261,6 +6399,7 @@
             })) : [],
             archiveNote: report.archiveNote || "",
             archiveFormat: report.archiveFormat || "",
+            partialScan: report.partialScan === true,
             nestedVtPrimary: report.nestedVtPrimary || null,
             signature: report.signature || null,
             risks: riskLines,
@@ -7272,7 +6411,7 @@
             trustedSource: !!(opts && opts.trustedSource),
             gated: gate,
             allowed,
-            success: !!report.success
+            success: !!report.success && !(restart && !restart.success)
           });
           // A newer refresh/re-download may have invalidated this probe while
           // it was reading bytes or querying VT. Never let a rejected stale
@@ -7292,13 +6431,15 @@
                 filename,
                 kind: report.kind,
                 sha256: report.sha256,
+                sampleOnly: true,
+                downloadIdentityVerified: false,
                 pe: report.pe,
                 nested: report.nested,
                 nestedVtPrimary: report.nestedVtPrimary || null,
                 signature: report.signature,
                 vt: report.vt,
                 risks: riskLines,
-                message: finalMsg,
+                message: finalVtEntry.message,
                 guiUrl,
                 status,
                 allowed
@@ -7308,7 +6449,7 @@
 
           if ((!allowed || hard.block) && typeof NS.showBlockedNotification === "function") {
             try {
-              await NS.showBlockedNotification(title, finalMsg || filename, tabId);
+              await NS.showBlockedNotification(finalVtEntry.title, finalVtEntry.message, tabId);
             } catch { /* ignore */ }
           }
           if (!probeIsCurrent()) return;
@@ -7318,8 +6459,10 @@
             try {
               chrome.storage.local.set({
                 latestNotice: {
-                  title,
-                  message: finalMsg || filename,
+                  title: finalVtEntry.title,
+                  message: finalVtEntry.message,
+                  sampleOnly: true,
+                  downloadIdentityVerified: false,
                   tabId,
                   url: pageUrl || url,
                   guardKind: "package",

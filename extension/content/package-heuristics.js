@@ -67,16 +67,18 @@
     if (!href || typeof href !== "string") return false;
     const trimmed = href.trim();
     if (!trimmed || /^(javascript:|#|data:|blob:|mailto:|tel:)/i.test(trimmed)) return false;
-    if (NS.looksLikeSvgPathOrNumericJunkName(trimmed) || NS.looksLikeSvgPathOrNumericJunkName(NS.normalizeFileName(trimmed))) return false;
     try {
       const u = new URL(trimmed, location.href);
-      const base = NS.normalizeFileName(u.pathname);
-      if (PACKAGE_EXT.test(u.pathname)) return NS.isPlausiblePackageFileName(base);
+      const pathPackage = PACKAGE_EXT.test(u.pathname);
+      const phpPackage = /\.php(?:\/|$)/i.test(u.pathname) && PACKAGE_EXT.test(u.href);
+      if (!pathPackage && !u.search && !phpPackage) return false;
+      if (NS.looksLikeSvgPathOrNumericJunkName(trimmed) || NS.looksLikeSvgPathOrNumericJunkName(NS.normalizeFileName(trimmed))) return false;
+      if (pathPackage) return NS.isPlausiblePackageFileName(NS.normalizeFileName(u.pathname));
       for (const key of ["filename", "file", "name", "downurl", "downloadurl", "path"]) {
         const v = u.searchParams.get(key) || "";
         if ((PACKAGE_NAME.test(v) || PACKAGE_EXT.test(v)) && NS.isPlausiblePackageFileName(v)) return true;
       }
-      if (/\.php(?:\/|$)/i.test(u.pathname) && PACKAGE_EXT.test(u.href)) return NS.isPlausiblePackageFileName(base) || NS.isPlausiblePackageFileName(NS.normalizeFileName(u.href));
+      if (phpPackage) return NS.isPlausiblePackageFileName(NS.normalizeFileName(u.pathname)) || NS.isPlausiblePackageFileName(NS.normalizeFileName(u.href));
       return false;
     } catch {
       return false;
@@ -734,31 +736,29 @@
     }
   };
 
-  NS.looksLikeOfficialProductDownloadEndpoint = function (href, pageHostSpoofHint) {
+  NS.looksLikeOfficialProductDownloadEndpoint = function (href, pageHostSpoofHint, allowPageTrustLookup = true) {
     if (!href || /^(javascript:|#|data:|blob:|mailto:|tel:)/i.test(href)) return false;
     try {
-      const pageHostSpoof = typeof pageHostSpoofHint === "boolean"
-        ? pageHostSpoofHint
-        : (typeof NS.hostLooksLikeBrandMarketingSpoof === "function" && NS.hostLooksLikeBrandMarketingSpoof());
-      if (pageHostSpoof) return false;
+      if (pageHostSpoofHint === true) return false;
       const u = new URL(href, location.href);
-      if (!NS.isSamePageBrandApex(u.href)) return false;
+      const pageAllowsEndpoint = () => NS.isSamePageBrandApex(u.href)
+        && (pageHostSpoofHint === false || !NS.hostLooksLikeBrandMarketingSpoof?.());
       const path = (u.pathname || "").toLowerCase().replace(/\/+$/, "") || "/";
       const base = (path.split("/").filter(Boolean).pop() || "").split("?")[0];
       if (/^(?:\d{2,}down|down\d{2,}|dl\d{2,}|getfile|getdown)$/i.test(base.replace(/\.[^.]+$/, ""))) return false;
-      if (/^\/(?:win|windows|mac|osx|macos|linux|android|ios|pc|desktop)(?:\/(?:d|dl|download|get|installer?))?$/i.test(path)) return true;
-      if (/^\/(?:download|downloads|getclient|getapp|client)(?:\/[a-z0-9._-]{0,32})?$/i.test(path)) return true;
+      if (/^\/(?:win|windows|mac|osx|macos|linux|android|ios|pc|desktop)(?:\/(?:d|dl|download|get|installer?))?$/i.test(path)) return pageAllowsEndpoint();
+      if (/^\/(?:download|downloads|getclient|getapp|client)(?:\/[a-z0-9._-]{0,32})?$/i.test(path)) return pageAllowsEndpoint();
       const bareDownloadPhp = /^(?:download|down|getdown|getfile)\.(?:php|asp|aspx|jsp)$/i.test(base);
       if (/\.(php|asp|aspx|jsp)$/i.test(base)) {
-        if (bareDownloadPhp) return typeof NS.isTrustedOfficialDownloadContext === "function" && NS.isTrustedOfficialDownloadContext() && !NS.hostLooksLikeBrandMarketingSpoof();
-        if (/^download[a-z0-9._-]+\./i.test(base)) return true;
-        if (/^get(?:file|down|soft|client|setup|installer)[a-z0-9._-]*\./i.test(base)) return true;
-        if (/\/(?:product|products|download|soft|client|support)\/[^?#]*download/i.test(path)) return true;
-        if (/\/download\/[a-z0-9._-]+\.(php|asp|aspx|jsp)$/i.test(path) && !/[a-f0-9]{12,}/i.test(path)) return true;
+        if (bareDownloadPhp) return allowPageTrustLookup && pageAllowsEndpoint() && !!NS.isTrustedOfficialDownloadContext?.();
+        if (/^download[a-z0-9._-]+\./i.test(base)) return pageAllowsEndpoint();
+        if (/^get(?:file|down|soft|client|setup|installer)[a-z0-9._-]*\./i.test(base)) return pageAllowsEndpoint();
+        if (/\/(?:product|products|download|soft|client|support)\/[^?#]*download/i.test(path)) return pageAllowsEndpoint();
+        if (/\/download\/[a-z0-9._-]+\.(php|asp|aspx|jsp)$/i.test(path) && !/[a-f0-9]{12,}/i.test(path)) return pageAllowsEndpoint();
       }
-      if (NS.isPackageFileUrl(u.href)) {
+      if ((u.search || PACKAGE_EXT.test(u.pathname) || PACKAGE_EXT.test(u.href)) && NS.isPackageFileUrl(u.href)) {
         const fn = NS.getFilenameFromUrl(u.href);
-        if (NS.looksLikeProductPackageName(fn) && !NS.looksLikeObjectStoragePackageUrl(u.href)) return true;
+        if (NS.looksLikeProductPackageName(fn) && !NS.looksLikeObjectStoragePackageUrl(u.href)) return pageAllowsEndpoint();
       }
       return false;
     } catch {
@@ -906,6 +906,21 @@
     return "";
   };
 
+  NS.packageEvidenceHtml = function (source) {
+    // HTML 注释不是有效下载入口；保留脚本、真实链接及事件处理器。
+    let html = String(source || "").replace(
+      /<script\b[^>]*>[\s\S]*?(?:<\/script\s*>|$)|<!--[\s\S]*?(?:-->|$)/gi,
+      (part) => part.startsWith("<!--") ? "" : part);
+    if (typeof NS.pageLooksLikeInteractiveNetworkUtility === "function"
+      && NS.pageLooksLikeInteractiveNetworkUtility()) {
+      // 仅移除测速下拉选项的样本值，不移除 select/option 上的下载事件。
+      html = html.replace(/<script\b[^>]*>[\s\S]*?(?:<\/script\s*>|$)|<option\b[^>]*>/gi,
+        (tag) => /^<script\b/i.test(tag) ? tag : tag.replace(
+          /\svalue\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, ""));
+    }
+    return html;
+  };
+
   NS.collectAllPagePackageHrefs = function () {
     const set = new Set();
     const MAX = 80;
@@ -945,7 +960,7 @@
       } catch { /* ignore */ }
     }
     if (!archiveHeavy) {
-      try { NS.extractPackageUrlFromHandlerText(NS.getThreatScanHtml(80000)).forEach(add); } catch { /* ignore */ }
+      try { NS.extractPackageUrlFromHandlerText(NS.packageEvidenceHtml(NS.getThreatScanHtml(80000))).forEach(add); } catch { /* ignore */ }
     }
     return Array.from(set);
   };
@@ -1073,6 +1088,8 @@
 
   NS.disableAllDownloadIntentControls = function () {
     const state = NS.state;
+    // A pending/rejected soft verdict doesn't own a page-wide DOM lock.
+    if (!state.downloadGuardInstalled && !NS.hasRealHardKitThreat?.()) return;
     const seen = new Set();
     const disableEl = (el) => {
       if (!el || seen.has(el)) return;
@@ -1108,6 +1125,7 @@
               if (NS.isDownloadIntentElement(el)
                 || (t.length > 0 && t.length < 40 && /下载|安装|客户端|Download/i.test(t))
                 || /\.(?:exe|zip|msi|apk|dmg)(?:\?|$)/i.test(href)) {
+                (NS.parentLockedFrameControls ??= new WeakSet()).add(el);
                 disableEl(el);
               }
             } catch { /* ignore */ }
@@ -1163,7 +1181,7 @@
     const state = NS.state;
     let found = null;
     try {
-      const html = NS.getHtmlSlice(120000);
+      const html = NS.packageEvidenceHtml(NS.getHtmlSlice(120000));
       const safeOfficial = NS.looksLikeSafeOfficialContext() || NS.looksLikeMatureOfficialPortal();
       const pkgRe = /([A-Za-z][A-Za-z0-9._-]{2,80}\.(?:zip|exe|apk|msi|dmg|rar|7z))(?:\b|(?=[?"'#\s<>]))/gi;
       let m;

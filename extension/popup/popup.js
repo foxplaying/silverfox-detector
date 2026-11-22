@@ -5,7 +5,7 @@
   "use strict";
 
   const VT_TRUST_POLICY_VERSION = 4;
-  const VT_STATS_POLICY_VERSION = 3;
+  const VT_STATS_POLICY_VERSION = 4;
   /** 与 background pe-vt-bg 加权表一致：group 去重；Avast/AVG 同组 */
   const VT_ENGINE_WEIGHT_TABLE = [
     { id: "Kaspersky", group: "kaspersky", weight: 3, re: /^Kaspersky(?:\s|$|\.)/i },
@@ -96,16 +96,29 @@
     return /^[a-f0-9]{64}$/.test(hash) ? hash : "";
   }
 
+  function popupHasVtEvidence(vt) {
+    return !!(vt && (vt.found != null || vt.notFound === true || !!vt.hash
+      || Number(vt.total) > 0 || Number(vt.malicious) > 0 || Number(vt.suspicious) > 0
+      || !!vt.sigTrustFromVt || !!vt.signerFromVt));
+  }
+
+  // No hash and no report is an unperformed query, not evidence of another file.
+  // Also recognize older stored reports which only carried unknown + skipped PE.
+  function popupVtNotQueried(vtInfo) {
+    if (!vtInfo || normalizePopupSha256(vtInfo.sha256) || popupHasVtEvidence(vtInfo.vt)) return false;
+    const vt = vtInfo.vt;
+    const pe = vtInfo.pe;
+    return !!((vt && (vt.queryState === "not-requested" || vt.unknown === true))
+      || (pe && pe.skipped === true && /too-large|incomplete|not-read/i.test(String(pe.reason || ""))));
+  }
+
   /** 有 VT 派生结论时，外层文件与 VT 结果必须以双方完整 SHA-256 绑定。 */
   function popupVtIdentityUnbound(vtInfo) {
     const vt = vtInfo && vtInfo.vt;
     if (!vt) return false;
     const outerHash = normalizePopupSha256(vtInfo && vtInfo.sha256);
     const vtHash = normalizePopupSha256(vt.hash);
-    const hasVtDerivedState = vt.found != null || vt.notFound === true || vt.unknown === true
-      || Number(vt.total) > 0 || Number(vt.malicious) > 0 || Number(vt.suspicious) > 0
-      || !!vt.sigTrustFromVt || !!vt.signerFromVt;
-    if (!hasVtDerivedState) return false;
+    if (!popupHasVtEvidence(vt)) return false;
     return !outerHash || !vtHash || outerHash !== vtHash;
   }
 
@@ -113,7 +126,7 @@
   function popupVtHashMismatch(vtInfo) {
     const vt = vtInfo && vtInfo.vt;
     if (popupVtIdentityUnbound(vtInfo)) return true;
-    return !!(vt && vt.found === true && Number(vt.statsPolicyVersion) !== 3);
+    return !!(vt && vt.found === true && Number(vt.statsPolicyVersion) !== VT_STATS_POLICY_VERSION);
   }
 
   function popupNestedVtMatchesItem(item) {
@@ -122,7 +135,7 @@
     const vtHash = normalizePopupSha256(vt && vt.hash);
     if (!itemHash || !vtHash || itemHash !== vtHash) return false;
     // 只有 found 报告带统计口径；notFound/unknown 只要求文件身份精确绑定。
-    return vt.found !== true || Number(vt.statsPolicyVersion) === 3;
+    return vt.found !== true || Number(vt.statsPolicyVersion) === VT_STATS_POLICY_VERSION;
   }
 
   function popupNestedSignatureTrust(item) {
@@ -134,80 +147,11 @@
     return String(item.trust || item.sigTrust || (item.signed ? "present" : "none")).toLowerCase();
   }
 
-  function sslValidationRank(infoOrValidation) {
-    const value = typeof infoOrValidation === "object"
-      ? infoOrValidation && infoOrValidation.validation
-      : infoOrValidation;
-    const validation = String(value || "").toUpperCase();
-    if (validation === "EV") return 3;
-    if (validation === "OV") return 2;
-    if (validation === "DV") return 1;
-    return 0;
-  }
-
-  function sslInfoHostKey(info) {
-    return String((info && (info.host || info.queriedHost)) || "")
-      .toLowerCase().replace(/\.$/, "").replace(/^www\./, "");
-  }
-
-  function isBogusSslOrganization(org) {
-    return /internet\s*widgits|some[-\s]?state|default\s+company/i.test(String(org || ""));
-  }
-
-  function usableSslOrganization(info) {
-    const org = String((info && info.organization) || "").trim();
-    if (!org || isBogusSslOrganization(org)) return "";
-    return org;
-  }
-
-  function effectiveSslValidationRank(info) {
-    const rank = sslValidationRank(info);
-    const org = String((info && info.organization) || "").trim();
-    return rank >= 2 && org && isBogusSslOrganization(org) ? 0 : rank;
-  }
-
-  function sslCertificateIdentity(info) {
-    const fingerprint = String((info && (info.fingerprintSha256 || info.fingerprint)) || "")
-      .toLowerCase().replace(/[^a-f0-9]/g, "");
-    if (fingerprint.length >= 32) return `fp:${fingerprint}`;
-    const certId = String((info && (info.certId || info.certificateId)) || "").trim();
-    return certId ? `id:${certId}` : "";
-  }
-
-  /** Popup 也执行单调升级，防止 runtime/storage 异步回调中的旧 DV 把 OV/EV 画回去。 */
+  /** Use the same certificate-bound precedence as background/content. */
   function chooseStrongerSslInfo(previous, incoming) {
-    if (!previous) return incoming || null;
-    if (!incoming) return previous || null;
-    const previousHost = sslInfoHostKey(previous);
-    const incomingHost = sslInfoHostKey(incoming);
-    if (previousHost && incomingHost && previousHost !== incomingHost) return incoming;
-    const previousRank = effectiveSslValidationRank(previous);
-    const incomingRank = effectiveSslValidationRank(incoming);
-    if (previousRank !== incomingRank) return incomingRank > previousRank ? incoming : previous;
-    const quality = (info) => {
-      let score = 0;
-      if (usableSslOrganization(info)) score += 8;
-      if (info && info.sniChainVerified === true) score += 4;
-      if (info && info.liveTlsLeafVerified === true) score += 4;
-      if (info && info.unexpiredHostVerified === true) score += 2;
-      if (!/^(?:https-reachability|page-https|https-assumed)$/i.test(String((info && info.source) || ""))) score += 1;
-      return score;
-    };
-    const primary = quality(incoming) >= quality(previous) ? incoming : previous;
-    const secondary = primary === incoming ? previous : incoming;
-    const primaryIdentity = sslCertificateIdentity(primary);
-    const secondaryIdentity = sslCertificateIdentity(secondary);
-    if (primaryIdentity && primaryIdentity === secondaryIdentity) {
-      return {
-        ...secondary,
-        ...primary,
-        organization: usableSslOrganization(primary) || usableSslOrganization(secondary),
-        sniChainVerified: primary.sniChainVerified === true || secondary.sniChainVerified === true,
-        liveTlsLeafVerified: primary.liveTlsLeafVerified === true || secondary.liveTlsLeafVerified === true,
-        unexpiredHostVerified: primary.unexpiredHostVerified === true || secondary.unexpiredHostVerified === true
-      };
-    }
-    return { ...primary };
+    return globalThis.SilverfoxSslEvidence
+      ? globalThis.SilverfoxSslEvidence.choose(previous, incoming)
+      : incoming || previous || null;
   }
 
   class PopupRenderer {
@@ -215,7 +159,7 @@
       this.root = root;
       this.activeTabId = null;
       this.activeTabUrl = "";
-      /** 同 tab 最近一次「已完成」报告，防止中间态 analysisComplete:false 把 UI 打回「正在分析」 */
+      /** Latest merged snapshot per tab, including explicit unknown outcomes. */
       this._lastCompletedByTab = new Map();
       this._activeRiskTxnByTab = new Map();
       /**
@@ -227,6 +171,7 @@
       this._riskReportWakeRequests = new Set();
       this._vtDetailsRefreshes = new Set();
       this._nestedSignatureRefreshes = new Set();
+      this._refreshRetryCounts = new Map();
       this._renderRequestSeq = 0;
     }
 
@@ -240,7 +185,7 @@
       }
     }
 
-    /** 合并：新消息 incomplete 时，同主机沿用上次完成报告并合并情报字段 */
+    /** Only reports for the same URL and analysis transaction can share evidence. */
     coalesceReport(data, tabUrl) {
       if (!data) return null;
       const tabId = this.activeTabId;
@@ -269,86 +214,13 @@
           url: reportUrl
         });
       }
-      // Identity-source failure is an explicit unresolved terminal.  Do not
-      // coalesce it with a previously completed clean snapshot from the same
-      // transaction; doing so was the remaining path to a misleading 0 score
-      // after Edge froze/restored a tab.
-      if (data.identityVerificationUnavailable === true) {
-        if (tabId != null) this._lastCompletedByTab.delete(tabId);
-        return { ...data, analysisComplete: false };
-      }
-      const completed = this.isCompletedReport(data);
-      if (completed) {
-        let next = { ...data, url: data.url || tabUrl, analysisComplete: true };
-        const prev = tabId != null ? this._lastCompletedByTab.get(tabId) : null;
-        if (prev && this.isCompletedReport(prev)) {
-          if (samePopupRiskTransaction(prev, next)
-            && urlsMatch(prev.url || tabUrl, next.url || tabUrl)) {
-            const sslInfo = /^https:/i.test(String(next.url || tabUrl || ""))
-              ? chooseStrongerSslInfo(prev.sslInfo, next.sslInfo)
-              : (next.sslInfo || null);
-            const prevAt = Number(prev.timestamp) || 0;
-            const nextAt = Number(next.timestamp) || 0;
-            next = prevAt && nextAt && nextAt < prevAt
-              ? { ...prev, sslInfo }
-              : { ...next, sslInfo };
-            // 同主机的新完成报告仍明确是品牌仿冒时，禁止无名报告覆盖已有具名结论。
-            const nextHasBrandRisk = !!(next.brandSpoofPortal
-              || (Array.isArray(next.details) && next.details.some((d) => /仿冒品牌官网|主动探测仿冒/i.test(d?.name || ""))));
-            if (nextHasBrandRisk && !next.spoofBrand && prev.spoofBrand) {
-              next = { ...next, spoofBrand: prev.spoofBrand };
-            }
-          }
-        }
-        if (tabId != null) this._lastCompletedByTab.set(tabId, next);
-        return next;
-      }
+      const next = { ...data, url: reportUrl, analysisComplete:
+        data.identityVerificationUnavailable !== true && this.isCompletedReport(data) };
       const prev = tabId != null ? this._lastCompletedByTab.get(tabId) : null;
-      if (!prev || !this.isCompletedReport(prev)) return data;
-      if (samePopupRiskTransaction(prev, data)
-        && urlsMatch(prev.url || tabUrl, data.url || tabUrl)) {
-        const riskRank = { low: 0, medium: 1, high: 2 };
-        const prevRisk = String(prev.riskLevel || "low");
-        const nextRisk = String(data.riskLevel || "low");
-        const mergeList = (a, b, keyOf) => {
-          const out = [];
-          const seen = new Set();
-          for (const item of [...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])]) {
-            const key = keyOf(item);
-            if (!key || seen.has(key)) continue;
-            seen.add(key);
-            out.push(item);
-          }
-          return out;
-        };
-        const merged = {
-          ...prev,
-          ...data,
-          analysisComplete: true,
-          icpInfo: data.icpInfo || prev.icpInfo,
-          icpForcedMissing: Object.prototype.hasOwnProperty.call(data, "icpForcedMissing")
-            ? data.icpForcedMissing === true
-            : prev.icpForcedMissing === true,
-          whoisInfo: data.whoisInfo || prev.whoisInfo,
-          sslInfo: /^https:/i.test(String(tabUrl || data.url || prev.url || ""))
-            ? chooseStrongerSslInfo(prev.sslInfo, data.sslInfo)
-            : (data.sslInfo || null),
-          score: Math.max(Number(prev.score) || 0, Number(data.score) || 0),
-          riskLevel: (riskRank[nextRisk] || 0) >= (riskRank[prevRisk] || 0) ? nextRisk : prevRisk,
-          downloadGuardInstalled: !!(prev.downloadGuardInstalled || data.downloadGuardInstalled),
-          packageBlocked: !!(prev.packageBlocked || data.packageBlocked),
-          brandSpoofPortal: !!(prev.brandSpoofPortal || data.brandSpoofPortal),
-          spoofBrand: data.spoofBrand || prev.spoofBrand || "",
-          details: mergeList(data.details, prev.details, (d) =>
-            `${d?.name || ""}::${d?.reason || ""}::${d?.weight ?? ""}`),
-          protectedTargets: mergeList(data.protectedTargets, prev.protectedTargets, (t) => String(t || "")),
-          timestamp: data.timestamp || prev.timestamp,
-          url: tabUrl || data.url || prev.url
-        };
-        if (tabId != null) this._lastCompletedByTab.set(tabId, merged);
-        return merged;
-      }
-      return data;
+      const result = prev && samePopupRiskTransaction(prev, next) && urlsMatch(prev.url, reportUrl)
+        ? globalThis.SilverfoxRiskReport.merge(prev, next, chooseStrongerSslInfo) : next;
+      if (tabId != null && txn) this._lastCompletedByTab.set(tabId, result);
+      return result;
     }
 
     clearRoot() { while (this.root.firstChild) this.root.removeChild(this.root.firstChild); }
@@ -418,7 +290,7 @@
     appendIcp(data) {
       if (!data || !data.icpInfo) return;
       const raw = String(data.icpInfo);
-      // 只有取得可展示的组织字段，才用组织证书隐藏「未查询到备案信息」
+      if (globalThis.SilverfoxSslEvidence?.hidesMissingIcp(data.sslInfo, raw)) return;
       if (/未查询到|查询失败|暂无/.test(raw)
         && data.icpForcedMissing !== true
         && this.isDisplayableOrganizationSsl(data.sslInfo)) return;
@@ -486,8 +358,9 @@
       const peObj = vtInfo.pe || null;
       const rawVt = vtInfo.vt || null;
       const vtStatsPolicyStale = !!(rawVt && rawVt.found === true
-        && Number(rawVt.statsPolicyVersion) !== 3);
+        && Number(rawVt.statsPolicyVersion) !== VT_STATS_POLICY_VERSION);
       const vtHashMismatch = popupVtHashMismatch(vtInfo);
+      const vtNotQueried = popupVtNotQueried(vtInfo);
       // Never render or act on statistics that belong to another file.
       const vt = vtHashMismatch ? null : rawVt;
       // hash 不匹配时，所有可能由 VT 回填的派生状态都隔离；只保留本地 PE 证书表粗检。
@@ -533,14 +406,16 @@
       const sha = String(vtInfo.sha256 || "").trim();
       const normalizedOuterSha = normalizePopupSha256(sha);
       const guiUrl = String(
-        vtHashMismatch
+        vtNotQueried ? "" : vtHashMismatch
           ? (normalizedOuterSha ? ("https://www.virustotal.com/gui/file/" + normalizedOuterSha) : "")
           : (vtInfo.guiUrl || (vt && vt.guiUrl) || "")
       ).trim();
       const title = vtHashMismatch
         ? (vtStatsPolicyStale ? "VT 旧缓存待重新查询" : "VT 数据与当前文件不匹配，待重新查询")
-        : String(vtInfo.title || "").trim();
+        : (vtNotQueried && !nested.length ? "文件未完整读取，检测未完成" : String(vtInfo.title || "").trim());
       const trustedSource = vtInfo.trustedSource === true;
+      // Older URL-probe records also contain a network sample, never disk bytes.
+      const sampleOnly = vtInfo.sampleOnly === true || /^https?:\/\//i.test(vtInfo.url || "");
 
       // 状态行（检测中必须一直显示，直到有明确结果）
       const isChecking = status === "checking" || status === "uploading";
@@ -557,14 +432,14 @@
             || (status === "uploading"
               ? `正在上传 ${filename}…`
               : `正在 VT 检测 ${filename}…`);
-        } else if (vtHashMismatch) {
+        } else if (vtHashMismatch || (vtNotQueried && !nested.length)) {
           sp.className = "vt-warn";
           sp.textContent = title;
         } else if (status === "blocked" || (vtInfo.allowed === false && status !== "done" && status !== "allowed")) {
           sp.className = "vt-bad";
           sp.textContent = junkTitle ? "已完成检测" : (title || "已拦截");
         } else if (status === "allowed") {
-          sp.className = "vt-ok";
+          sp.className = sampleOnly ? "vt-warn" : "vt-ok";
           sp.textContent = junkTitle ? "已完成检测" : (title || "VT 通过，已放行");
         } else if (status === "flagged") {
           sp.className = "vt-bad";
@@ -581,6 +456,12 @@
           st.appendChild(sp);
           this.root.appendChild(st);
         }
+      }
+
+      if (sampleOnly) {
+        const scope = this.el("div", "item vt-warn");
+        scope.textContent = "检测范围：以下 SHA256、数字签名和 VT 仅对应重新请求的来源样本；尚未核验实际下载文件，未据此删除本地文件。";
+        this.root.appendChild(scope);
       }
 
       // 检测中：若已有本地解析（文件名/签名/哈希），仍展示，避免干等空白
@@ -853,6 +734,10 @@
       let vtLineIsShellNote = false;
       if (vtHashMismatch) {
         vtLine = "VT 数据与当前文件 SHA256 不匹配，待重新查询";
+      } else if (vtNotQueried) {
+        vtLine = isArchiveShellUi
+          ? "压缩包未完整读取，未生成整包 SHA256，未查询外壳 VT"
+          : "文件未完整读取，未生成 SHA256，未查询 VT";
       } else if (isArchiveShellUi && nestedHasVtHit && (rawVtNone || (vt && vt.deferToNested))) {
         // 包内已有 19/69 等结论：外壳「无」降级，避免误读成整包干净
         vtLine = "压缩包外壳无 VT 记录（以上方包内文件为准）";
@@ -890,7 +775,7 @@
         const vtSp = document.createElement("span");
         vtSp.className = "vt-text";
         if (vtLineIsShellNote) vtSp.className += " vt-muted";
-        else if (vtHashMismatch) vtSp.className += " vt-warn";
+        else if (vtHashMismatch || vtNotQueried) vtSp.className += " vt-warn";
         else if (unscopedVtSource) vtSp.className += " vt-warn";
         else if (trustedHard || trustedEngineCount >= 2 || status === "blocked" || status === "flagged") vtSp.className += " vt-bad";
         else if (vtNone || (!peSigned && (kind === "pe" || (peObj && peObj.isPe)))) vtSp.className += " vt-warn";
@@ -905,7 +790,9 @@
       if (sha) {
         const shaRow = this.el("div", "item sha-row");
         const shaLabel = document.createElement("strong");
-        shaLabel.textContent = isArchiveShellUi ? "压缩包SHA256: " : "SHA256: ";
+        shaLabel.textContent = sampleOnly
+          ? (isArchiveShellUi ? "压缩包样本 SHA256: " : "来源样本 SHA256: ")
+          : (isArchiveShellUi ? "压缩包SHA256: " : "SHA256: ");
         shaRow.appendChild(shaLabel);
         const shaSp = document.createElement("span");
         shaSp.className = "sha-text";
@@ -1011,7 +898,7 @@
       // 压缩包：包内已有检出时不提示「库中无此样本/上传外壳」（避免 zip 无盖过 exe 19/69）
       const feedSubmitted = !!(vt && (vt.feedSubmitted || vt.submitted));
       const suppressShellNoneTip = !!(isArchiveShellUi && nestedHasVtHit && (rawVtNone || (vt && vt.deferToNested)));
-      if (!suppressShellNoneTip && (vtNone || vtUnknown || feedSubmitted || (vt && vt.needCaptcha))) {
+      if (!vtNotQueried && !suppressShellNoneTip && (vtNone || vtUnknown || feedSubmitted || (vt && vt.needCaptcha))) {
         const tip = this.el("div", "item");
         const tipSp = document.createElement("span");
         tipSp.className = feedSubmitted ? "vt-ok" : "vt-warn";
@@ -1224,8 +1111,8 @@
         && /^(?:ai|pdf|gpt|ocr|nlp|ml|llm|pc|web|app)$/i.test(mixed[1])
         && /(?:智能)?(?:重?命名|改名|编辑|推荐|生成|识别|分析|检测|搜索|翻译|创作|剪辑|修复|转换|处理|管理|优化|加速|同步|备份|清理|压缩|解压|录制|播放|下载|安装|截图|桌面|控制|协助|协作|连接|访问|办公|会议|教育|助手|运维|操作|服务)$/.test(mixed[2])) return "";
 
-      const modeLead = /^(?:智能|自动|一键|在线|离线|实时|快速|极速|精准|批量|免费|专业|高效|便捷|云端|本地|远程|桌面|移动|跨端|跨平台|多端|多人|团队)/;
-      const capabilityTail = /(?:重?命名|改名|编辑|推荐|生成|识别|分析|检测|搜索|翻译|创作|剪辑|修复|转换|处理|管理|优化|加速|同步|备份|清理|压缩|解压|录制|播放|下载|安装|截图|桌面|控制|协助|协作|连接|访问|办公|会议|教育|助手|运维|操作|服务)$/;
+      const modeLead = /^(?:智能|自动|一键|在线|离线|实时|快速|极速|精准|批量|免费|专业|高效|便捷|云端|本地|远程|桌面|移动|跨端|跨平台|多端|多人|团队|个性|每日|热门|精选|官方|正版|最新)/;
+      const capabilityTail = /(?:重?命名|改名|编辑|推荐|生成|识别|分析|检测|搜索|翻译|创作|剪辑|修复|转换|处理|管理|优化|加速|同步|备份|清理|压缩|解压|录制|播放|下载|安装|截图|远程|桌面|控制|协助|协作|连接|访问|办公|会议|教育|助手|运维|操作|服务|音乐|歌曲|歌单|软件|工具|系统|主机|服务器|托管)$/;
       if (modeLead.test(compact) && capabilityTail.test(compact)) return "";
       if (compact.length >= 4 && modeLead.test(compact)
         && /(?:远程)?(?:控|协|连|访|运)$/.test(compact)) return "";
@@ -1234,6 +1121,14 @@
 
     brandSpoofFromData(data) {
       if (!data) return "";
+      // Modern reports carry the same final snapshot used by page/system notices.
+      // A missing/unsettled snapshot is not permission to re-elect a brand from host/details.
+      if (Object.prototype.hasOwnProperty.call(data, "brandFinalSnapshot")) {
+        const snapshot = data.brandFinalSnapshot;
+        if (!snapshot || snapshot.final !== true || snapshot.url !== data.url
+          || !snapshot.analysisTxn || snapshot.analysisTxn !== data.analysisTxn) return "";
+        return this.sanitizeSpoofBrandName(snapshot.brand, { confirmedIdentity: true });
+      }
       if (data.spoofBrand) {
         const direct = this.sanitizeSpoofBrandName(data.spoofBrand, { confirmedIdentity: true });
         if (direct) return direct;
@@ -1287,10 +1182,32 @@
       return "";
     }
 
-    /** 同页品牌通知已定稿、风险报告仍处于极短竞态时，用通知补齐 popup 展示名。 */
+    hasBrandSpoofVerdict(data) {
+      if (!data) return false;
+      if (Object.prototype.hasOwnProperty.call(data, "brandFinalSnapshot")) {
+        // 现代报告只有同 URL、同事务的最终快照能授权仿冒结论。
+        // 残留布尔标记/旧详情不能绕过 brandSpoofFromData 的快照校验。
+        return data.brandSpoofPortal === true && !!this.brandSpoofFromData(data);
+      }
+      return !!(data.brandSpoofPortal || this.brandSpoofFromData(data))
+        || (Array.isArray(data.details) && data.details.some((d) => /仿冒品牌官网/i.test(d.name || "")));
+    }
+
+    isBrandSpoofNotice(notice) {
+      return !!notice && (notice.guardKind === "brand-spoof" || !!notice.brandSnapshot
+        || /仿冒.*官网|仿冒品牌/.test(`${notice.title || ""} ${notice.message || ""}`));
+    }
+
+    /** 旧版报告没有最终快照时，用同页通知补齐展示名。现代报告以最终快照为准。 */
     brandSpoofFromNotice(notice) {
       try {
         if (!notice) return "";
+        if (notice.brandSnapshot) {
+          const snapshot = notice.brandSnapshot;
+          if (snapshot.final !== true || snapshot.url !== notice.url
+            || (notice.analysisTxn && snapshot.analysisTxn !== notice.analysisTxn)) return "";
+          return this.sanitizeSpoofBrandName(snapshot.brand, { confirmedIdentity: true });
+        }
         const blob = `${notice.title || ""} ${notice.message || ""}`;
         if (notice.guardKind !== "brand-spoof" && !/仿冒「[^」]+」官网|品牌「[^」]+」/.test(blob)) return "";
         const m = blob.match(/仿冒「([^」]{2,28})」官网/)
@@ -1437,7 +1354,7 @@
       if (!this.reportHasProtection(data) && score === 0 && (level === "medium" || level === "high")) level = "low";
       if (score >= 24 && details.length >= 2 && level === "low") level = "medium";
       const spoofBrand = this.brandSpoofFromData(data);
-      const brandSpoof = !!(data?.brandSpoofPortal || spoofBrand) || details.some((d) => /仿冒品牌官网/i.test(d.name || ""));
+      const brandSpoof = this.hasBrandSpoofVerdict(data);
       const multiSerp = details.some((d) => /多平台下载指向搜索引擎/i.test(d.name || ""));
       let title;
       if (level === "high") title = brandSpoof && spoofBrand ? `存在严重风险（仿冒「${spoofBrand}」官网）` : "存在严重风险";
@@ -1457,18 +1374,26 @@
     }
 
     renderRisk(data, latestNotice, tabUrl, vtInfo) {
-      this.clearRoot();
       const url = tabUrl || this.activeTabUrl;
+      const coalesced = this.coalesceReport(data, url);
+      // A rejected (older) transaction is not a missing report. A delayed
+      // storage read must not repaint an already visible verdict as pending.
+      if (data && !coalesced) return;
+      this.clearRoot();
       // storage.onChanged can briefly pair a newer package notice with the
       // previous probe's structured report. Show only the newer transaction;
       // never compose two different hashes/signature states into one view.
       if (this.newerPackageNoticeSupersedesVt(latestNotice, vtInfo, url)) vtInfo = null;
-      const coalesced = this.coalesceReport(data, url);
       // No matching current-transaction report means the current page is
       // still being verified. Never fall back to a previous completed route.
       let matchedData = this.dataMatchesTab(coalesced, url) ? coalesced : null;
+      const modernBrandReport = !!matchedData
+        && Object.prototype.hasOwnProperty.call(matchedData, "brandFinalSnapshot");
+      const finalBrandVerdict = this.hasBrandSpoofVerdict(matchedData);
       const clean = this.isCleanSafeReport(matchedData);
-      const noticeActive = !clean && this.noticeMatchesTab(
+      const noticeActive = !clean
+        && !(modernBrandReport && !finalBrandVerdict && this.isBrandSpoofNotice(latestNotice))
+        && this.noticeMatchesTab(
         latestNotice,
         this.activeTabId,
         url,
@@ -1488,8 +1413,8 @@
         url
       );
       let brandName = this.brandSpoofFromData(matchedData);
-      if (!brandName && showNotice) brandName = this.brandSpoofFromNotice(latestNotice);
-      const brandSpoof = !!(matchedData?.brandSpoofPortal || brandName);
+      if (!modernBrandReport && !brandName && showNotice) brandName = this.brandSpoofFromNotice(latestNotice);
+      const brandSpoof = modernBrandReport ? finalBrandVerdict : !!(matchedData?.brandSpoofPortal || brandName);
       const detailsEarly = Array.isArray(matchedData?.details) ? matchedData.details : [];
       const multiSerp = detailsEarly.some((d) => /多平台下载指向搜索引擎/i.test(d.name || ""));
       const identityRisk = this.identityRiskFromData(matchedData);
@@ -1583,6 +1508,34 @@
       }
     }
 
+    storedRiskForTab(stored, tabId, tabUrl) {
+      const local = stored?.[`risk_${tabId}`];
+      if (local && (local.tabId == null || local.tabId === tabId) && this.dataMatchesTab(local, tabUrl)) return local;
+      const global = stored?.risk_latest;
+      return global && global.tabId === tabId && this.dataMatchesTab(global, tabUrl) ? global : null;
+    }
+
+    requestVtSupplement(seen, type, identity, vtInfo, hash) {
+      const tabId = this.activeTabId, url = this.activeTabUrl;
+      const key = JSON.stringify([type, tabId, url, vtInfo.probeId || "", vtInfo.downloadId, identity]);
+      if (seen.has(key)) return;
+      seen.add(key);
+      const finish = (reply) => {
+        if (!chrome.runtime.lastError && reply?.success) return;
+        // Re-read storage, never resend the old report after a race. Keep the
+        // key held through backoff so storage.onChanged cannot start a loop.
+        const count = this._refreshRetryCounts.get(key) || 0;
+        if (count >= 2) return;
+        this._refreshRetryCounts.set(key, count + 1);
+        setTimeout(() => {
+          seen.delete(key);
+          if (this.activeTabId === tabId && this.activeTabUrl === url) this.refresh(url);
+        }, count ? 2000 : 300);
+      };
+      try { chrome.runtime.sendMessage({ type, sha256: hash, tabId }, finish); }
+      catch { finish(null); }
+    }
+
     maybeRefreshVtEngineDetails(vtInfo) {
       const vt = vtInfo && vtInfo.vt;
       // 身份未绑定的对象不可据其 VT hash 发起刷新；同 hash 的旧统计口径则必须重查。
@@ -1595,15 +1548,8 @@
       const needsEngineRefresh = detections > 0 && (vt.engineDetailsAvailable !== true || !policyCurrent);
       const needsStatsRefresh = vtStale || !statsCurrent;
       if (!/^[a-f0-9]{64}$/.test(hash) || !vt || vt.found !== true
-        || (!needsEngineRefresh && !needsStatsRefresh) || this._vtDetailsRefreshes.has(hash)) return;
-      this._vtDetailsRefreshes.add(hash);
-      try {
-        chrome.runtime.sendMessage({
-          type: "refresh-vt-engine-details",
-          sha256: hash,
-          tabId: this.activeTabId
-        }, () => { void chrome.runtime.lastError; });
-      } catch { /* ignore */ }
+        || (!needsEngineRefresh && !needsStatsRefresh)) return;
+      this.requestVtSupplement(this._vtDetailsRefreshes, "refresh-vt-engine-details", hash, vtInfo, hash);
     }
 
     maybeRefreshNestedSignatures(vtInfo) {
@@ -1624,15 +1570,7 @@
       });
       if (!pending.length) return;
       const refreshKey = `${hash}|${pending.map((item) => item.sha256).join("|")}`;
-      if (this._nestedSignatureRefreshes.has(refreshKey)) return;
-      this._nestedSignatureRefreshes.add(refreshKey);
-      try {
-        chrome.runtime.sendMessage({
-          type: "refresh-nested-vt-signatures",
-          sha256: hash,
-          tabId: this.activeTabId
-        }, () => { void chrome.runtime.lastError; });
-      } catch { /* ignore */ }
+      this.requestVtSupplement(this._nestedSignatureRefreshes, "refresh-nested-vt-signatures", refreshKey, vtInfo, hash);
     }
 
     refresh(currentTabUrl, vtOverride = null) {
@@ -1648,10 +1586,7 @@
         if (requestUrl && activeUrl && !urlsMatch(requestUrl, activeUrl)) return;
         if (chrome.runtime.lastError) { this.clearRoot(); this.root.appendChild(this.el("div", "item", "读取扩展数据失败。")); return; }
         const tabUrl = this.activeTabUrl || requestUrl;
-        const localRaw = result[`risk_${requestTabId}`] || null;
-        const localData = this.dataMatchesTab(localRaw, tabUrl) ? localRaw : null;
-        const latestData = result.risk_latest && this.dataMatchesTab(result.risk_latest, tabUrl) ? result.risk_latest : null;
-        const data = localData || latestData || null;
+        const data = this.storedRiskForTab(result, requestTabId, tabUrl);
         const notice = result.latestNotice || null;
         // 优先本 tab 键；全局 latestExeVt 必须再过 vtMatchesTab（防换站/串台）
         let vtInfo = null;
@@ -1678,7 +1613,7 @@
             // Establish the new transaction before the asynchronous storage
             // read. If disk still contains the previous same-URL completion,
             // coalesceReport will now reject it instead of flashing it.
-            this.coalesceReport(msg, this.activeTabUrl || msg.url);
+            if (!this.coalesceReport(msg, this.activeTabUrl || msg.url)) return;
             this.refresh(this.activeTabUrl || msg.url);
             return;
           }
@@ -1695,12 +1630,13 @@
             if (requestUrl && activeUrl && !urlsMatch(requestUrl, activeUrl)) return;
             // Popup 初次打开时，runtime 消息可能先于初始 storage.get 返回；先吸收已落盘强证书，
             // 再渲染实时消息，避免初始 OV 读取被取消后短暂画成 DV。
-            const storedRaw = extra && (extra[`risk_${requestTabId}`] || extra.risk_latest);
-            if (storedRaw && this.dataMatchesTab(storedRaw, requestUrl)) {
+            const storedRaw = this.storedRiskForTab(extra, requestTabId, requestUrl);
+            if (storedRaw) {
               this.coalesceReport(storedRaw, requestUrl);
             }
             // 先吸收落盘报告，再合并 runtime 报告；不能前面合并、后面却仍渲染原始 msg。
             const reportForRender = this.coalesceReport(msg, requestUrl);
+            if (!reportForRender) return;
             const tabVt = (extra && extra[vtTabKey]) || null;
             const globalVt = (extra && extra.latestExeVt) || null;
             const tabUrlNow = this.activeTabUrl || msg.url;
@@ -1793,7 +1729,8 @@
       chooseStrongerSslInfo,
       normalizePopupSha256,
       popupVtIdentityUnbound,
-      popupVtHashMismatch
+      popupVtHashMismatch,
+      popupVtNotQueried
     };
   }
 })();

@@ -107,11 +107,56 @@ function parseTechnicalList(lines) {
   return entries;
 }
 
-function publicError(output) {
-  const raw = String(output || "").replace(/\s+/g, " ").trim();
-  if (/password|passphrase|encrypted|wrong password/i.test(raw)) return "压缩包已加密，无法在无密码情况下拆包验签";
-  if (/volume|split|part\s*\d+|cannot find.*part/i.test(raw)) return "压缩包可能是分卷文件，缺少完整分卷，无法拆包验签";
-  return "压缩包损坏、格式不受支持或缺少分卷，无法拆包验签";
+function hasEncryptionDiagnostic(output) {
+  // A filename such as password.exe is not proof of encryption.
+  return String(output || "").split(/\r?\n/).some((line) =>
+    !/^\s*(?:Path|Name)\s*=/i.test(line) && (
+      /(?:enter|incorrect|wrong|requires?|need|missing)\s+(?:a\s+|the\s+)?(?:password|passphrase)\b/i.test(line)
+      || /^\s*Encrypted\s*=\s*\+\s*$/i.test(line)
+      || /^\s*Method\s*=.*(?:AES|7zAES)\b/i.test(line)
+      || /(?:cannot|can not).*encrypted archive|data error in encrypted file|encrypted headers/i.test(line)));
+}
+
+// RAR5 archive encryption header, validated with its CRC32 before trusting its type.
+// Format reference: https://www.rarlab.com/technote.htm#enchead
+function hasRar5EncryptedHeader(input) {
+  const bytes = new Uint8Array(input);
+  const signature = [0x52, 0x61, 0x72, 0x21, 0x1a, 7, 1, 0];
+  if (bytes.length < 15 || !signature.every((b, i) => bytes[i] === b)) return false;
+  let pos = 12;
+  const readVint = (end) => {
+    let value = 0, factor = 1;
+    for (let count = 0; count < 8 && pos < end; count++, factor *= 128) {
+      const byte = bytes[pos++]; value += (byte & 127) * factor;
+      if (!Number.isSafeInteger(value)) return null;
+      if (!(byte & 128)) return value;
+    }
+    return null;
+  };
+  const size = readVint(Math.min(bytes.length, 15));
+  if (size == null || size < 21 || size > 128 || pos + size > bytes.length) return false;
+  const end = pos + size;
+  if (readVint(end) !== 4) return false;
+  let crc = 0xffffffff;
+  for (let i = 12; i < end; i++) {
+    crc ^= bytes[i];
+    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+  }
+  return ((crc ^ 0xffffffff) >>> 0) === new DataView(input).getUint32(8, true);
+}
+
+function classifyFailure(result, output) {
+  if (result.encrypted === true || hasEncryptionDiagnostic(output)) {
+    result.status = "encrypted";
+    result.encrypted = true;
+    result.note = `${result.format.toUpperCase()} 已加密，需要密码，未进行包内文件与数字签名扫描`;
+  } else {
+    result.status = "error";
+    result.note = /missing volume|cannot find.*(?:volume|\.part\d+)|unexpected end of (?:archive|data)/i.test(String(output || ""))
+      ? "压缩包数据不完整或缺少分卷，无法拆包验签"
+      : "无法拆包验签，原因尚未确认（可能需要密码、格式不受支持、文件损坏或缺少分卷）";
+  }
+  return result;
 }
 
 function fsReadFile(sevenZip, path) {
@@ -146,33 +191,46 @@ async function processTask(task) {
     result.note = "压缩包数据为空或不完整";
     return result;
   }
+  if (format === "rar" && hasRar5EncryptedHeader(task.input)) {
+    result.encrypted = true;
+    return classifyFailure(result, "");
+  }
 
   const stdout = [];
   const stderr = [];
+  const pendingOutput = { out: [], err: [] };
+  const decodeOutput = (bytes) => new TextDecoder("utf-8").decode(new Uint8Array(bytes));
+  const captureByte = (key, lines, byte) => {
+    if (byte == null || byte === 10) {
+      if (pendingOutput[key].length) lines.push(decodeOutput(pendingOutput[key]));
+      pendingOutput[key] = [];
+    } else if (byte !== 13) pendingOutput[key].push(byte);
+  };
+  const diagnosticText = (error = "") => [...stdout, decodeOutput(pendingOutput.out), ...stderr, decodeOutput(pendingOutput.err), error].join("\n");
   let sevenZip = null;
   try {
     sevenZip = await SevenZipWasm({
       locateFile: (name) => new URL(`../vendor/sevenzip-wasm/${name}`, self.location.href).href,
       print: (line) => stdout.push(String(line || "")),
-      printErr: (line) => stderr.push(String(line || ""))
+      printErr: (line) => stderr.push(String(line || "")),
+      // Password prompts may not end in a newline before WASM aborts on stdin.
+      stdout: (byte) => captureByte("out", stdout, byte),
+      stderr: (byte) => captureByte("err", stderr, byte),
+      stdin: () => null
     });
     const archiveName = `/input.${format}`;
     sevenZip.FS.writeFile(archiveName, new Uint8Array(task.input));
     const listCode = sevenZip.callMain(["l", "-slt", "-ba", "-bd", "-bsp0", archiveName]);
-    const diagnostic = stdout.concat(stderr).join("\n");
+    const diagnostic = diagnosticText();
     const listed = parseTechnicalList(stdout);
+    result.encrypted = listed.some((entry) => entry.encrypted);
     if (listCode !== 0) {
-      result.status = /password|encrypted/i.test(diagnostic) ? "encrypted" : "error";
-      result.encrypted = result.status === "encrypted";
-      result.note = publicError(diagnostic);
-      return result;
+      return classifyFailure(result, diagnostic);
     }
     result.entriesTotal = listed.length;
     result.encrypted = listed.some((entry) => entry.encrypted);
-    if (result.encrypted) {
-      result.status = "encrypted";
-      result.note = `${format.toUpperCase()} 已加密，无法在无密码情况下拆包验签`;
-      return result;
+    if (result.encrypted || hasEncryptionDiagnostic(diagnostic)) {
+      return classifyFailure(result, diagnostic);
     }
 
     result.truncatedEntries = listed.length > maxEntries;
@@ -209,14 +267,13 @@ async function processTask(task) {
       sevenZip.FS.mkdir("/out");
       stdout.length = 0;
       stderr.length = 0;
+      pendingOutput.out = []; pendingOutput.err = [];
       const extractCode = sevenZip.callMain([
-        "x", "-y", "-bd", "-bsp0", "-bso0", "-bse0",
+        "x", "-y", "-spd", "-bd", "-bsp0", "-bso1", "-bse1",
         archiveName, "-o/out", "--", ...selected.map((entry) => entry.path)
       ]);
       if (extractCode !== 0) {
-        result.status = "error";
-        result.note = publicError(stdout.concat(stderr).join("\n"));
-        return result;
+        return classifyFailure(result, diagnosticText());
       }
       let actualTotal = 0;
       for (const candidate of selected) {
@@ -241,9 +298,7 @@ async function processTask(task) {
     result.note = limitations.join("；");
     return result;
   } catch (error) {
-    result.status = "error";
-    result.note = publicError(`${error && error.message || error || ""}\n${stderr.join("\n")}`);
-    return result;
+    return classifyFailure(result, diagnosticText(error && error.message || error || ""));
   } finally {
     if (sevenZip && sevenZip.FS) {
       try { sevenZip.FS.unlink(`/input.${format}`); } catch { /* module is about to be discarded */ }

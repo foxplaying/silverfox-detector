@@ -17,10 +17,6 @@
       || PackageHeuristicsBg.looksLikeAndroidPackageIdName(nameFromUrl)) {
       return { cancel: false };
     }
-    if (PackageHeuristicsBg.looksLikeStrongProductInstallerName(name)
-      || PackageHeuristicsBg.looksLikeStrongProductInstallerName(nameFromUrl)) {
-      return { cancel: false };
-    }
     // ICP/WHOIS 已核验且无真实硬威胁的来源页：文件名/CDN 启发式只做后台 VT，不预先取消。
     if (typeof NS.getTrustedDownloadSource === "function" && NS.getTrustedDownloadSource(item)) {
       return { cancel: false, trustedSource: true };

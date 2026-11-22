@@ -960,11 +960,12 @@
     } catch { return false; }
   };
 
-  /** 写入报告用的 ICP 文案：取得可展示的组织字段时才隐藏「未查询到备案信息」 */
+  /** 展示规则与备案核验、风险判定独立。 */
   NS.formatIcpInfoForReport = function (icpRaw) {
     try {
       const s = String(icpRaw != null ? icpRaw : (NS.state && NS.state.icpInfo) || "").trim();
       if (!s) return "";
+      if (globalThis.SilverfoxSslEvidence?.hidesMissingIcp(NS.state.sslInfo, s)) return "";
       if (/未查询到|查询失败|暂无/.test(s) && NS.hasOrganizationValidatedSsl()
         && !NS.shouldPreserveForcedMissingIcp()) return "";
       return s;
@@ -1033,15 +1034,15 @@
   /** 已废弃：不再提前写 DV 占位（探测完成前不展示 SSL） */
   NS.ensureSslPlaceholder = function () { /* no-op */ };
 
-  /** 应用 background 推送/查询到的 SSL 证书分类（只升不降；force 仅表示重查，不允许降级） */
+  /** Apply certificate-bound evidence; a newer live leaf can legitimately be DV. */
   NS.applySslCertInfo = function (info, force) {
     try {
       if (!info || typeof info !== "object") return false;
       const src = String(info.source || "");
       // 旧空占位拒绝；https-assumed 是 CT 失败后的合法 HTTPS 回退
       if (src === "page-https" || src === "https-reachability") return false;
-      const host = (location.hostname || "").toLowerCase().replace(/^www\./, "");
-      const infoHost = String(info.host || "").toLowerCase().replace(/^www\./, "");
+      const host = (location.hostname || "").toLowerCase().replace(/\.$/, "");
+      const infoHost = String(info.host || "").toLowerCase().replace(/\.$/, "");
       if (infoHost && host && infoHost !== host) return false;
       let nextVal = String(info.validation || "").toUpperCase();
       if (!/^(DV|OV|EV)$/.test(nextVal)) return false;
@@ -1053,38 +1054,21 @@
       if (dirtyOrg(info.organization)) {
         if (nextVal === "OV" || nextVal === "EV") nextVal = "DV";
       }
-      // 旧结果是占位 OV（Internet Widgits）：允许被正确 DV 覆盖
-      const prevBogusOv = prev && dirtyOrg(prev.organization)
-        && sslValidationRank(prev.validation) >= 2;
-      // 禁止用弱 DV 覆盖已识别的 OV/EV（脏占位 OV 除外）
-      if (prev && sslValidationRank(prev.validation) > sslValidationRank(nextVal)
-        && !prevBogusOv) {
-        return false;
-      }
-      // 禁止用 https-assumed 覆盖已有 CT/Labs 结果
-      if (!force && prev && prev.validation && prev.source && prev.source !== "https-assumed"
-        && src === "https-assumed") {
-        return false;
-      }
-      // 同级时保留已有机构名；但拒绝把未绑定实时叶证书的 OV / OpenSSL 占位 org 粘住
+      // Organization fields may only be enriched from the exact same leaf.
       let org = String(info.organization || "").trim();
       if (dirtyOrg(org) || unboundOv(info.validation, info.sniChainVerified, info.liveTlsLeafVerified, info.unexpiredHostVerified)) org = "";
-      if (!org && prev && prev.organization && sslValidationRank(prev.validation) === sslValidationRank(nextVal)) {
-        if (!dirtyOrg(prev.organization)
-          && !unboundOv(prev.validation, prev.sniChainVerified, prev.liveTlsLeafVerified, prev.unexpiredHostVerified)) {
-          org = prev.organization;
-        }
-      }
-      // 新结果无 org 但旧结果是脏 CDN/占位 org：清空
-      if (!org && prev && (dirtyOrg(prev.organization)
-        || unboundOv(prev.validation, prev.sniChainVerified, prev.liveTlsLeafVerified, prev.unexpiredHostVerified))) org = "";
       const finalVal = nextVal;
-      NS.state.sslInfo = {
+      const candidate = {
         validation: finalVal,
         organization: org,
-        commonName: String(info.commonName || (prev && prev.commonName) || host).trim(),
+        commonName: String(info.commonName || host).trim(),
         state: String(info.state || "secure"),
-        fingerprintSha256: String(info.fingerprintSha256 || ""),
+        fingerprintSha256: String(info.fingerprintSha256 || info.fingerprint || ""),
+        certId: info.certId,
+        queriedHost: String(info.queriedHost || infoHost || host),
+        issuer: String(info.issuer || ""),
+        notBefore: info.notBefore || 0,
+        observedAt: Number(info.observedAt) || Number(info.at) || Date.now(),
         host: infoHost || host,
         at: Number(info.at) || Date.now(),
         limited: !!info.limited,
@@ -1094,6 +1078,10 @@
         unexpiredHostVerified: info.unexpiredHostVerified === true,
         assumed: !!info.assumed || src === "https-assumed"
       };
+      const selected = globalThis.SilverfoxSslEvidence
+        ? globalThis.SilverfoxSslEvidence.choose(prev, candidate) : candidate;
+      if (selected === prev) return false;
+      NS.state.sslInfo = selected;
       // 身份裁决不能把「有效 ICP 已返回」误当成整条身份链已结束。
       // 记录 TLS 侧至少已有一次可用结果；OV/EV 组织证书可立即闭环，DV
       // 仍允许 background 的延迟升级链继续把结果提升为 OV/EV。
@@ -2462,6 +2450,8 @@
   };
 
   NS.pageClaimsBrandDownloadLanding = function () {
+    if (typeof NS.pageLooksLikeInteractiveNetworkUtility === "function"
+      && NS.pageLooksLikeInteractiveNetworkUtility()) return false;
     if (NS.pageLooksLikeSearchEngineResultsPage()) return false;
     if (NS.pageLooksLikeThirdPartyBrandProxyOrMirror()) return false;
     if (typeof NS.pageLooksLikeAppMarketOrAppStoreListing === "function" && NS.pageLooksLikeAppMarketOrAppStoreListing()) return false;
@@ -2906,11 +2896,30 @@
         if (NS.looksLikeProductPackageName(NS.normalizeFileName(fm[1]))) return true;
       }
       if (/window\.__DATA__\s*=/.test(full) && /DownloadLink|downloadLink|installer|win_installer/i.test(full) && /https?:\/\/[^"'\\]+\.(?:exe|dmg|msi|pkg)/i.test(full) && NS.countTransparentProductPackages(full) >= 1) return true;
-      const iceOrSpa = !!document.querySelector("#ice-container, #root, #app, #__next, #__nuxt");
-      const hasTryAgain = !!document.querySelector("a.tryAgain, .hasDownload a[href], .download-success a[href], a[href*='/win/'], a[href*='/mac/']");
-      const sameSiteDl = Array.from(document.querySelectorAll("a[href]")).some((a) => { const h = (a.getAttribute("href") || "").trim(); return h && NS.looksLikeOfficialProductDownloadEndpoint(h); });
-      const scripts = Array.from(document.scripts || []).filter((s) => s.src).length;
-      if (iceOrSpa && (hasTryAgain || sameSiteDl) && scripts >= 3 && /下载|客户端|官方/i.test(document.title || "")) return true;
+      // Only this SPA-specific rule needs link evidence. Repository navigation
+      // and README links cannot affect it if any prerequisite already failed.
+      if (/下载|客户端|官方/i.test(document.title || "")
+        && document.querySelector("#ice-container, #root, #app, #__next, #__nuxt")) {
+        let externalScripts = 0;
+        for (const script of document.scripts || []) {
+          if (script.src && ++externalScripts === 3) break;
+        }
+        if (externalScripts === 3) {
+          if (document.querySelector("a.tryAgain, .hasDownload a[href], .download-success a[href], a[href*='/win/'], a[href*='/mac/']")) return true;
+          const links = document.links;
+          const seen = new Set();
+          for (let i = 0, n = links.length; i < n; i++) {
+            const a = links[i];
+            if (a.tagName !== "A") continue;
+            const h = (a.getAttribute("href") || "").trim();
+            if (!h || seen.has(h)) continue;
+            if (seen.size < 512) seen.add(h);
+            // Current synchronous pass already rejected spoof hosts above.
+            // A link requiring official-page trust cannot itself prove it.
+            if (NS.looksLikeOfficialProductDownloadEndpoint(h, false, false)) return true;
+          }
+        }
+      }
       if (NS.looksLikeOfficialBrandDownloadPage(full)) return true;
       if (NS.looksLikeOfficialClientDownloadPage()) return true;
       if (NS.looksLikeSelfConsistentOfficialSite()) return true;

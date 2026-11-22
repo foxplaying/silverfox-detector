@@ -340,90 +340,111 @@
   /**
    * 顶层 arm 后处理页面内 iframe/embed：
    * - 仅 pointer-events 不够：晚加载的跨源下载壳仍会完整渲染，用户可点
-   * - 掏空 src → about:blank、加 sandbox、挡交互；同源再灰内部按钮
+   * - 幂等置空 src、加 sandbox、挡交互；解锁时恢复原属性
    * - 由 installParentGuardInheritance 定时补锁，防 SPA 重插框架
    */
+  const lockedFrames = new Map();
   NS.neutralizePageFramesForGuard = function (on) {
     try {
       if (!NS.isTopFrame()) return;
-      document.querySelectorAll("iframe, embed, object").forEach((el) => {
-        try {
-          const tag = (el.tagName || "").toUpperCase();
-          if (on) {
-            if (!el.dataset.silverfoxFramePrevPe) {
-              el.dataset.silverfoxFramePrevPe = el.style.pointerEvents || "";
+      if (!on) {
+        for (const [el, prev] of lockedFrames) {
+          const restoreAttr = (key, value) => {
+            if (el.getAttribute(key) === value) return;
+            if (value == null) el.removeAttribute(key);
+            else el.setAttribute(key, value);
+          };
+          try {
+            for (const key of ["sandbox", "allow", "allowfullscreen", "data", "src", "srcdoc"]) {
+              restoreAttr(key, prev.attrs[key]);
             }
-            el.style.setProperty("pointer-events", "none", "important");
-            el.style.setProperty("visibility", "hidden", "important");
-            el.setAttribute("data-silverfox-frame-locked", "1");
-            // 保存并掏空导航目标（防晚加载下载落地页）
-            try {
-              const curSrc = el.getAttribute("src") || el.src || "";
-              if (curSrc && !/^about:blank$/i.test(curSrc) && !el.dataset.silverfoxFrameOrigSrc) {
-                el.dataset.silverfoxFrameOrigSrc = curSrc;
-              }
-              if (tag === "IFRAME" || tag === "EMBED") {
-                try { el.removeAttribute("src"); } catch { /* ignore */ }
-                try { el.src = "about:blank"; } catch { /* ignore */ }
-                try { el.setAttribute("src", "about:blank"); } catch { /* ignore */ }
-              }
-              if (tag === "OBJECT") {
-                try {
-                  if (!el.dataset.silverfoxFrameOrigData && el.getAttribute("data")) {
-                    el.dataset.silverfoxFrameOrigData = el.getAttribute("data");
-                  }
-                  el.removeAttribute("data");
-                } catch { /* ignore */ }
-              }
-              // 最严沙箱：无下载、无顶层导航、无表单
-              try {
-                if (tag === "IFRAME") {
-                  el.setAttribute("sandbox", "");
-                  el.removeAttribute("allow");
-                  el.removeAttribute("allowfullscreen");
-                }
-              } catch { /* ignore */ }
-            } catch { /* ignore */ }
-            // 同源：灰内部下载控件
-            try {
-              const doc = el.contentDocument;
-              if (doc) {
-                doc.querySelectorAll("a, button, [role='button']").forEach((node) => {
-                  try {
-                    const t = (node.textContent || "").replace(/\s+/g, " ").trim();
-                    const href = (node.getAttribute && (node.getAttribute("href") || node.getAttribute("data-href"))) || "";
-                    if (/下载|download|安装|客户端|免费获取/i.test(t + " " + href)
-                      || /\.(?:exe|zip|msi|apk|dmg)(?:\?|$)/i.test(href)
-                      || true) {
-                      // 同源 frame 内一律挡可点控件（盗版下载壳）
-                      node.style.setProperty("pointer-events", "none", "important");
-                      node.style.setProperty("opacity", "0.45", "important");
-                      node.setAttribute("data-silverfox-greyed", "1");
-                      if (node.tagName === "A") {
-                        if (!node.dataset.silverfoxOrigHref && node.getAttribute("href")) {
-                          node.dataset.silverfoxOrigHref = node.getAttribute("href");
-                        }
-                        try { node.setAttribute("href", "javascript:void(0)"); } catch { /* ignore */ }
-                      }
-                    }
-                  } catch { /* ignore */ }
-                });
-              }
-            } catch { /* cross-origin — 已 about:blank */ }
-          } else if (el.getAttribute("data-silverfox-frame-locked") === "1") {
-            el.style.pointerEvents = el.dataset.silverfoxFramePrevPe || "";
-            el.style.visibility = "";
+            for (const [key, value] of Object.entries(prev.styles)) {
+              if (value.value) el.style.setProperty(key, value.value, value.priority);
+              else el.style.removeProperty(key);
+            }
             el.removeAttribute("data-silverfox-frame-locked");
-            delete el.dataset.silverfoxFramePrevPe;
-            // 一般不自动恢复 src（防立刻再下）；仅清标记
-            try { el.removeAttribute("sandbox"); } catch { /* ignore */ }
+          } catch { /* detached frame */ }
+        }
+        lockedFrames.clear();
+        NS.caches._frameGuardLastSweep = 0;
+        return;
+      }
+      const now = Date.now();
+      if (now - (NS.caches._frameGuardLastSweep || 0) < 150) return;
+      NS.caches._frameGuardLastSweep = now;
+      const frames = document.querySelectorAll("iframe, embed, object");
+      const start = (NS.caches._frameGuardCursor || 0) % Math.max(1, frames.length);
+      NS.caches._frameGuardCursor = (start + 128) % Math.max(1, frames.length);
+      for (let index = 0; index < Math.min(128, frames.length); index++) {
+        const el = frames[(start + index) % frames.length];
+        try {
+          const tag = String(el.tagName || "").toUpperCase();
+          // MAIN-world guard owns this snapshot. Do not capture its blank
+          // placeholder as the original URL; it restores on set-guard(false).
+          if (!lockedFrames.has(el) && el.getAttribute("data-silverfox-frame-owner") === "page-hooks") continue;
+          if (!lockedFrames.has(el)) {
+            const attrs = {};
+            for (const key of ["src", "srcdoc", "data", "sandbox", "allow", "allowfullscreen"]) {
+              attrs[key] = el.getAttribute(key);
+            }
+            const styles = {};
+            for (const key of ["pointer-events", "visibility"]) {
+              styles[key] = { value: el.style.getPropertyValue(key), priority: el.style.getPropertyPriority(key) };
+            }
+            lockedFrames.set(el, { attrs, styles });
           }
-        } catch { /* ignore */ }
-      });
+          if (el.style.getPropertyValue("pointer-events") !== "none"
+            || el.style.getPropertyPriority("pointer-events") !== "important") {
+            el.style.setProperty("pointer-events", "none", "important");
+          }
+          if (el.style.getPropertyValue("visibility") !== "hidden"
+            || el.style.getPropertyPriority("visibility") !== "important") {
+            el.style.setProperty("visibility", "hidden", "important");
+          }
+          if (el.getAttribute("data-silverfox-frame-locked") !== "1") {
+            el.setAttribute("data-silverfox-frame-locked", "1");
+          }
+          if (tag === "IFRAME" || tag === "EMBED") {
+            if (el.getAttribute("src") !== "about:blank") el.setAttribute("src", "about:blank");
+            if (el.hasAttribute("srcdoc")) el.removeAttribute("srcdoc");
+          }
+          if (tag === "OBJECT" && el.hasAttribute("data")) el.removeAttribute("data");
+          if (tag === "IFRAME") {
+            if (el.getAttribute("sandbox") !== "") el.setAttribute("sandbox", "");
+            if (el.hasAttribute("allow")) el.removeAttribute("allow");
+            if (el.hasAttribute("allowfullscreen")) el.removeAttribute("allowfullscreen");
+          }
+        } catch { /* inaccessible frame */ }
+      }
+      for (const el of lockedFrames.keys()) {
+        if (!el.isConnected) lockedFrames.delete(el);
+      }
     } catch { /* ignore */ }
   };
 
   NS.addSignal = function (name, weight, reason) {
+    // 多条检测路径指向同一仿冒结论：只取最强权重，不能 18+20+24 重复加分。
+    // 保留其他独立风险信号的原有累计规则，并兼容已经存在的重复明细。
+    if (name === "仿冒品牌官网下载站") {
+      const state = NS.state;
+      const existing = state.details.filter((d) => d.name === name);
+      if (existing.length) {
+        const strongest = existing.reduce((a, b) => Number(b.weight) > Number(a.weight) ? b : a);
+        const w = Math.max(0, Number(weight) || 0, Number(strongest.weight) || 0);
+        const oldTotal = existing.reduce((sum, d) => sum + Math.max(0, Number(d.weight) || 0), 0);
+        const changed = existing.length > 1 || w > Number(strongest.weight);
+        const retained = existing[0];
+        retained.reason = (Number(weight) >= Number(strongest.weight) && reason) || strongest.reason || "";
+        retained.weight = w;
+        state.details = state.details.filter((d) => d.name !== name || d === retained);
+        state.score = Math.max(0, state.score - oldTotal + w);
+        for (const key of state.signalSet) {
+          if (String(key).startsWith(`${name}:`)) state.signalSet.delete(key);
+        }
+        state.signalSet.add(`${name}:${w}`);
+        return changed;
+      }
+    }
     if (_silverfoxDebug && (Number(weight) || 0) > 0) {
       NS.silverfoxLog("signal", `w${weight}`, name, String(reason || "").slice(0, 100));
     }

@@ -6,11 +6,12 @@
  * 扩展的 DOM wrap 还可能出现在相关堆栈里，被误当成「插件报错」。
  *
  * 策略（均不碰主文档导航、不拦安装包判定）：
- * 1) 主文档 https: 时，公网被动资源（图/CSS/字体/音视频）写入前 http→https
+ * 1) 主文档 https: 时，公网图片/样式资源写入前 http→https
  *    （含跨站 CDN，如 netease.com → 126.net；与 Chromium 自动升级一致，尽早改写）
  * 2) 纯 http: / 局域网目标一律不改写
  * 3) 永不升级 script / iframe / xhr / main_frame
  * 4) 不包装页面 console（包装会把所有站点日志首帧指到扩展）
+ * 5) 不改写播放器及其 source/track/embed 地址：重新设置资源会重载并丢失暂停状态。
  */
 ;(function (NS) {
   "use strict";
@@ -101,14 +102,22 @@
     static isPassiveResourceAttribute(el, name) {
       const tag = String(el && el.tagName || "").toUpperCase();
       const n = String(name || "").toLowerCase();
-      if (n === "src") return /^(?:IMG|SOURCE|VIDEO|AUDIO|EMBED|INPUT|TRACK)$/.test(tag);
+      if (MixedContentQuiet.isPlaybackResource(el)) return false;
+      if (n === "src") return tag === "IMG" || tag === "INPUT";
       if (n === "srcset") return tag === "IMG" || tag === "SOURCE";
-      if (n === "poster") return tag === "VIDEO";
       if (n === "href") return tag === "LINK";
       if (n === "data-src" || n === "data-original" || n === "data-lazy-src") {
-        return /^(?:IMG|SOURCE|VIDEO|AUDIO)$/.test(tag);
+        return tag === "IMG";
       }
       return false;
+    }
+
+    static isPlaybackResource(el) {
+      const tag = String(el && el.tagName || "").toUpperCase();
+      if (/^(?:VIDEO|AUDIO|TRACK|EMBED)$/.test(tag)) return true;
+      // A detached SOURCE may later be attached to a player. Only a source
+      // already owned by PICTURE is safe for image-only srcset upgrades.
+      return tag === "SOURCE" && String(el.parentElement && el.parentElement.tagName || "").toUpperCase() !== "PICTURE";
     }
 
     /**
@@ -163,6 +172,7 @@
 
     static upgradeElement(el) {
       if (!el || el.nodeType !== 1) return;
+      if (MixedContentQuiet.isPlaybackResource(el)) return;
       try {
         const tag = String(el.tagName || "").toUpperCase();
         // 被动媒体 + 样式表
@@ -204,11 +214,8 @@
         const scope = root && root.querySelectorAll ? root : document;
         const sel = [
           "img[src^='http://'], img[srcset*='http://'], img[data-src^='http://']",
-          "source[src^='http://'], source[srcset*='http://']",
-          "video[src^='http://'], video[poster^='http://']",
-          "audio[src^='http://']",
+          "picture > source[srcset*='http://']",
           "link[href^='http://']",
-          "embed[src^='http://']",
           "input[src^='http://']",
           "[style*='http://']"
         ].join(",");
@@ -290,10 +297,6 @@
         };
 
         try { patchSrcProp(HTMLImageElement.prototype); } catch { /* ignore */ }
-        try { patchSrcProp(HTMLSourceElement.prototype); } catch { /* ignore */ }
-        try { patchSrcProp(HTMLVideoElement.prototype); } catch { /* ignore */ }
-        try { patchSrcProp(HTMLAudioElement.prototype); } catch { /* ignore */ }
-        try { patchSrcProp(HTMLEmbedElement.prototype); } catch { /* ignore */ }
         try { patchSrcProp(HTMLInputElement.prototype); } catch { /* ignore */ }
 
         try {

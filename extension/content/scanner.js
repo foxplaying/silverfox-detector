@@ -152,6 +152,9 @@
     } catch { return false; }
   };
 
+  const pendingDownloadActivations = new WeakMap();
+  const handledDownloadActivationEvents = new WeakSet();
+
   NS.blockPackageDownloadAction = function (event, element) {
     if (!element) return false;
     if (!NS.isPrimaryActivationEvent(event)) return false;
@@ -193,6 +196,7 @@
       && (NS.shouldNeverArmProtection() || NS.looksLikeMatureOfficialPortal() || NS.pageLooksLikeLegitimateOfficialDownload())) {
       // 硬套件已命中时禁止点击路径清 guard
       if (typeof NS.hasHardThreatKitLocked === "function" && NS.hasHardThreatKitLocked()) {
+        event.preventDefault(); event.stopImmediatePropagation(); event.stopPropagation();
         try { NS.disableAllDownloadIntentControls(); NS.postToHooks({ type: "set-guard", enabled: true }); } catch { /* ignore */ }
         return true;
       }
@@ -242,24 +246,73 @@
     }
     if (NS.isHrefSuspiciousPackageSync(href, element) || NS.isHrefSuspiciousPackage(href, element)) {
       event.preventDefault(); event.stopImmediatePropagation(); event.stopPropagation();
-      NS.disableOneSuspiciousElement(element, href);
-      NS.disableAllDownloadIntentControls();
-      if (!state.protectedTargets.includes(href)) state.protectedTargets.push(href);
       NS.markRemoteDownloadDispatch(`blocked -> ${href}`, href);
+      if (state.downloadGuardInstalled) {
+        NS.disableOneSuspiciousElement(element, href);
+        if (!state.protectedTargets.includes(href)) state.protectedTargets.push(href);
+      }
       let msg = NS.formatPackageLabel(href);
       try { const u = new URL(href, location.href); if (!NS.PACKAGE_EXT.test(u.pathname)) msg = `${u.hostname}${u.pathname}`; } catch { /* ignore */ }
       NS.showGuardOverlay(href, { title: "已拦截可疑下载", message: msg, toast: true, userAction: true, forceNotify: true });
       return true;
     }
     if (href && NS.needsDownloadBehaviorProbe(href, element) && !NS.shouldNeverArmProtection() && !NS.looksLikeMatureOfficialPortal()) {
+      // 一次点击的 pointerdown/mousedown 不是独立导航。阻止页面在按下时
+      // 提前执行下载，但保留默认焦点/点击生成，仅最终激活拥有核验及恢复权。
+      if (event.type === "pointerdown" || event.type === "mousedown") {
+        event.stopImmediatePropagation(); event.stopPropagation();
+        return true;
+      }
       event.preventDefault(); event.stopImmediatePropagation(); event.stopPropagation();
+      if (event.repeat || handledDownloadActivationEvents.has(event)) return true;
+      handledDownloadActivationEvents.add(event);
       const abs = (() => { try { return new URL(href, location.href).href; } catch { return href; } })();
-      const cached = NS.caches.probeCache.get(abs);
-      if (cached && cached.isDownload === false) { try { if (element.tagName === "A" && href && href !== "#") window.location.href = abs; } catch { /* ignore */ } return true; }
-      if (cached && cached.isDownload) { NS.applyConfirmedDownloadBlock(href, element, cached); NS.disableAllDownloadIntentControls(); NS.showGuardOverlay(href, { title: "已拦截可疑下载", message: cached.filename || href }); return true; }
-      NS.probeDownloadBehavior(href).then((result) => {
-        if (result && result.isDownload) { NS.applyConfirmedDownloadBlock(href, element, result); NS.disableAllDownloadIntentControls(); NS.showGuardOverlay(href, { title: "已拦截可疑下载", message: result.filename || NS.formatPackageLabel(href) }); }
-        else { try { const tgt = (element.getAttribute("target") || "_self").toLowerCase(); if (tgt === "_blank") window.open(abs, "_blank", "noopener,noreferrer"); else window.location.href = abs; } catch { /* ignore */ } }
+      const probePageUrl = String(location.href || "");
+      const probeTxn = state._analysisTxn;
+      const pending = pendingDownloadActivations.get(element);
+      if (pending && pending.url === abs && pending.pageUrl === probePageUrl && pending.txn === probeTxn) return true;
+      const activation = { url: abs, pageUrl: probePageUrl, txn: probeTxn };
+      pendingDownloadActivations.set(element, activation);
+      // 保留命名窗口的大小写；保留字才忽略大小写。
+      const target = element.getAttribute("target")
+        || (document.querySelector("base[target]")?.getAttribute("target")) || "_self";
+      // Snapshot the activation, not just target: Ctrl/Meta opens a new tab,
+      // Shift alone requests a new window even when the link uses _self.
+      // Ctrl/Meta+Shift still requests a tab; focus remains browser-controlled.
+      const openNewTab = !!(event.ctrlKey || event.metaKey);
+      const openNewWindow = !!event.shiftKey && !openNewTab;
+      const finish = (result) => {
+        if (pendingDownloadActivations.get(element) !== activation) return;
+        pendingDownloadActivations.delete(element);
+        if (String(location.href || "") !== probePageUrl || state._analysisTxn !== probeTxn) return;
+        // 等待期间新风险已上锁时，不得用旧的放行结果重新打开目标。
+        if (hasActiveClickProtection(state)) return;
+        if (!(result && result.isDownload && NS.applyConfirmedDownloadBlock(href, element, result))) {
+          try {
+            const reserved = String(target).toLowerCase();
+            if (openNewTab || openNewWindow || reserved === "_blank") {
+              // Probing may outlive transient activation. Don't pre-open a
+              // blank tab or fall back to replacing the current page. A second
+              // click can use the confirmed probe cache synchronously.
+              if (typeof navigator !== "undefined" && navigator.userActivation
+                && navigator.userActivation.isActive === false) {
+                try { NS.showPageToast("链接核验已返回", "请再次点击链接，以按原方式打开新标签页或窗口。", { force: false }); } catch { /* ignore */ }
+                return;
+              }
+              window.open(abs, "_blank", openNewWindow ? "popup=yes,noopener,noreferrer" : "noopener,noreferrer");
+            }
+            else if (reserved === "_self") window.location.href = abs;
+            else if (reserved === "_top") window.top.location.href = abs;
+            else if (reserved === "_parent") window.parent.location.href = abs;
+            else window.open(abs, target);
+          } catch { /* ignore */ }
+        }
+      };
+      const entry = NS.caches.probeCache.get(abs);
+      const cached = entry && entry.success === true && entry.expiresAt > Date.now() ? entry : null;
+      if (cached && typeof cached.isDownload === "boolean") { finish(cached); return true; }
+      Promise.resolve().then(() => NS.probeDownloadBehavior(href)).then(finish, () => {
+        if (pendingDownloadActivations.get(element) === activation) pendingDownloadActivations.delete(element);
       });
       return true;
     }
@@ -693,7 +746,8 @@
       const embedded = NS.scanEmbeddedPackageThreats();
       if (embedded) { found = true; firstHref = firstHref || embedded; NS.addSignal("页面嵌入可疑安装包", 16, `源码/配置中发现可疑安装包: ${NS.formatPackageLabel(embedded)}`); }
 
-      // 包扫描：只收集/禁用单链，不在此直接 arm；arm 前优先补跑品牌检测与品牌化 toast
+      // Candidates are local until the guard accepts the verdict.
+      const packageCandidates = [];
       let pkgHitBrandNear = false;
       // 归档站大幅降采样，避免 200+ 行表格每次扫描卡顿
       if (lateExplicitEvidence || !(archiveHeavy && !titleHot && !state._brandSpoofPortalDetected)) {
@@ -735,8 +789,7 @@
           if (NS.isHrefSuspiciousPackageSync(href, el) || NS.looksLikeObjectStoragePackageUrl(href) || NS.looksLikeBrandNearMissPackageName(fn)) {
             found = true; if (!firstHref) firstHref = href;
             if (NS.looksLikeBrandNearMissPackageName(fn) || (typeof NS.packageMismatchesPageBrand === "function" && NS.packageMismatchesPageBrand(href))) pkgHitBrandNear = true;
-            if (!state.protectedTargets.includes(href)) state.protectedTargets.push(href);
-            NS.disableOneSuspiciousElement(el, href);
+            packageCandidates.push({ href, el });
             continue;
           }
           if (toProbe.length < 6 && NS.needsDownloadBehaviorProbe(href, el)) toProbe.push({ href, el });
@@ -753,7 +806,7 @@
               if (NS.looksLikeObjectStoragePackageUrl(href) || NS.looksLikeHighRiskBlobPackageUrl(href) || NS.looksLikeBrandNearMissPackageName(fn) || NS.isHrefSuspiciousPackageSync(href, null)) {
                 found = true; firstHref = firstHref || href;
                 if (NS.looksLikeBrandNearMissPackageName(fn)) pkgHitBrandNear = true;
-                if (!state.protectedTargets.includes(href)) state.protectedTargets.push(href);
+                packageCandidates.push({ href });
                 break;
               }
             }
@@ -795,16 +848,18 @@
             }
           } catch { /* ignore */ }
         }
-        const brandish = pkgHitBrandNear || !!brandTok || titleHot || /官网|官方下载/i.test(document.title || "");
+        const networkUtility = typeof NS.pageLooksLikeInteractiveNetworkUtility === "function"
+          && NS.pageLooksLikeInteractiveNetworkUtility();
+        const brandish = !networkUtility
+          && (pkgHitBrandNear || !!brandTok || titleHot || /官网|官方下载/i.test(document.title || ""));
         if (brandish) {
           const noticeTitle = brandTok ? `已识别仿冒「${brandTok}」官网` : "已识别仿冒品牌官网下载";
           const noticeMsg = brandTok
             ? `页面标题/正文品牌「${brandTok}」与当前域名不匹配，疑似仿冒官网。`
             : `页面宣称官方下载，但域名/安装包异常，已拦截 ${label}`;
           if (brandTok) state.spoofBrand = brandTok;
-          try { NS.addSignal("仿冒品牌官网下载站", 20, noticeMsg); } catch { /* ignore */ }
           // 软品牌近失/标题热：勿 lockHard——否则绕过 ICP 软门，保护页会整包误杀曲包
-          NS.installDownloadGuard(brandTok ? `仿冒品牌官网下载站（仿冒「${brandTok}」）: ${label}` : `仿冒品牌官网下载: ${label}`, {
+          const accepted = NS.installDownloadGuard(brandTok ? `仿冒品牌官网下载站（仿冒「${brandTok}」）: ${label}` : `仿冒品牌官网下载: ${label}`, {
             notify: true,
             href: hrefForGuard,
             message: noticeMsg,
@@ -813,6 +868,7 @@
             guardKind: "brand-spoof",
             lockHard: false
           });
+          if (accepted) NS.addSignal("仿冒品牌官网下载站", 20, noticeMsg);
         } else {
           NS.installDownloadGuard(`已拦截可疑下载: ${label}`, {
             notify: true,
@@ -822,7 +878,6 @@
             forceNotify: true
           });
         }
-        NS.disableAllDownloadIntentControls();
       } else if (found && state.downloadGuardInstalled) {
         // 品牌检测已 arm 时仍把包链禁用，但不要再用“已拦截安装包 …”改写
         // 同一个品牌 toast。包名留在风险详情，页面只维持一条稳定的品牌通知。
@@ -834,13 +889,26 @@
         }
       }
 
+      if (state.downloadGuardInstalled) {
+        for (const { href, el } of packageCandidates) {
+          if (!state.protectedTargets.includes(href)) state.protectedTargets.push(href);
+          if (el) NS.disableOneSuspiciousElement(el, href);
+        }
+      }
+
       if (toProbe.length > 0 && !state.downloadGuardInstalled && !NS.shouldNeverArmProtection() && !NS.looksLikeMatureOfficialPortal() && !NS.looksLikeSafeOfficialContext()) {
         const unique = []; const seen = new Set();
         for (const item of toProbe.slice(0, 4)) {
           try { const abs = new URL(item.href, location.href).href; if (seen.has(abs)) continue; if (NS.isPackageFileUrl(abs)) continue; seen.add(abs); unique.push(item); } catch { /* ignore */ }
         }
         if (unique.length) {
-          Promise.all(unique.map(async ({ href, el }) => { const result = await NS.probeDownloadBehavior(href); if (result && result.isDownload) { NS.applyConfirmedDownloadBlock(href, el, result); NS.disableAllDownloadIntentControls(); return true; } return false; })).then((results) => { if (results.some(Boolean)) { NS.disableSuspiciousDownloadButtons(); NS.disableAllDownloadIntentControls(); NS.emitRiskReport(true); } }).catch(() => {});
+          const pageUrl = location.href, txn = state._analysisTxn;
+          for (const { href, el } of unique) {
+            NS.probeDownloadBehavior(href).then(result => {
+              if (location.href === pageUrl && state._analysisTxn === txn && result?.isDownload)
+                NS.applyConfirmedDownloadBlock(href, el, result);
+            }).catch(() => {});
+          }
         }
       }
 

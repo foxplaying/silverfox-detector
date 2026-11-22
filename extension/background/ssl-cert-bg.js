@@ -43,8 +43,11 @@
   const SSL_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
   const SSL_SOURCE_SUCCESS_TTL_MS = 6 * 60 * 60 * 1000;
   const SSL_SOURCE_EMPTY_TTL_MS = 15 * 60 * 1000;
-  const SSL_CERT_CACHE_STORAGE_KEY = "silverfox_ssl_cert_cache_v1";
+  // v1 folded www into the apex and kept maximum validation grade forever.
+  const SSL_CERT_CACHE_STORAGE_KEY = "silverfox_ssl_cert_cache_v2";
   const SSL_SOURCE_STATE_STORAGE_KEY = "silverfox_ssl_source_state_v1";
+  const SSL_SUBJECT_FORMAT = 2;
+  const SUBJECT_FILTERED_PROVIDERS = new Set(["networkcalc", "ssllabs", "edgeone", "myssl"]);
   const SSL_SOURCE_CACHE_MAX = 240;
   let sslPersistentLoaded = false;
   let sslPersistentLoadPromise = null;
@@ -82,7 +85,8 @@
                 if (!value || typeof value !== "object") continue;
                 const at = Number(value.at) || 0;
                 if (!at || now - at > SSL_CACHE_TTL_MS) continue;
-                NS.sslCertByHost.set(key, value);
+                if (hostKey(value.host || key) !== hostKey(key)) continue;
+                NS.sslCertByHost.set(key, betterResult(NS.sslCertByHost.get(key), value));
               }
             }
             const state = data && data[SSL_SOURCE_STATE_STORAGE_KEY];
@@ -93,6 +97,14 @@
                 const at = Number(entry.at) || 0;
                 const ttl = Math.max(0, Number(entry.ttl) || 0);
                 if (!at || !ttl || now - at > ttl) continue;
+                // Re-query affected adapters after upgrading, but retain rate
+                // limits and unrelated negative or complete cache entries.
+                if (state.subjectFormat !== SSL_SUBJECT_FORMAT) {
+                  const [provider, host] = key.split("|");
+                  const known = NS.sslCertByHost.get(host);
+                  if (SUBJECT_FILTERED_PROVIDERS.has(provider) && !entry.value?.organization
+                    && known?.validation === "EV" && !known.organization) continue;
+                }
                 NS._sslSourceCache.set(key, entry);
               }
             }
@@ -145,7 +157,7 @@
     try {
       chrome.storage.local.set({
         [SSL_CERT_CACHE_STORAGE_KEY]: certs,
-        [SSL_SOURCE_STATE_STORAGE_KEY]: { cache, cooldowns, savedAt: Date.now() }
+        [SSL_SOURCE_STATE_STORAGE_KEY]: { cache, cooldowns, subjectFormat: SSL_SUBJECT_FORMAT, savedAt: Date.now() }
       }, () => { try { void chrome.runtime?.lastError; } catch { /* ignore */ } });
     } catch { /* ignore */ }
   }
@@ -273,12 +285,15 @@
     const now = Date.now();
     const cached = NS._sslSourceCache.get(key);
     if (cached && now - (Number(cached.at) || 0) <= (Number(cached.ttl) || 0)) {
-      return cached.value || null;
+      return cached.value ? { ...cached.value,
+        observedAt: Number(cached.value.observedAt) || Number(cached.at) || now } : null;
     }
     if (cached) NS._sslSourceCache.delete(key);
     if (providerCoolingDown(provider)) return null;
     if (NS._sslSourceInflight.has(key)) return NS._sslSourceInflight.get(key);
-    const p = Promise.resolve().then(runner).catch(() => null).then((value) => {
+    const p = Promise.resolve().then(runner).catch(() => null).then((result) => {
+      // Preserve observation time through every cache/read/normalization layer.
+      const value = result ? { ...result, observedAt: Number(result.observedAt) || Date.now() } : null;
       // 429 已有独立持久化熔断；不要再用普通空结果覆盖其状态。
       if (value || !providerCoolingDown(provider)) {
         NS._sslSourceCache.set(key, {
@@ -338,16 +353,9 @@
   // 仅明确 DV 产品线：LiteSSL / Encryption Everywhere / RapidSSL / LE / Cloudflare 等
   const FREE_DV_ISSUER_RE = /let'?s\s*encrypt|zerossl|google\s*trust\s*services|gts\s*ca|cloudflare|ssl\s*corporation|ssl\.com|amazon|amazonaws|litessl|encryption\s*everywhere|cpanel|sectigo\s*rsa\s*domain|domain\s*validation|rapidssl|usertrust|comodo\s*domain|r3|r10|r11|r12|r13|e1|e5|e6|e7|e8|e9|yr1|yr2|ye[12]|we[12]/i;
 
-  /** 缓存键：去 www.，便于 www/裸域共用缓存 */
+  /** Certificates are host-bound: www and the apex may serve different leaves. */
   function hostKey(hostOrUrl) {
-    try {
-      if (/^https?:\/\//i.test(String(hostOrUrl || ""))) {
-        return new URL(hostOrUrl).hostname.toLowerCase().replace(/^www\./, "");
-      }
-      return String(hostOrUrl || "").toLowerCase().replace(/^www\./, "").split("/")[0];
-    } catch {
-      return "";
-    }
+    return rawHostname(hostOrUrl);
   }
 
   /** 探测用主机名：保留 www.，不剥掉 */
@@ -748,14 +756,14 @@
   }
 
   /**
-   * 清理假 O=：占位名、CA 机构名（在 DV 链上误扫到 Issuer O= 时）。
-   * 返回可用于定级的组织名；空串表示按 DV 处理。
+   * org must come from the leaf Subject.O, never Issuer.O. A CA company
+   * can itself hold a website certificate; do not discard its verified name.
    */
-  function sanitizeLeafOrganization(org, issuerName) {
-    let o = String(org || "").trim();
+  function sanitizeLeafOrganization(org, issuerName, subjectCn) {
+    const o = String(org || "").trim();
     if (!o) return "";
     if (isBogusPlaceholderOrg(o)) return "";
-    if (isCaLikeOrganization(o)) return "";
+    if (isCaLikeOrganization(o) && !nameLooksLikeHostname(subjectCn)) return "";
     // 免费 DV 中间 CA 签发的叶子：有 O= 也极可能是误解析，不认 OV
     // （ZeroSSL/LE 合法叶子不应带 Subject.O；有则多半是扫到了错误节点）
     if (isLikelyFreeDvIssuer(issuerName) && !/\bOV\b|\bEV\b|organization/i.test(String(issuerName || ""))) {
@@ -1293,44 +1301,10 @@
     return isLikelyFreeDvIssuer(hit.issuer);
   }
 
-  /**
-   * 择优：同一 host 下未过期叶子中，**验证等级优先**（EV>OV>DV）。
-   * 同级再比：叶子真覆盖目标 host > 可用组织名 > 较新 notBefore。
-   * 未绑定 SNI 叶链的 OV 组织名不参与择优。
-   */
+  /** Certificate identity and current TLS evidence precede validation grade. */
   function betterResult(a, b) {
-    if (!a) return b;
-    if (!b) return a;
-    const ra = validationRank(a.validation);
-    const rb = validationRank(b.validation);
-    // 核心：等级优先
-    if (rb !== ra) return rb > ra ? b : a;
-    // 同级：真覆盖目标 host 优先
-    if (!!a.leafOk !== !!b.leafOk) return a.leafOk ? a : b;
-    // 同为 OV：与非 noSNI 叶链精确对应的证书优先
-    if (ra === 2 && isLiveBoundOv(a) !== isLiveBoundOv(b)) {
-      return isLiveBoundOv(b) ? b : a;
-    }
-    // 同级：有可用组织名更好
-    const orgScore = (r) => {
-      const o = String(r.organization || "").trim();
-      if (!o) return 0;
-      if (isBogusPlaceholderOrg(o)) return 0;
-      if (String(r.validation || "").toUpperCase() === "OV" && !isLiveBoundOv(r)) return 0;
-      // 免费 DV 签发却标 OV+org → 脏结果
-      if (isLikelyFreeDvIssuer(r.issuer) && validationRank(r.validation) >= 2) return 0;
-      return 1;
-    };
-    const oa = orgScore(a);
-    const ob = orgScore(b);
-    if (ob !== oa) return ob > oa ? b : a;
-    const ta = Number(a.notBefore) || 0;
-    const tb = Number(b.notBefore) || 0;
-    if (tb !== ta) return tb > ta ? b : a;
-    const rich = (s) => /^(?:ssllabs|ssllabs\+crt\.sh|shodan-ct|networkcalc|myssl|edgeone)$/i.test(String(s || ""));
-    if (rich(a.source) && !rich(b.source)) return a;
-    if (rich(b.source) && !rich(a.source)) return b;
-    return a;
+    return globalThis.SilverfoxSslEvidence
+      ? globalThis.SilverfoxSslEvidence.choose(a, b) : b || a || null;
   }
 
   function parseDnString(dn) {
@@ -1338,14 +1312,25 @@
     const s = String(dn || "").replace(/^subject\s*[:=]\s*/i, "").trim();
     if (!s) return attrs;
     // /C=US/O=Org Name/CN=www.example.com  或  C=US, O=Org, CN=www
-    const parts = s.split(/\/(?=[A-Za-z][A-Za-z0-9.]*\s*=)/).join("\n")
-      .split(/,(?=\s*[A-Za-z][A-Za-z0-9.]*\s*=)/);
-    for (let part of parts) {
-      part = part.replace(/^\//, "").trim();
-      const m = part.match(/^([A-Za-z][A-Za-z0-9.]*)\s*=\s*(.+)$/);
+    const parts = [];
+    let start = 0, quoted = false;
+    const slashForm = s.startsWith("/");
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === "\\") { i++; continue; }
+      if (ch === '"') { quoted = !quoted; continue; }
+      if (quoted || !(ch === "\n" || ch === "+" || (slashForm ? ch === "/" : ch === ","))) continue;
+      // Some providers leave the comma in "Acme, Inc." unescaped.
+      if (!/^\s*(?:[a-z][\w.]*|\d+(?:\.\d+)+)\s*=/i.test(s.slice(i + 1))) continue;
+      parts.push(s.slice(start, i)); start = i + 1;
+    }
+    if (quoted) return attrs;
+    parts.push(s.slice(start));
+    for (const part of parts) {
+      const m = part.trim().match(/^([a-z][\w.]*|\d+(?:\.\d+)+)\s*=\s*([\s\S]+)$/i);
       if (!m) continue;
       const k = m[1].toUpperCase();
-      const v = m[2].trim().replace(/^"|"$/g, "");
+      const v = m[2].trim().replace(/^"|"$/g, "").replace(/\\([,/"+=\\])/g, "$1");
       if (k && v && !attrs[k]) attrs[k] = v;
     }
     return attrs;
@@ -1367,8 +1352,8 @@
    */
   function classifyFromSubjectDn(subjectDn, issuerDn) {
     const a = parseDnString(subjectDn);
-    let org = String(a.O || a.ORGANIZATIONNAME || a.ORGANIZATION || "").trim();
-    const cn = String(a.CN || a.COMMONNAME || "").trim();
+    let org = String(a.O || a.ORGANIZATIONNAME || a.ORGANIZATION || a["2.5.4.10"] || "").trim();
+    const cn = String(a.CN || a.COMMONNAME || a["2.5.4.3"] || "").trim();
     // 仅丢弃 CN 明确是中间 CA 的节点
     if (isCaLikeSubject(cn, org)) {
       return null;
@@ -1376,15 +1361,7 @@
     // OpenSSL 默认证：无 CN + 占位 O=
     if (!cn && isBogusPlaceholderOrg(org)) return null;
     const issuer = String(issuerDn || "");
-    org = sanitizeLeafOrganization(org, issuer);
-    // 官网叶子 O=DigiCert + CN=域名 → 保留；不要剥 O（sanitize 会剥 CA 名，域名 CN 时 digicert 官网再补）
-    if (!org) {
-      const rawOrg = String(a.O || a.ORGANIZATIONNAME || a.ORGANIZATION || "").trim();
-      if (rawOrg && nameLooksLikeHostname(cn) && isCaLikeOrganization(rawOrg)
-        && !isBogusPlaceholderOrg(rawOrg) && !isLikelyFreeDvIssuer(issuer)) {
-        org = rawOrg;
-      }
-    }
+    org = sanitizeLeafOrganization(org, issuer, cn);
     const hasJuris = !!(a.JURISDICTIONCOUNTRYNAME || a.JURISDICTIONSTATEORPROVINCENAME
       || a.JURISDICTIONLOCALITYNAME
       || a["1.3.6.1.4.1.311.60.2.1.3"] || a["1.3.6.1.4.1.311.60.2.1.2"]
@@ -1724,6 +1701,7 @@
         const hit = applyIssuerEvUpgrade({
           ...meta,
           source: "crt.sh",
+          certId: c.id,
           issuer: c.issuer,
           leafOk: true
         }, c.issuer);
@@ -1833,6 +1811,7 @@
                 organization: org,
                 commonName: cn,
                 source: "certspotter",
+                fingerprintSha256: r.cert_sha256 || "",
                 issuer: issuerName,
                 leafOk: true,
                 unexpiredHostVerified: notAfter > Date.now(),
@@ -1855,6 +1834,7 @@
           let hit = applyIssuerEvUpgrade({
             ...meta,
             source: "certspotter",
+            fingerprintSha256: r.cert_sha256 || "",
             issuer: issuerName,
             leafOk: true
           }, issuerName);
@@ -1963,7 +1943,8 @@
       if (!hit) return null;
       const id = typeof itemOrId === "string" ? itemOrId.toLowerCase() : labsCertId(itemOrId);
       const bound = forced === true || (!!id && sniLeafIds.has(id));
-      return sanitizeOvForDisplay({ ...hit, sniChainVerified: bound });
+      return sanitizeOvForDisplay({ ...hit, sniChainVerified: bound,
+        fingerprintSha256: /^[0-9a-f]{64}$/.test(id) ? id : hit.fingerprintSha256 });
     };
 
     function considerSubject(subject, issuer, altNames) {
@@ -1973,7 +1954,7 @@
       const c = subject ? classifyFromSubjectDn(subject, issuer) : null;
       if (c === null && subject) return null;
       let validation = c && c.validation;
-      let organization = sanitizeLeafOrganization((c && c.organization) || "", issuer);
+      let organization = (c && c.organization) || "";
       let commonName = (c && c.commonName) || "";
       if (!commonName && altNames) {
         const names = String(altNames).split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
@@ -2039,7 +2020,9 @@
               || "";
             if (!cnFromCert && !alts) return null;
             const cn = cnFromCert || host;
-            let org = sanitizeLeafOrganization(classified.organization || "", iss);
+            // The subject DN belongs to this same certs[] item, not its issuer or a sibling leaf.
+            let org = sanitizeLeafOrganization(classified.organization
+              || (subDn && classifyFromSubjectDn(subDn, iss)?.organization) || "", iss, cnFromCert);
             let validation = classified.validation;
             if (!org && validation === "OV" && !classified._flags?.hasOvPolicy) {
               validation = "DV";
@@ -2238,14 +2221,7 @@
       } catch { /* ignore */ }
     }
 
-    // ⑥ 有叶子指纹但无 org：写进 hit，供 enrich / 后台再探
-    if (best && !String(best.organization || "").trim() && leafShaHints.length) {
-      best = {
-        ...best,
-        certId: best.certId || leafShaHints[0],
-        fingerprintSha256: best.fingerprintSha256 || leafShaHints[0]
-      };
-    }
+    // Never attach the first endpoint's fingerprint to a result from another leaf.
     return sanitizeOvForDisplay(best);
   }
 
@@ -2442,6 +2418,7 @@
                   || (data.parsed && data.parsed.issuer && (data.parsed.issuer.raw || data.parsed.issuer.cn))
                   || "",
                 leafOk: true,
+                fingerprintSha256: c.hash,
                 unexpiredHostVerified: c.notAfter > nowSec,
                 notBefore: (c.notBefore || 0) * (c.notBefore > 1e12 ? 1 : 1000)
               }, c.issuer);
@@ -2474,6 +2451,7 @@
               source: "shodan-ct",
               issuer: issuerRaw,
               leafOk: true,
+              fingerprintSha256: c.hash,
               unexpiredHostVerified: c.notAfter > nowSec,
               notBefore: (c.notBefore || 0) * (c.notBefore > 1e12 ? 1 : 1000)
             }, issuerRaw);
@@ -2542,7 +2520,7 @@
       .join("\n");
     if (!leafMatchesQueryHost(commonName, altNames, host)) return null;
     const issuer = String(cert.issued_by || "").trim();
-    let organization = sanitizeLeafOrganization(classified.organization || "", issuer);
+    let organization = sanitizeLeafOrganization(classified.organization || "", issuer, classified.commonName);
     let validation = String(classified.validation || "DV").toUpperCase();
     if (!/^(DV|OV|EV)$/.test(validation)) validation = organization ? "OV" : "DV";
     if (!organization && validation === "OV" && !classified._flags?.hasOvPolicy) validation = "DV";
@@ -2633,6 +2611,10 @@
         cur._trustAttrs = celAttrs;
         continue;
       }
+      if (title === "通用名称" && cur && cur["通用名称"] != null) {
+        leaves.push(cur);
+        cur = null;
+      }
       if (!cur) {
         if (title !== "通用名称") continue;
         cur = Object.create(null);
@@ -2672,7 +2654,7 @@
       const issuer = String(leaf["颁发者"] || "").trim();
       let organization = String(leaf["组织机构"] || "").trim();
       if (organization === "--" || organization === "-" || organization === "—") organization = "";
-      organization = sanitizeLeafOrganization(organization, issuer);
+      organization = sanitizeLeafOrganization(organization, issuer, commonName);
 
       if (!validation) validation = organization ? "OV" : "DV";
       if (validationRank(validation) >= 2 && !organization) continue;
@@ -2732,7 +2714,8 @@
 
     const issuer = [iss.O || iss.o, iss.CN || iss.cn].filter(Boolean).join(" / ").trim()
       || String(iss.CN || iss.cn || iss.O || "").trim();
-    let organization = sanitizeLeafOrganization(String(sub.O || sub.o || "").trim(), issuer);
+    let organization = sanitizeLeafOrganization(String(sub.O || sub.o || sub.organizationName
+      || sub.organization || sub["2.5.4.10"] || "").trim(), issuer, commonName);
     let validation = organization ? "OV" : "DV";
     if (isLikelyFreeDvIssuer(issuer) && !/\bOV\b|\bEV\b/i.test(issuer)) {
       validation = "DV";
@@ -2746,6 +2729,7 @@
       organization: validation === "DV" ? "" : organization,
       commonName: commonName || h,
       source: "edgeone",
+      fingerprintSha256: String(cert.fingerprint256 || cert.fingerprintSha256 || "").replace(/:/g, ""),
       issuer,
       leafOk: true,
       liveTlsLeafVerified: true,
@@ -2762,6 +2746,30 @@
     if (!hit || !hit.validation) return hit;
     if (validationRank(hit.validation) < 2) return hit;
     if (String(hit.organization || "").trim()) return hit;
+    if (String(hit.validation).toUpperCase() === "EV") {
+      // An EV grade from metadata is not an excuse to borrow the holder of a
+      // different (possibly historical) certificate matching the hostname.
+      const fp = String(hit.fingerprintSha256 || "").replace(/:/g, "").toLowerCase();
+      const id = String(hit.certId || "");
+      const hasFp = /^[a-f0-9]{64}$/.test(fp);
+      const byId = /^crt\.sh(?:-meta)?$/.test(hit.source || "") && /^\d+$/.test(id);
+      if (!hasFp && !byId) return hit;
+      try {
+        const url = byId ? "https://crt.sh/?d=" + id : "https://crt.sh/?sha256=" + fp + "&d=1";
+        const dl = await fetchBytes(url, 4000);
+        if (!dl.ok || !dl.buf?.length) return hit;
+        const der = dl.buf[0] === 0x30 ? dl.buf : pemToDer(new TextDecoder().decode(dl.buf));
+        if (!der) return hit;
+        if (hasFp) {
+          const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", der));
+          if (Array.from(digest, b => b.toString(16).padStart(2, "0")).join("") !== fp) return hit;
+        }
+        const leaf = classifyFromDerBytes(der);
+        if (leaf?.organization && !isBogusPlaceholderOrg(leaf.organization))
+          return { ...hit, organization: leaf.organization };
+      } catch { /* keep the grade without inventing a holder */ }
+      return hit;
+    }
     const bare = host.replace(/^www\./, "");
     const domains = [host];
     if (bare !== host && !isCnPublicSuffixApex(bare)) domains.push(bare);
@@ -3035,7 +3043,8 @@
       source: clean.source || "multi",
       issuer: clean.issuer || "",
       certId: clean.certId,
-      fingerprintSha256: clean.fingerprintSha256 || "",
+      fingerprintSha256: clean.fingerprintSha256 || clean.fingerprint || clean.sha256 || "",
+      observedAt: Number(clean.observedAt) || Number(clean.at) || Date.now(),
       sniChainVerified: clean.sniChainVerified === true,
       liveTlsLeafVerified: clean.liveTlsLeafVerified === true,
       unexpiredHostVerified: clean.unexpiredHostVerified === true,
@@ -3132,6 +3141,14 @@
       };
 
       const onOne = (r) => {
+        // Fast CT metadata must not discard a slower, verified current leaf.
+        // Do not delay the first response; retain the late observation for the
+        // bounded upgrade pass and future callers of this exact hostname.
+        if (r && (r.liveTlsLeafVerified === true || r.sniChainVerified === true
+          || (r.organization && globalThis.SilverfoxSslEvidence?.sameCertificate(
+            NS.getSslCertInfoForHost(host), r)))) {
+          NS.storeSslCertInfo(host, { ...normalizeProbeHit(host, r), queriedHost: host });
+        }
         if (settled) return;
         pending -= 1;
         if (r && r.validation) {
@@ -3216,6 +3233,9 @@
       if (!hit || !hit.validation) continue;
       const packed = { ...hit, host: cacheHost, queriedHost: q };
       bestAll = betterResult(bestAll, packed);
+      // A verified live DV on the actual host must not be replaced by an
+      // unrelated parent-host OV/EV just because its grade is higher.
+      if (q === currentHost && (hit.liveTlsLeafVerified === true || hit.sniChainVerified === true)) return bestAll;
       // OV/EV 足够
       if (validationRank(bestAll.validation) >= 2) return bestAll;
       // 国内站当前 host 仅 DV：再试上层（通配证常挂在 apex）
@@ -3242,7 +3262,9 @@
         clean.organization = "";
       }
     }
-    const prev = NS.sslCertByHost.get(key);
+    clean = { ...clean, host: key,
+      observedAt: Number(clean.observedAt) || Number(clean.at) || Date.now() };
+    const prev = NS.getSslCertInfoForHost(host);
     // 占位 org / 免费 DV 误升允许被正确结果覆盖；无组织名的 OV 等级本身不是脏结果
     const prevDirty = prev && (
       isBogusPlaceholderOrg(prev.organization)
@@ -3250,18 +3272,9 @@
         && !String(prev.organization || "").trim())
       || (validationRank(prev.validation) >= 2 && isBogusPlaceholderOrg(prev.organization))
     );
-    if (prev && prev.validation
-      && validationRank(prev.validation) > validationRank(clean.validation)
-      && !prevDirty) {
-      return;
-    }
-    // 同级：新结果更优（有正确 org / 非脏 CDN org）时覆盖
-    if (prev && validationRank(prev.validation) === validationRank(clean.validation)) {
-      const better = betterResult(prev, { ...clean, host: key });
-      if (better === prev && prev.organization && !clean.organization
-        && !isBogusPlaceholderOrg(prev.organization)) return;
-    }
-    NS.sslCertByHost.set(key, { ...clean, host: key, at: Date.now() });
+    const selected = prevDirty ? clean : betterResult(prev, clean);
+    if (selected === prev) return;
+    NS.sslCertByHost.set(key, { ...selected, host: key, at: Date.now() });
     persistSslStateSoon(false);
   };
 
@@ -3286,7 +3299,7 @@
    * opts.https === true：CT 全失败时回退 https-assumed DV（页面已是 HTTPS，浏览器已验过证）。
    */
   NS.resolveSslCertInfo = async function (hostRaw, opts) {
-    // 缓存键去 www；探测主机保留 www（www.gov.cn 叶子是 *.www.gov.cn，剥 www 会 miss）
+    // Both cache and probe keep the exact hostname (www can have another leaf).
     const host = hostKey(hostRaw);
     const probeHost = rawHostname(hostRaw) || host;
     if (!host) return null;
@@ -3308,10 +3321,8 @@
               const bg = (async () => {
                 try {
                   const again = await NS.probeSslCertForHost(probeHost);
-                  if (again && (validationRank(again.validation) > rank
-                    || (again.organization && !cached.organization))) {
-                    NS.storeSslCertInfo(host, again);
-                  }
+                  if (again) NS.storeSslCertInfo(host, again);
+                  return NS.getSslCertInfoForHost(host);
                 } catch { /* ignore */ }
                 finally { NS._sslProbeInflight.delete(host); }
               })();
@@ -3332,9 +3343,8 @@
               const bg = (async () => {
                 try {
                   const again = await NS.probeSslCertForHost(probeHost);
-                  if (again && validationRank(again.validation) > rank) {
-                    NS.storeSslCertInfo(host, again);
-                  }
+                  if (again) NS.storeSslCertInfo(host, again);
+                  return NS.getSslCertInfoForHost(host);
                 } catch { /* ignore */ }
                 finally { NS._sslProbeInflight.delete(host); }
               })();
@@ -3362,11 +3372,6 @@
           info = httpsAssumedDv(host);
         }
         if (!info || !info.validation) return null;
-        // 勿用弱结果覆盖更强缓存；但 force 重探时允许 EV 覆盖 OV
-        const prev = NS.sslCertByHost.get(host);
-        if (prev && validationRank(prev.validation) > validationRank(info.validation)) {
-          return prev;
-        }
         NS.storeSslCertInfo(host, info);
         return NS.getSslCertInfoForHost(host) || sanitizeOvForDisplay(info);
       } finally {

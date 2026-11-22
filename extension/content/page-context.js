@@ -260,6 +260,28 @@
     } catch { return false; }
   };
 
+  // 测速/流量工具的测试样本 URL 不是软件下载入口。这里只约束软品牌推断，
+  // 不授予站点信任，也不影响实际下载、恶意套件或文件检测。
+  NS.pageLooksLikeInteractiveNetworkUtility = function () {
+    try {
+      const identity = [document.title || "",
+        document.querySelector('meta[name="description"]')?.getAttribute("content") || "",
+        document.querySelector('meta[name="keywords"]')?.getAttribute("content") || "",
+        typeof NS.collectHeadingText === "function" ? NS.collectHeadingText(1200) : ""
+      ].join(" ").slice(0, 3000);
+      if (!/测速|流量消耗|消耗流量|流量杀手|流量消失|speed\s*test|bandwidth\s*test/i.test(identity)) return false;
+      // 真正宣称官方身份的下载页仍走原来的品牌核验。
+      if (/官网|官方网站|官方下载|官方客户端|官方正版|official\s+(?:site|website|download|client)/i.test(identity)) return false;
+      const text = String(document.body?.textContent || "").slice(0, 18000);
+      if (!/测速源|测试源|自定义链接|test\s*(?:source|url)/i.test(text)
+        || !/线程|并发|threads?|concurrency/i.test(text)
+        || !/实时流量|实时速率|已运行|已消耗|已消失的流量|elapsed|current\s*speed/i.test(text)) return false;
+      if (!document.querySelector("select option[value], input[type='url']")) return false;
+      return Array.from(document.querySelectorAll("button, [role='button'], input[type='button'], input[type='submit'], a.btn"))
+        .slice(0, 80).some((el) => /开始|停止|启动|start|stop/i.test(String(el.textContent || el.value || "")));
+    } catch { return false; }
+  };
+
   /**
    * 软件「下载落地页壳」统一门控（品牌仿冒 / 下载页检测共用）。
    * 必须同时具备：下载门户话术（pitch）+ 下载壳证据（CTA/安装包/多平台/hub…）。
@@ -275,6 +297,9 @@
       editorial: false, reasons: []
     };
     try {
+      if (NS.pageLooksLikeInteractiveNetworkUtility()) {
+        return { ...empty, reasons: ["interactive-network-utility"] };
+      }
       if (typeof NS.pageLooksLikeSearchEngineResultsPage === "function" && NS.pageLooksLikeSearchEngineResultsPage()) {
         return { ...empty, reasons: ["serp"] };
       }

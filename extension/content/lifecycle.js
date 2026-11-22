@@ -498,6 +498,11 @@
               return false;
             }
             if (msg && msg.type === "show-page-threat-toast") {
+              if (msg.sourceAnalysisTxn && (msg.sourceAnalysisTxn !== NS.state._analysisTxn
+                || msg.sourcePageUrl !== String(location.href || ""))) {
+                sendResponse({ ok: true, skipped: "stale-download" });
+                return false;
+              }
               // 后台下载取消或子 frame 拦截统一在顶层页面显示，避免 Toast 落在隐藏 iframe。
               try {
                 if (typeof NS.isTopFrame !== "function" || NS.isTopFrame()) {
@@ -517,6 +522,11 @@
             }
             // VT 权威引擎共识删盘后：同步禁用本页下载按钮 + arm guard（仅 toast 不够）
             if (msg && msg.type === "arm-page-download-guard") {
+              if (!msg.sourceAnalysisTxn || msg.sourceAnalysisTxn !== NS.state._analysisTxn
+                || msg.sourcePageUrl !== String(location.href || "")) {
+                sendResponse({ ok: true, skipped: "stale-download" });
+                return false;
+              }
               try {
                 if (typeof NS.isTopFrame === "function" && !NS.isTopFrame()) {
                   try { sendResponse({ ok: true, skipped: "frame" }); } catch { /* ignore */ }
@@ -530,6 +540,10 @@
                   state._vtConsensusThreat = true;
                   state._remoteGarbleDlDetected = true;
                 } catch { /* ignore */ }
+                // Revoke the MAIN-world trusted-site shortcut before either
+                // installDownloadGuard or the explicit arm below posts a guard.
+                // Otherwise an already-official page silently discards that arm.
+                try { NS.postToHooks({ type: "set-official-safe", enabled: false }); } catch { /* ignore */ }
                 try {
                   NS.addSignal(
                     "VT权威引擎共识恶意",
@@ -551,7 +565,6 @@
                 try { NS.disableAllDownloadIntentControls(); } catch { /* ignore */ }
                 try {
                   NS.postToHooks({ type: "set-guard", enabled: true });
-                  NS.postToHooks({ type: "set-official-safe", enabled: false });
                 } catch { /* ignore */ }
                 try {
                   if (chrome?.runtime?.id) {
@@ -627,14 +640,25 @@
         // 新 iframe 插入后立即补锁（持续，不 disconnect）
         if (typeof MutationObserver !== "undefined" && !NS.caches._frameGuardMo) {
           let moT = 0;
-          NS.caches._frameGuardMo = new MutationObserver(() => {
+          NS.caches._frameGuardMo = new MutationObserver((mutations) => {
             if (!NS.state.downloadGuardInstalled) return;
+            const relevant = mutations.some((m) => {
+              if (m.type === "attributes") {
+                const el = m.target;
+                if (!/^(?:IFRAME|EMBED|OBJECT)$/.test(String(el.tagName || ""))) return false;
+                if (m.attributeName === "src") return el.getAttribute("src") !== "about:blank";
+                return el.hasAttribute(m.attributeName);
+              }
+              return Array.from(m.addedNodes || []).slice(0, 32).some((el) => el.nodeType === 1
+                && (el.matches("iframe, embed, object") || el.querySelector("iframe, embed, object")));
+            });
+            if (!relevant) return;
             // 合并抖动：短防抖 + 必跑
             if (moT) return;
-            moT = setTimeout(() => { moT = 0; reLockFrames(); }, 40);
+            moT = setTimeout(() => { moT = 0; reLockFrames(); }, 200);
           });
           const root = document.documentElement || document.body;
-          if (root) NS.caches._frameGuardMo.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ["src"] });
+          if (root) NS.caches._frameGuardMo.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "srcdoc", "data"] });
         }
         // 定时补锁：对抗「等一会再插 iframe / 改 src」的晚加载下载壳
         if (!NS.caches._frameGuardInterval) {

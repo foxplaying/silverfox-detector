@@ -209,12 +209,12 @@
       try {
         if (window.__silverfoxNavApi && typeof window.__silverfoxNavApi.setGuard === "function") window.__silverfoxNavApi.setGuard(true);
       } catch { /* ignore */ }
-      DomGuard.scrubDesktopForceDownloadDom();
+      DomGuard.scrubDesktopForceDownloadDom(this);
       DownloadUi.disableAllDownloadButtonsInPage();
       if (first) {
         this.post({ type: "request-guard", reason: reason || "桌面端强制弹窗下载套件 (dlp)" });
         this.post({ type: "signal", name: "桌面端强制弹窗下载", weight: 24, reason: reason || "dlp-overlay + auto zip download kit" });
-        [100, 300, 800, 2000, 5000].forEach((ms) => setTimeout(() => { if (this.forceDesktopDlKit) DomGuard.scrubDesktopForceDownloadDom(); }, ms));
+        [100, 300, 800, 2000, 5000].forEach((ms) => setTimeout(() => { if (this.forceDesktopDlKit) DomGuard.scrubDesktopForceDownloadDom(this); }, ms));
       }
     }
 

@@ -49,11 +49,21 @@
       if (!node || node.nodeType !== 1) return false;
       try {
         const tag = (node.tagName || "").toLowerCase();
+        if (node.closest && node.closest("template")) return false;
+        if (tag === "script") {
+          const type = String(node.getAttribute("type") || "").trim().toLowerCase().split(";")[0].trim();
+          if (node.getAttribute("src") || (type && type !== "module"
+            && !/^(?:text|application)\/(?:javascript|ecmascript|x-javascript)$/.test(type))) return false;
+          return CloakingKit.isDesktopForceDownloadKitBlob(node.textContent || "");
+        }
         if (tag === "style") return CloakingKit.isDesktopForceDownloadKitBlob(node.textContent || node.innerHTML || "");
+        // 展示在仓库/文档中的源码与模板不属于活动弹窗。
+        if (node.closest && node.closest("pre, code, textarea, [inert]")) return false;
         const cls = `${node.className || ""} ${node.getAttribute && node.getAttribute("class") || ""}`;
         if (/\bdlp-(?:overlay|modal|topbar|btn|badge|close)\b/i.test(cls)) return true;
         if (node.id && /^dlp-/i.test(node.id)) return true;
-        if ((tag === "a" || tag === "iframe" || tag === "embed") && node.getAttribute) {
+        // 隐藏 a 是正常下载实现的常见形式，本身没有发起导航，不能视为强制弹窗。
+        if ((tag === "iframe" || tag === "embed") && node.getAttribute) {
           const href = node.getAttribute("href") || node.getAttribute("src") || "";
           if (href && PackageHeuristics.isPackageFileUrl(href) && !PackageHeuristics.isStrongProductInstallerUrl(href)) {
             const st = (node.getAttribute("style") || "") + (node.style && node.style.cssText || "");

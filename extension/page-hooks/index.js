@@ -337,7 +337,17 @@
           const origNav = navigation.navigate.bind(navigation);
           navigation.navigate = function (url, options) {
             if (this.policy.tryBlockNavigation(url, `navigation.navigate -> ${PackageHeuristics.coerceHref(url)}`)) {
-              try { return origNav(location.href, { ...options, history: "replace" }); } catch { return undefined; }
+              // Navigating to the current URL is a reload, not cancellation:
+              // it destroys paused players and can restart autoplay on load.
+              // Preserve NavigationResult's promise shape without navigating.
+              const error = new DOMException("Navigation blocked by Silverfox", "AbortError");
+              const committed = Promise.reject(error);
+              const finished = Promise.reject(error);
+              // Callers often ignore the result. Mark both handled while still
+              // returning rejected promises to callers that await them.
+              committed.catch(() => {});
+              finished.catch(() => {});
+              return { committed, finished };
             }
             return origNav(url, options);
           }.bind(this);
@@ -452,9 +462,35 @@
 
     _installContentBridge() {
       const policy = this.policy;
+      let guardGeneration = 0;
+      const guardTimers = new Set();
+      const resetGuardWork = () => {
+        guardGeneration++;
+        for (const timer of guardTimers) { try { clearTimeout(timer); } catch { /* ignore */ } }
+        guardTimers.clear();
+        try {
+          if (window.__silverfoxGuardMo) window.__silverfoxGuardMo.disconnect();
+          window.__silverfoxGuardMo = null;
+        } catch { /* ignore */ }
+      };
+      const scheduleGuardWork = (callback, delay, enabled) => {
+        const generation = guardGeneration;
+        const timer = setTimeout(() => {
+          guardTimers.delete(timer);
+          // Old clear/arm callbacks must never undo a newer protection state.
+          if (generation !== guardGeneration) return;
+          if (enabled ? (!policy.guardEnabled || policy.officialSafe)
+            : (policy.guardEnabled || policy.forceDesktopDlKit)) return;
+          callback();
+        }, delay);
+        guardTimers.add(timer);
+      };
       const applySetGuard = (enabled) => {
+        if (enabled && policy.guardEnabled && !policy.officialSafe && window.__silverfoxGuardMo) return;
+        resetGuardWork();
         if (policy.officialSafe && enabled) {
           policy.guardEnabled = false;
+          DomGuard.restoreNeutralizedFrames(policy);
           try { DomGuard.restoreFetchInspection(); } catch { /* ignore */ }
           try { if (window.__silverfoxNavApi && typeof window.__silverfoxNavApi.setGuard === "function") window.__silverfoxNavApi.setGuard(false); } catch { /* ignore */ }
           DownloadUi.restoreAllDownloadButtonsInPage();
@@ -469,28 +505,64 @@
         policy.syncNavBoot();
         if (policy.guardEnabled) {
           DownloadUi.disableAllDownloadButtonsInPage();
-          try { DomGuard.scrubHostileLoadingOverlaysMain(); } catch { /* ignore */ }
-          try { DomGuard.scrubDesktopForceDownloadDom(); } catch { /* ignore */ }
-          [50, 200, 500, 1200, 3000].forEach((ms) => setTimeout(() => {
-            DownloadUi.disableAllDownloadButtonsInPage();
-            try { DomGuard.scrubHostileLoadingOverlaysMain(); } catch { /* ignore */ }
-          }, ms));
+          try { DomGuard.scrubDesktopForceDownloadDom(policy); } catch { /* ignore */ }
           try {
             if (!window.__silverfoxGuardMo && typeof MutationObserver !== "undefined") {
-              window.__silverfoxGuardMo = new MutationObserver(() => {
-                if (!policy.guardEnabled) return;
-                DownloadUi.disableAllDownloadButtonsInPage();
-                try { DomGuard.scrubHostileLoadingOverlaysMain(); } catch { /* ignore */ }
+              const generation = guardGeneration;
+              const roots = new Set();
+              let walker = null, queued = false;
+              const flush = () => {
+                queued = false;
+                const until = Date.now() + 5;
+                for (let count = 0; count < 96 && Date.now() <= until; count++) {
+                  let node = walker?.nextNode();
+                  if (!node) {
+                    walker = null;
+                    node = roots.values().next().value;
+                    if (!node) break;
+                    roots.delete(node);
+                    if (!node.isConnected) continue;
+                    walker = document.createTreeWalker(node, 1);
+                  }
+                  if (node.matches("a,button,[role=button]") && DownloadUi.isDownloadIntentText(node)) DownloadUi.greyOut(node);
+                  DomGuard.scrubHostileLoadingOverlaysMain(node);
+                }
+                if (walker || roots.size) queue();
+              };
+              const queue = () => {
+                if (!queued) { queued = true; scheduleGuardWork(flush, 32, true); }
+              };
+              const observer = new MutationObserver((records) => {
+                if (generation !== guardGeneration || !policy.guardEnabled || policy.officialSafe) return;
+                // Only inspect additions. Bursts collapse into one incremental
+                // traversal, never a synchronous page-wide scan per mutation.
+                let examined = 0;
+                batch: for (const record of records) {
+                  if (++examined > 128) { roots.clear(); roots.add(document.documentElement); break; }
+                  for (const node of record.addedNodes) {
+                    if (++examined > 128 || roots.size >= 128) {
+                      roots.clear(); roots.add(document.documentElement); break batch;
+                    }
+                    if (node.nodeType === 1) roots.add(node);
+                    else if (node.nodeType === 3) {
+                      const control = node.parentElement?.closest("a,button,[role=button]");
+                      if (control) roots.add(control);
+                    }
+                  }
+                }
+                if (roots.size) queue();
               });
-              window.__silverfoxGuardMo.observe(document.documentElement || document.body, { childList: true, subtree: true });
+              window.__silverfoxGuardMo = observer;
+              observer.observe(document.documentElement || document.body, { childList: true, subtree: true });
               // 持续观察更久：加载遮罩常在 几秒后才插入
-              setTimeout(() => { try { if (window.__silverfoxGuardMo) { window.__silverfoxGuardMo.disconnect(); window.__silverfoxGuardMo = null; } } catch { /* ignore */ } }, 60000);
+              scheduleGuardWork(() => { try { if (window.__silverfoxGuardMo === observer) { observer.disconnect(); window.__silverfoxGuardMo = null; } } catch { /* ignore */ } }, 60000, true);
             }
           } catch { /* ignore */ }
         } else {
           try { if (window.__silverfoxGuardMo) { window.__silverfoxGuardMo.disconnect(); window.__silverfoxGuardMo = null; } } catch { /* ignore */ }
+          DomGuard.restoreNeutralizedFrames(policy);
           DownloadUi.restoreAllDownloadButtonsInPage();
-          [50, 200, 600].forEach((ms) => setTimeout(DownloadUi.restoreAllDownloadButtonsInPage, ms));
+          [50, 200, 600].forEach((ms) => scheduleGuardWork(DownloadUi.restoreAllDownloadButtonsInPage, ms, false));
         }
       };
       window.addEventListener("message", (event) => {
@@ -512,10 +584,12 @@
           }
           if (data.type === "set-light-page" && data.enabled) policy.lightPage = true;
           if (policy.officialSafe) {
+            resetGuardWork();
             policy.guardEnabled = false;
             policy.forceDesktopDlKit = false;
             policy.lightPage = true;
             policy.blockedHops.clear();
+            DomGuard.restoreNeutralizedFrames(policy);
             try {
               if (window.__silverfoxNavApi) {
                 if (typeof window.__silverfoxNavApi.setGuard === "function") window.__silverfoxNavApi.setGuard(false);
@@ -524,7 +598,7 @@
             } catch { /* ignore */ }
             try { if (window.__silverfoxGuardMo) { window.__silverfoxGuardMo.disconnect(); window.__silverfoxGuardMo = null; } } catch { /* ignore */ }
             DownloadUi.restoreAllDownloadButtonsInPage();
-            [50, 200, 600].forEach((ms) => setTimeout(DownloadUi.restoreAllDownloadButtonsInPage, ms));
+            [50, 200, 600].forEach((ms) => scheduleGuardWork(DownloadUi.restoreAllDownloadButtonsInPage, ms, false));
           }
           if (policy.lightPage || policy.officialSafe) {
             try { DomGuard.restoreNativeDomProtos(this.restoreList); } catch { /* ignore */ }

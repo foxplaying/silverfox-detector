@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "__MSG_extensionName__",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "__MSG_extensionDescription__",
   "default_locale": "zh_CN",
   "permissions": [
@@ -61,6 +61,7 @@
         "page-hooks/package-heuristics.js",
         "page-hooks/page-context.js",
         "page-hooks/cloaking-kit.js",
+        "shared/control-state.js",
         "page-hooks/download-ui.js",
         "page-hooks/nav-policy.js",
         "page-hooks/mixed-content-quiet.js",
@@ -89,6 +90,8 @@
         "https://virustotal.com/*"
       ],
       "js": [
+        "shared/ssl-evidence.js",
+        "shared/control-state.js",
         "content/state.js",
         "content/package-heuristics.js",
         "content/brand-domain-match.js",

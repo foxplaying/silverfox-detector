@@ -246,6 +246,8 @@
 
   // 模块加载（顺序：工具 → SSL 证书 → PE/VT → 通知 → 导航保护 → 下载判定 → 消息处理）
   importScripts("./filename-heuristics-bg.js");
+  importScripts("../shared/ssl-evidence.js");
+  importScripts("../shared/risk-report.js");
   importScripts("./ssl-cert-bg.js");
   importScripts("./pe-vt-bg.js");
   importScripts("./notification-bg.js");
@@ -378,7 +380,7 @@
         if (!NS.isOnProtectedOrigin(tabId, newUrl) || NS.isHostileAutoTarget(newUrl)) {
           if (NS.isTabProtected(tabId) && !NS.isOnProtectedOrigin(tabId, newUrl)) {
             NS.pauseNavBlocking(tabId, "tabs-url-leave");
-            NS.clearTabAnalysisState(tabId);
+            NS.clearTabAnalysisState(tabId, { destination: newUrl });
             if (!NS.isHostileAutoTarget(newUrl)) st.lastGoodUrl = newUrl;
             NS.injectNavBoot(tabId, 0);
             return;
@@ -393,7 +395,7 @@
       if (changeInfo.status === "complete" && tab && tab.url && /^https?:/i.test(tab.url)) {
         const st = NS.getTabNav(tabId);
         if (!NS.isHostileAutoTarget(tab.url)) { st.lastGoodUrl = tab.url; NS.releaseProtectionIfLeftOrigin(tabId, tab.url); }
-        else if (NS.isTabProtected(tabId) && !NS.isOnProtectedOrigin(tabId, tab.url)) { NS.pauseNavBlocking(tabId, "complete-serp"); NS.clearTabAnalysisState(tabId); }
+        else if (NS.isTabProtected(tabId) && !NS.isOnProtectedOrigin(tabId, tab.url)) { NS.pauseNavBlocking(tabId, "complete-serp"); NS.clearTabAnalysisState(tabId, { destination: tab.url }); }
       }
     });
   }
@@ -513,16 +515,6 @@
         return;
       }
 
-      const strongProduct = (() => {
-        try {
-          const { PackageHeuristicsBg } = NS;
-          if (!PackageHeuristicsBg) return false;
-          const name = PackageHeuristicsBg.basenameFromPath(item.filename)
-            || PackageHeuristicsBg.basenameFromPath(dlUrl);
-          return PackageHeuristicsBg.looksLikeStrongProductInstallerName(name);
-        } catch { return false; }
-      })();
-
       // 标记已处理（取消路径也会 probe）
       const markHandled = () => {
         try {
@@ -605,11 +597,25 @@
       }
 
       // 保护页上的安装包：先扣下，VT 通过再放行
-      if (protectedTab && !verdict.trustedSource && isPkg && !strongProduct && /^https?:\/\//i.test(dlUrl)) {
+      if (protectedTab && !verdict.trustedSource && isPkg && /^https?:\/\//i.test(dlUrl)) {
         markHandled();
         chrome.downloads.cancel(item.id, () => {
           if (chrome.runtime.lastError) {
             console.warn("vt-gate cancel failed", chrome.runtime.lastError.message);
+            // The original may already be complete (or still downloading).
+            // Without a confirmed cancellation there is nothing to replay:
+            // keep its history and only inspect the source sample.
+            try {
+              if (typeof NS.probeDownloadExecutableAsync === "function") {
+                NS.probeDownloadExecutableAsync(item, {
+                  gate: false,
+                  requireSignedPe: true,
+                  sourceTabId: tabId,
+                  trustedSource: false
+                });
+              }
+            } catch { /* ignore */ }
+            return;
           }
           try { chrome.downloads.erase({ id: item.id }, () => { void chrome.runtime.lastError; }); } catch { /* ignore */ }
           if (tabId != null) NS.safeSetBadge(tabId, "…", "#f59e0b");
@@ -628,7 +634,7 @@
       }
 
       // 普通页安装包：不拦，后台 VT 仅展示
-      if (isPkg && !strongProduct) {
+      if (isPkg) {
         markHandled();
         try {
           if (typeof NS.probeDownloadExecutableAsync === "function") {

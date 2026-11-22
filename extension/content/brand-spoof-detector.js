@@ -166,6 +166,18 @@
     return String(value || "").replace(/\s+/g, " ").trim().slice(0, 240);
   }
 
+  // Guard rewrites are not site hydration. A disabled anchor still represents
+  // the same download CTA, and our warning tooltip is not a new logo/brand.
+  const BRAND_CTA_SELECTOR = 'a[href*="download"], a[data-threat-original-href*="download"], button[class*="download"], [id*="download"], .download-btn';
+  function siteIdentityTitle(node) {
+    const title = node.getAttribute?.("title");
+    if (title === "已拦截可疑安装包下载" && node.dataset?.threatDetectorDisabled === "1") {
+      try { return JSON.parse(node.dataset.silverfoxControlBefore || "{}").title || ""; }
+      catch { return ""; }
+    }
+    return title;
+  }
+
   /**
    * A deliberately small identity snapshot.  It follows only fields used by
    * brand election and a boolean download-CTA bit, so ordinary SPA content
@@ -192,14 +204,12 @@
       for (let index = 0; index < Math.min(identityNodes.length, 4); index++) {
         const node = identityNodes[index];
         parts.push(normalizeBrandIdentityFingerprintPart(
-          node.getAttribute?.("alt") || node.getAttribute?.("title") || node.textContent || ""
+          node.getAttribute?.("alt") || siteIdentityTitle(node) || node.textContent || ""
         ));
       }
       let hasDownloadCta = false;
       try {
-        hasDownloadCta = !!document.querySelector(
-          'a[href*="download"], button[class*="download"], [id*="download"], .download-btn'
-        );
+        hasDownloadCta = !!document.querySelector(BRAND_CTA_SELECTOR);
       } catch { /* ignore */ }
       parts.push(hasDownloadCta ? "download:1" : "download:0");
       return parts.join("|");
@@ -227,8 +237,8 @@
           if (!node || node.nodeType !== 1) continue;
           if (node.matches?.(BRAND_IDENTITY_SELECTOR)
             || node.querySelector?.(BRAND_IDENTITY_SELECTOR)
-            || node.matches?.('a[href*="download"], button[class*="download"], [id*="download"], .download-btn')
-            || node.querySelector?.('a[href*="download"], button[class*="download"], [id*="download"], .download-btn')) {
+            || node.matches?.(BRAND_CTA_SELECTOR)
+            || node.querySelector?.(BRAND_CTA_SELECTOR)) {
             return true;
           }
         }
@@ -286,6 +296,13 @@
         return false;
       }
       const changed = fingerprint !== previous;
+      // CTA presence helps start election on a hydrating page. Once the brand
+      // is final, hiding/replacing the CTA alone isn't a new brand identity.
+      if (changed && state._brandSpoofFinalPresented && state._brandSpoofFinalSnapshot
+        && fingerprint.replace(/\|download:[01]$/, "") === previous.replace(/\|download:[01]$/, "")) {
+        state._brandElectionIdentityFingerprint = fingerprint;
+        return false;
+      }
       if (!changed) {
         if (explicitWake && (state._brandElectionRetryPending
           || state._brandElectionAwaitingDom
@@ -737,6 +754,8 @@
         // 真硬套件不走软仿冒门禁
         return true;
       }
+      if (typeof NS.pageLooksLikeInteractiveNetworkUtility === "function"
+        && NS.pageLooksLikeInteractiveNetworkUtility()) return false;
       if (identityVerificationUnavailableForCurrentUrl(state)) return false;
       if (!(typeof NS.isBrandSpoofIdentityVerificationSettled === "function"
         && NS.isBrandSpoofIdentityVerificationSettled())) return false;
@@ -989,7 +1008,12 @@
       const matchHint = String(o.matchHint || "域名与品牌不匹配");
       const lockHard = o.lockHard !== false;
       const decisionUrl = String(location.href || "");
-      const decisionGeneration = invalidateBrandSpoofDecision(state, "brand-presentation-begin");
+      // A rescan of the already committed verdict isn't a new election.
+      // Incrementing here unconditionally invalidated the very snapshot
+      // used by the guard, notification and popup before the reuse branch.
+      const existingFinal = NS.getCurrentBrandSpoofFinalSnapshot?.();
+      let decisionGeneration = existingFinal ? existingFinal.decisionGeneration
+        : invalidateBrandSpoofDecision(state, "brand-presentation-begin");
 
       const decisionIsCurrent = () => {
         try {
@@ -1144,8 +1168,9 @@
             && Number(state._brandSpoofLatinUpgradeAttempts || 0) < 2
           );
         } catch { allowLatinToChineseRetry = false; }
-        if (allowLatinToChineseRetry) {
-          state._brandSpoofLatinUpgradeAttempts = Number(state._brandSpoofLatinUpgradeAttempts || 0) + 1;
+        if (allowLatinToChineseRetry || !NS.getCurrentBrandSpoofFinalSnapshot?.()) {
+          if (allowLatinToChineseRetry) state._brandSpoofLatinUpgradeAttempts = Number(state._brandSpoofLatinUpgradeAttempts || 0) + 1;
+          if (existingFinal) decisionGeneration = invalidateBrandSpoofDecision(state, "brand-presentation-replace");
           state._brandSpoofFinalPresented = false;
           state._brandSpoofFinalSnapshot = null;
           state._brandSpoofFinalizeScheduled = false;
@@ -1153,17 +1178,13 @@
           state._brandSpoofNoticeKey = "";
           state._lastGuardNoticeKey = "";
         } else {
-        try {
-          if (typeof NS.installDownloadGuard === "function") {
-            NS.installDownloadGuard(String(o.reason || "仿冒品牌官网下载站"), {
-              notify: false,
-              guardKind: "brand-spoof",
-              lockHard: true
+          state._pendingSoftBrandSpoof = false;
+          try {
+            if (!state.downloadGuardInstalled) NS.installDownloadGuard?.(String(o.reason || "仿冒品牌官网下载站"), {
+              notify: false, guardKind: "brand-spoof", lockHard: true, brandSnapshot: existingFinal
             });
-          }
-          NS.disableAllDownloadIntentControls();
-        } catch { /* ignore */ }
-        return String(state.spoofBrand || "");
+          } catch { /* ignore */ }
+          return String(state.spoofBrand || "");
         }
       }
 
@@ -2938,6 +2959,10 @@
   /** 父页品牌 vs 域名错配（主动 fetch 落地页时联动仿冒） */
   NS.getParentPageBrandSpoofContext = function () {
     try {
+      if (typeof NS.pageLooksLikeInteractiveNetworkUtility === "function"
+        && NS.pageLooksLikeInteractiveNetworkUtility()) {
+        return { mismatch: false, brand: "", hostMatch: "network-utility", brandToken: "" };
+      }
       if (typeof NS.pageLooksLikeSoftwareCatalogPortal === "function" && NS.pageLooksLikeSoftwareCatalogPortal()) {
         return { mismatch: false, brand: "", hostMatch: "portal", brandToken: "" };
       }
@@ -3257,6 +3282,9 @@
   NS.proactivelyProbeDownloadButtons = async function (opts) {
     const o = opts || {};
     const state = NS.state;
+    const pageUrl = location.href, txn = state._analysisTxn;
+    const current = () => location.href === pageUrl && state._analysisTxn === txn;
+    const probeOwner = {};
     try {
       if (state._proactiveProbeBusy) {
         NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "busy-skip");
@@ -3308,16 +3336,18 @@
         return false;
       }
       state._proactiveProbeAt = now;
-      state._proactiveProbeBusy = true;
+      state._proactiveProbeBusy = probeOwner;
 
       const parentCtx = typeof NS.getParentPageBrandSpoofContext === "function"
         ? NS.getParentPageBrandSpoofContext()
         : { mismatch: false, brand: "" };
-      // 再补一轮 domainRel mismatch（父页中文品牌 + 无关域名）
+      const networkUtility = typeof NS.pageLooksLikeInteractiveNetworkUtility === "function"
+        && NS.pageLooksLikeInteractiveNetworkUtility();
+      // 工具名称与域名不一致不是冒充官方身份，不能在补查中重新升级。
       let parentMismatch = !!parentCtx.mismatch;
       let parentBrand = parentCtx.brand || state.spoofBrand || "";
       try {
-        if (typeof NS.evaluateDomainKeywordRelevance === "function") {
+        if (!networkUtility && typeof NS.evaluateDomainKeywordRelevance === "function") {
           const rel2 = NS.evaluateDomainKeywordRelevance();
           if (rel2 && !rel2.related && (rel2.mismatch || rel2.hostMatch === "none") && (rel2.brand || rel2.brandToken)) {
             parentMismatch = true;
@@ -3373,25 +3403,16 @@
           }
           if (!analysis.hit) {
             NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "fetch-no-hit", href, "len=", source.length);
-            // 仍收集包 URL 供后续保护
-            const pkgs0 = analysis.packages || [];
-            for (const p of pkgs0.slice(0, 8)) {
-              if (p && state.protectedTargets && !state.protectedTargets.includes(p)) state.protectedTargets.push(p);
-            }
             return null;
           }
           const pkgs = analysis.packages || [];
-          try {
-            for (const p of pkgs.slice(0, 8)) {
-              if (p && !state.protectedTargets.includes(p)) state.protectedTargets.push(p);
-            }
-          } catch { /* ignore */ }
           return { href, el, analysis, packages: pkgs };
         } catch (e) {
           NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "fetch-err", href, e && e.message);
           return null;
         }
       }));
+      if (!current()) return false;
       const landHit = landResults.find(Boolean);
       if (landHit) {
         const isBrand = !!(landHit.analysis.brandSpoofLanding || parentMismatch);
@@ -3427,11 +3448,10 @@
             (landHit.analysis.brandSpoofLanding || parentMismatch) ? 22 : 16,
             `${reason} → ${landHit.href}`
           );
-          if (landHit.el) try { NS.disableOneSuspiciousElement(landHit.el, landHit.href); } catch { /* ignore */ }
           const pkgHref = (landHit.packages && landHit.packages[0])
             || (state.protectedTargets || []).find((t) => /\.(?:exe|zip|msi|apk|dmg)/i.test(String(t)))
             || landHit.href;
-          NS.installDownloadGuard(reason, {
+          armed = !!NS.installDownloadGuard(reason, {
             notify: true,
             href: pkgHref,
             message: showBrand && isBrand
@@ -3442,9 +3462,13 @@
             guardKind: isBrand ? "brand-spoof" : "package",
             lockHard: true
           });
-          NS.disableAllDownloadIntentControls();
-          try { state._brandSpoofPortalDetected = state._brandSpoofPortalDetected || isBrand; } catch { /* ignore */ }
-          armed = true;
+          if (armed) {
+            for (const p of landHit.packages.slice(0, 8)) {
+              if (p && !state.protectedTargets.includes(p)) state.protectedTargets.push(p);
+            }
+            if (landHit.el) NS.disableOneSuspiciousElement(landHit.el, landHit.href);
+            state._brandSpoofPortalDetected ||= isBrand;
+          }
         }
       }
 
@@ -3457,12 +3481,8 @@
             return null;
           } catch { return null; }
         }));
-        const ph = probeHits.find(Boolean);
-        if (ph) {
-          NS.applyConfirmedDownloadBlock(ph.href, ph.el, ph.result);
-          NS.disableAllDownloadIntentControls();
-          armed = true;
-        }
+        if (!current()) return false;
+        armed = probeHits.some(ph => ph && NS.applyConfirmedDownloadBlock(ph.href, ph.el, ph.result));
       }
 
       if (armed) try { NS.emitRiskReport(true); } catch { /* ignore */ }
@@ -3472,7 +3492,7 @@
       NS.silverfoxLog && NS.silverfoxLog("proactive-probe", "err", e && e.message);
       return false;
     } finally {
-      try { state._proactiveProbeBusy = false; } catch { /* ignore */ }
+      if (state._proactiveProbeBusy === probeOwner) state._proactiveProbeBusy = false;
     }
   };
 

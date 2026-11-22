@@ -250,6 +250,18 @@
     // 只让 content 根据 current URL 继续更新；绝不能先 remove 再等它重报。
     if (nextHost && knownPreviousHost && nextHost === knownPreviousHost) return;
 
+    // Invalidate late VT UI writes now, independently of the global latest-file entry
+    // and of the asynchronous storage cleanup below.
+    let invalidatedVt = false;
+    if (knownPreviousHost && nextHost !== knownPreviousHost) {
+      try {
+        if (typeof NS.clearLatestExeVtIfStaleForTab === "function") {
+          NS.clearLatestExeVtIfStaleForTab(tabId, newUrl);
+          invalidatedVt = true;
+        }
+      } catch { /* ignore */ }
+    }
+
     const vtTabKey = `latestExeVt_${tabId}`;
     const riskTabKey = `risk_${tabId}`;
     chrome.storage.local.get([riskTabKey, "latestNotice", "risk_latest", "latestExeVt", vtTabKey], (r) => {
@@ -306,7 +318,7 @@
       }
       // 同步清内存，避免迟到的 write 又把旧结果写回 storage
       try {
-        if (typeof NS.clearLatestExeVtIfStaleForTab === "function") {
+        if (!invalidatedVt && typeof NS.clearLatestExeVtIfStaleForTab === "function") {
           NS.clearLatestExeVtIfStaleForTab(tabId, newUrl);
         } else if (NS._latestExeVtMem) {
           const m = NS._latestExeVtMem;
@@ -322,7 +334,7 @@
     });
   };
 
-  NS.clearTabAnalysisState = function (tabId) {
+  NS.clearTabAnalysisState = function (tabId, { preserveReport = false, destination = "" } = {}) {
     if (tabId == null) return;
     NS.clearTabProtectionState(tabId);
     if (typeof NS.clearTrustedDownloadSource === "function") NS.clearTrustedDownloadSource(tabId);
@@ -333,7 +345,10 @@
         chrome.action.setTitle({ tabId, title: "Threat Detector" }, () => { void chrome.runtime.lastError; });
       } catch { /* ignore */ }
     });
-    chrome.storage.local.remove([`risk_${tabId}`, `protect_tab_${tabId}`], () => { void chrome.runtime.lastError; });
+    // clearTabProtectionState already removed protect_tab_*. A reset that
+    // published the new page's placeholder must not erase that same report.
+    const belongsToDestination = destination && NS._lastRiskReportByTab?.get(tabId)?.url === destination;
+    if (!preserveReport && !belongsToDestination) chrome.storage.local.remove([`risk_${tabId}`], () => { void chrome.runtime.lastError; });
     chrome.storage.local.get(["latestNotice"], (r) => {
       if (r.latestNotice && r.latestNotice.tabId === tabId) chrome.storage.local.remove(["latestNotice"], () => { void chrome.runtime.lastError; });
     });
@@ -415,7 +430,7 @@
       if (nextHref !== meta.url) return NS.clearTabProtectionState(tabId);
     }
     if (!opts.force && newUrl && NS.isOnProtectedOrigin(tabId, newUrl)) return false;
-    NS.clearTabAnalysisState(tabId);
+    NS.clearTabAnalysisState(tabId, { destination: newUrl });
     return true;
   };
 
@@ -618,7 +633,7 @@
     const clientRedir = (details.transitionQualifiers || []).includes("client_redirect");
     if (!NS.isOnProtectedOrigin(tabId, url)) { if (!clientRedir || !NS.isHostileAutoTarget(url)) NS.releaseProtectionIfLeftOrigin(tabId, url, { force: !clientRedir }); }
     if (NS.shouldForceRestoreHostileNav(tabId, url, details)) { NS.forceRestoreTab(tabId, st.lastGoodUrl, url); return; }
-    if (NS.isHostileAutoTarget(url) && !clientRedir && NS.isTabProtected(tabId)) { NS.pauseNavBlocking(tabId, "serp-user-land"); NS.clearTabAnalysisState(tabId); NS.injectNavBoot(tabId, 0); return; }
+    if (NS.isHostileAutoTarget(url) && !clientRedir && NS.isTabProtected(tabId)) { NS.pauseNavBlocking(tabId, "serp-user-land"); NS.clearTabAnalysisState(tabId, { destination: url }); NS.injectNavBoot(tabId, 0); return; }
     if (!NS.isHostileAutoTarget(url)) {
       st.lastGoodUrl = url;
       if (NS.isUserDrivenTransition(details) || !clientRedir) st.landedAt = Date.now();
